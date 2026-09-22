@@ -691,11 +691,12 @@ async def _collect_non_stream(
             raise HTTPException(400, "input exceeds limit: message too long, shorten the message and try again")
 
         session.accumulated_tokens = max(getattr(session, "accumulated_tokens", 0) or 0, rec.accumulated_tokens)
-        account.sessions.touch_last_message(session_key, rec.id or response_message_id)
-        if context_seq:
-            pool.index_context(session_key, context_seq)
-        log.info("deepseek completion OK (%.0fms)", (time.monotonic() - started) * 1000)
 
+        # Check the hint BEFORE recording the message id. On a rate-limit hint the
+        # upstream never stored the message, so remembering its id would poison the
+        # session's parent pointer and the next request would fail with
+        # "invalid message id". The streaming path below already orders these the
+        # same way; keep the two in sync.
         if not (rec.content or rec.reasoning) and rec.hint_error:
             if _is_rate_limit_hint(rec):
                 _log_rate_limit_hint(
@@ -708,6 +709,11 @@ async def _collect_non_stream(
                     elapsed_ms=(time.monotonic() - started) * 1000,
                 )
             raise HTTPException(429, _busy_error_body(rec))
+
+        account.sessions.touch_last_message(session_key, rec.id or response_message_id)
+        if context_seq:
+            pool.index_context(session_key, context_seq)
+        log.info("deepseek completion OK (%.0fms)", (time.monotonic() - started) * 1000)
 
         content = rec.content
         reasoning = rec.reasoning

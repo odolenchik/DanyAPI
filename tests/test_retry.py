@@ -153,6 +153,21 @@ async def test_non_stream_raises_429_after_retries():
     assert "busy" in exc.detail.lower()
 
 
+async def test_non_stream_rate_limit_hint_does_not_record_message_id():
+    """A rate-limit hint must not poison the session's parent pointer.
+
+    Regression: ``touch_last_message`` ran before the hint check, so the id of a
+    message the upstream never stored was saved as ``last_message_id``. The next
+    request then sent it as ``parent_message_id`` and failed with "DeepSeek error
+    26: invalid message id", retried five times, then surfaced as HTTP 502.
+    """
+    acct = FakeAccount([TOO_FREQUENT_SSE])
+    with pytest.raises(openai_mod.HTTPException) as excinfo:
+        await _collect_non_stream(**_args(acct))
+    assert excinfo.value.status_code == 429
+    acct.sessions.touch_last_message.assert_not_called()
+
+
 async def test_stream_emits_error_event_after_retries():
     acct = FakeAccount([BUSY_SSE] * (openai_mod.MAX_RETRIES + 1))
     gen = _stream_openai(**_args(acct))

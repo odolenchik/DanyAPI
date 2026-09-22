@@ -2,6 +2,16 @@
 
 ## Готово
 
+- Починен баг `invalid message id`: в не-стриминговом пути `touch_last_message`
+  вызывался **до** проверки rate-limit хинта, поэтому в сессию записывался id
+  сообщения, которого апстрим не сохранил. Следующий запрос слал его как
+  `parent_message_id` → `DeepSeek error 26: invalid message id` → 5 ретраев по
+  502, сессия оставалась сломанной. Стриминговый путь (`streaming.py:1199-1242`)
+  уже имел правильный порядок; не-стриминг (`streaming.py:693-710`) приведён к
+  нему. Регрессионный тест
+  `test_non_stream_rate_limit_hint_does_not_record_message_id`
+  (`tests/test_retry.py`) проверен на откате фикса — падает без него и проходит
+  с ним. Верификация: `ruff` (2 файла) + `pytest -q` → 1049 passed, `arch-check` OK.
 - Заведена отдельная рабочая копия DanyAPI в `/home/odolen/ssd_new/DanyAPI3`:
   свой git-репозиторий (ветка `main`, первый коммит `chore: initial import of
   DanyAPI`), свой venv, свой порт `DANYAPI_PORT=6660`, свой кэш
@@ -222,8 +232,6 @@
 
 ## Текущий commit
 
-Закоммичено: `feat(qwen): map image size to upstream aspect ratio` —
-`danyapi/api/openai.py`, `danyapi/qwen/api.py`, `tests/test_image_size.py`,
-`tests/test_qwen_image.py`, `README.md`, `docs/usage.html`, `docs/i18n.js`,
-`PROGRESS.md`.
-Предыдущий коммит: `774461d feat(qwen): support qwen-image-2.0-pro / 3.0-pro in image generation`.
+Закоммичено: `fix(deepseek): don't record message id on a rate-limit hint` —
+`danyapi/api/streaming.py`, `tests/test_retry.py`, `BACKLOG.md`, `PROGRESS.md`.
+Предыдущий коммит: `docs: note the DanyAPI3 working copy`.
