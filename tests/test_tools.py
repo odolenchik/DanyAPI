@@ -1403,6 +1403,66 @@ def test_render_message_roles():
     assert render_message(msg) == "x"
 
 
+def test_extract_last_user_skips_trailing_user_role_reminder():
+    """A trailing <system-reminder> must not hide the user's actual question.
+
+    Real failure, verified against the wire log: Kimi appends these reminders as
+    a separate role="user" message AFTER the user's turn, and the content is a
+    list part. extract_last_user walked backwards, matched the reminder (it is a
+    user role), and returned it as "the user's message" — so the prompt sent
+    upstream carried no question and the model answered as if the user had said
+    nothing. The skip must therefore be role-agnostic.
+    """
+    reminder = [{"type": "text", "text": "<system-reminder>\nThe TodoList tool has not been updated recently.\n</system-reminder>"}]
+    messages = [
+        Message(role="user", content="tool_schema_map это что?"),
+        Message(role="assistant", content="Коротко."),
+        Message(role="user", content="как лучше?"),
+        Message(role="user", content=reminder),
+    ]
+    assert extract_last_user(messages) == "как лучше?"
+
+
+def test_extract_last_user_skips_system_role_reminder():
+    """The same skip applies when a reminder arrives as role="system"."""
+    reminder = "<system-reminder>\nThe TodoList tool has not been updated recently.\n</system-reminder>"
+    messages = [
+        Message(role="user", content="как лучше?"),
+        Message(role="system", content=reminder),
+    ]
+    assert extract_last_user(messages) == "как лучше?"
+
+
+def test_extract_last_user_uses_real_system_when_no_user():
+    """A genuine system instruction is still a valid fallback."""
+    messages = [Message(role="system", content="Be concise.")]
+    assert extract_last_user(messages) == "Be concise."
+
+
+def test_extract_last_user_real_question_kept_before_reminder():
+    """A real user turn that merely precedes a reminder is still returned."""
+    messages = [
+        Message(role="user", content="вопрос"),
+        Message(role="user", content="<system-reminder>\nnoise\n</system-reminder>"),
+    ]
+    assert extract_last_user(messages) == "вопрос"
+
+
+def test_tail_after_last_user_ignores_trailing_reminder():
+    """The tail must start after the user's turn, not after the reminder."""
+    reminder = "<system-reminder>\nreminder text\n</system-reminder>"
+    messages = [
+        Message(role="user", content="first"),
+        Message(role="assistant", content="a1"),
+        Message(role="user", content="second"),
+        Message(role="user", content=reminder),
+    ]
+    tail = _tail_after_last_user(messages)
+    # The reminder is after the last user turn, so it is part of the tail.
+    assert len(tail) == 1
+    assert "reminder text" in tail[0].content
+
+
 def test_extract_last_user_image_only():
     msg = Message(role="user", content=[{"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}])
     with pytest.raises(ValueError):

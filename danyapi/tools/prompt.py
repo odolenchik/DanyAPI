@@ -334,25 +334,33 @@ def extract_last_user(messages: list[Any]) -> str:
     if not messages:
         raise ValueError("messages is required")
     for msg in reversed(messages):
-        if getattr(msg, "role", None) in ("user", "system"):
-            content = getattr(msg, "content", "")
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts = []
-                for item in content:
-                    if isinstance(item, str):
-                        parts.append(item)
-                    elif isinstance(item, dict):
-                        if item.get("type") == "text" and isinstance(item.get("text"), str):
-                            parts.append(item["text"])
-                        elif item.get("type") == "image_url":
-                            continue
-                text = "".join(parts).strip()
-                if text:
-                    return text
-                continue
-            raise ValueError("unsupported message content")
+        role = getattr(msg, "role", None)
+        if role not in ("user", "system"):
+            continue
+        content = getattr(msg, "content", "")
+        # A client-injected <system-reminder> is not the user's turn. Kimi sends
+        # these as a separate role="user" message after the real question, so
+        # treating one as the user's text sends a prompt with no question at all
+        # and the model answers as if the user had said nothing.
+        if _is_ephemeral_system(_content_text(content)):
+            continue
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    if item.get("type") == "text" and isinstance(item.get("text"), str):
+                        parts.append(item["text"])
+                    elif item.get("type") == "image_url":
+                        continue
+            text = "".join(parts).strip()
+            if text:
+                return text
+            continue
+        raise ValueError("unsupported message content")
     raise ValueError("no user message found")
 
 
@@ -388,8 +396,12 @@ def _has_history(messages: list[Any]) -> bool:
 def _tail_after_last_user(messages: list[Any]) -> list[Any]:
     index = -1
     for i, msg in enumerate(messages):
-        if getattr(msg, "role", None) in ("user", "system"):
-            index = i
+        role = getattr(msg, "role", None)
+        if role not in ("user", "system"):
+            continue
+        if _is_ephemeral_system(_content_text(getattr(msg, "content", ""))):
+            continue
+        index = i
     if index < 0:
         return list(messages)
     return list(messages[index + 1 :])
