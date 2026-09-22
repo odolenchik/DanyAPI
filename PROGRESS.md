@@ -2,6 +2,17 @@
 
 ## Готово
 
+- Починена тихая потеря контекста при сбросе мёртвой сессии. Продолжение фикса
+  `invalid message id`: в stale-ветке сессия сбрасывалась и создавалась заново, но
+  `prompt` уже был посчитан вызывающим и не пересобирался — в пустую сессию уходил
+  короткий дельта-промпт. Модель отвечала, ничего не помня, и клиент получал
+  HTTP 200. Проверено живьём A/B: до фикса на вопрос о коде модель ответила
+  «There is no code stored in this conversation», после — `ZEBRA-7741`.
+  `streaming.py` принимает `rebuild_prompt: Callable[[], str]`, и в обеих stale-ветках
+  (не-стриминг и стриминг) промпт пересобирается с полной историей; `openai.py`
+  передаёт лямбду через `common`. Тесты: `tests/test_retry.py` (+1), проверен на
+  откате — падает семантически, не на TypeError. Верификация: `ruff` (3 файла) +
+  `pytest -q` → 1054 passed, `arch-check` OK.
 - Хвост tool-раунда больше не переотправляется целиком. `build_prompt`
   (`danyapi/tools/prompt.py`) на шагах внутри раунда отправляет только **новейший
   обмен** (последний assistant с tool_calls + ответившие ему tool-результаты) —
@@ -261,6 +272,7 @@
 
 ## Текущий commit
 
-Закоммичено: `perf(tools): send only the newest exchange of a tool round` —
-`danyapi/tools/prompt.py`, `tests/test_tools.py`, `PROGRESS.md`. Предыдущий
-коммит: `fix(deepseek): drop a stale session instead of retrying error 26`.
+Закоммичено: `fix(deepseek): rebuild the prompt when a stale session is replaced` —
+`danyapi/api/streaming.py`, `danyapi/api/openai.py`, `tests/test_retry.py`,
+`PROGRESS.md`. Предыдущий коммит:
+`perf(tools): send only the newest exchange of a tool round`.

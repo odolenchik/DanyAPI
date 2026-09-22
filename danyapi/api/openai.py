@@ -634,6 +634,16 @@ async def _chat_completions_deepseek(req: ChatCompletionRequest) -> Any:
         "trace": trace,
         "messages": req.messages,
         "user": getattr(req, "user", None),
+        # Rebuild the prompt with full history if the session dies mid-flight
+        # (stale parent pointer): the fresh session has no context, so a delta
+        # prompt would arrive with nothing behind it.
+        "rebuild_prompt": lambda: toolemu.build_prompt(
+            req.messages,
+            getattr(req, "tools", None),
+            getattr(req, "tool_choice", None),
+            False,
+            getattr(req, "response_format", None),
+        )[0],
     }
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-Id": request_id}
     if req.stream:

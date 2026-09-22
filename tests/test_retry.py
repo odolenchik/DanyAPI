@@ -177,6 +177,41 @@ async def test_non_stream_stale_session_drops_and_recreates():
     assert acct.client.completion.await_count == 2
 
 
+async def test_non_stream_stale_session_rebuilds_prompt():
+    """After dropping a dead session the retry must send the FULL conversation.
+
+    The delta prompt was built for the old session; in a brand-new one it would
+    arrive with no history behind it, silently losing context. The caller passes
+    a rebuild callable for exactly this case.
+    """
+    acct = FakeAccount([OK_SSE])
+    calls = {"n": 0}
+
+    async def stale_then_ok(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise openai_mod.HTTPException(502, "DeepSeek error 26: invalid message id")
+        return FakeResp(OK_SSE)
+
+    acct.client.completion = AsyncMock(side_effect=stale_then_ok)
+    acct.sessions.obtain = AsyncMock(side_effect=[(FakeSession(sid="dead"), "dead"), (FakeSession(sid="fresh"), "fresh")])
+    rebuilt: list[int] = []
+
+    def rebuild() -> str:
+        rebuilt.append(1)
+        return "FULL HISTORY PROMPT"
+
+    args = _args(acct, pool=MagicMock(), existing_sid=None)
+    args["rebuild_prompt"] = rebuild
+    result = await _collect_non_stream(**args)
+
+    assert result["choices"][0]["message"]["content"] == "Привет"
+    assert rebuilt == [1], "the prompt must be rebuilt exactly once"
+    first, second = acct.client.completion.call_args_list
+    assert first.kwargs["prompt"] == "x"  # the original delta prompt
+    assert second.kwargs["prompt"] == "FULL HISTORY PROMPT"
+
+
 async def test_non_stream_stale_session_is_not_retried_forever():
     """If the fresh session also answers 26, we stop rather than loop."""
     acct = FakeAccount([OK_SSE] * 3)

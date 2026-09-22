@@ -7,7 +7,7 @@ import ssl
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from fastapi import HTTPException
@@ -520,6 +520,7 @@ async def _collect_non_stream(
     trace: ToolTraceLogger | None = None,
     messages: list[Any] | None = None,
     user: str | None = None,
+    rebuild_prompt: Callable[[], str] | None = None,
 ):
     await _human_delay()
     async with account_lock(lock, settings.acquire_timeout):
@@ -562,6 +563,11 @@ async def _collect_non_stream(
                         log.warning("stale session (%s), re-creating session", exc.detail)
                         _drop_session(pool, account, session_key)
                         session, session_key, parent_message_id = await _prepare_session(account, pool, None, context_seq)
+                        if rebuild_prompt is not None:
+                            # The dead session is gone, so the delta prompt would
+                            # arrive with no history behind it. Send the full
+                            # conversation instead, as for a brand-new session.
+                            prompt = rebuild_prompt()
                         continue
                     if _is_retryable_http(exc) and attempt < MAX_RETRIES:
                         log.warning(
@@ -793,6 +799,7 @@ async def _stream_openai(
     trace: ToolTraceLogger | None = None,
     messages: list[Any] | None = None,
     user: str | None = None,
+    rebuild_prompt: Callable[[], str] | None = None,
 ):
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -860,6 +867,10 @@ async def _stream_openai(
                     log.warning("stale session (%s), re-creating session", exc.detail)
                     _drop_session(pool, account, session_key)
                     session, session_key, parent_message_id = await _prepare_session(account, pool, None, context_seq)
+                    if rebuild_prompt is not None:
+                        # Same as the non-stream path: the fresh session has no
+                        # history, so send the full conversation, not the delta.
+                        prompt = rebuild_prompt()
                     continue
                 if _is_retryable_http(exc) and attempt < MAX_RETRIES:
                     log.warning(
