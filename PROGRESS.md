@@ -290,7 +290,7 @@
 
 ## Текущий commit
 
-Заккомичено: `perf(api): stop re-uploading attachments and hashing whole images` —
+Закоммичено: `perf(api): stop re-uploading attachments and hashing whole images` —
 `danyapi/api/attachments.py`, `danyapi/api/openai.py`, `danyapi/tools/prompt.py`,
 `tests/test_image_size.py`, `tests/test_tools.py`, `PROGRESS.md`. Предыдущий
 коммит: `docs(backlog): note that trace.dany misses a rebuilt prompt`.
