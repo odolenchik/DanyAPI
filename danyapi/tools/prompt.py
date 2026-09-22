@@ -136,6 +136,16 @@ def _content_text(content: Any) -> str:
     return ""
 
 
+def _image_fingerprint(uri: str) -> str:
+    """A short, stable stand-in for an image data URI.
+
+    The digest keeps the conversation anchor identical for the same image while
+    avoiding an 11 MB string copy on every request that carries one: the
+    fingerprint is built from the hash, not from the URI itself.
+    """
+    return "image:" + hashlib.sha256(uri.encode("utf-8")).hexdigest()
+
+
 def _content_fingerprint(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -150,9 +160,9 @@ def _content_fingerprint(content: Any) -> str:
                 elif item.get("type") == "image_url":
                     image_url = item.get("image_url")
                     if isinstance(image_url, str):
-                        parts.append(image_url)
+                        parts.append(_image_fingerprint(image_url))
                     elif isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
-                        parts.append(image_url["url"])
+                        parts.append(_image_fingerprint(image_url["url"]))
         return "\n".join(parts)
     return ""
 

@@ -2,6 +2,24 @@
 
 ## Готово
 
+- Вложения из истории больше не перезагружаются на каждом ходу. Раньше
+  `_collect_attachments` сканировал **все** сообщения, и картинка из первого
+  сообщения загружалась заново на каждом шаге (N ходов = N загрузок, каждая с
+  PoW). Теперь при живой сессии сканируются только сообщения после последнего
+  ответа ассистента — то есть текущий ввод; остальное уже лежит в сессии
+  апстрима. Новые `_history_end_index` и параметр
+  `_collect_attachments(..., skip_sent_history=)` (`danyapi/api/attachments.py`),
+  вызов в `openai.py:615` передаёт `has_session`. Живой E2E (2 хода с одной
+  картинкой): **1 загрузка** вместо 2, модель по-прежнему называет код с картинки
+  (`ALICJ5`). Тесты: `tests/test_image_size.py` (+2), проверены на откате.
+- Картинки в отпечатке диалога хешируются, а не копируются целиком.
+  `_content_fingerprint` (`danyapi/tools/prompt.py`) встраивал весь data-URI
+  (11 МБ → 11.5 млн символов строки на каждый запрос). Новый `_image_fingerprint`
+  возвращает `image:<sha256>`. Замер: **79 символов вместо 11 534 367**, хеш
+  стабилен для одной картинки и различается для разных. Тесты:
+  `tests/test_image_size.py` (+2), существующий `test_content_fingerprint_variants`
+  обновлён под новое поведение. Верификация обоих: `ruff` + `pytest -q` →
+  1058 passed, `arch-check` OK.
 - Починена тихая потеря контекста при сбросе мёртвой сессии. Продолжение фикса
   `invalid message id`: в stale-ветке сессия сбрасывалась и создавалась заново, но
   `prompt` уже был посчитан вызывающим и не пересобирался — в пустую сессию уходил
@@ -272,7 +290,7 @@
 
 ## Текущий commit
 
-Закоммичено: `fix(deepseek): rebuild the prompt when a stale session is replaced` —
-`danyapi/api/streaming.py`, `danyapi/api/openai.py`, `tests/test_retry.py`,
-`PROGRESS.md`. Предыдущий коммит:
-`perf(tools): send only the newest exchange of a tool round`.
+Заккомичено: `perf(api): stop re-uploading attachments and hashing whole images` —
+`danyapi/api/attachments.py`, `danyapi/api/openai.py`, `danyapi/tools/prompt.py`,
+`tests/test_image_size.py`, `tests/test_tools.py`, `PROGRESS.md`. Предыдущий
+коммит: `docs(backlog): note that trace.dany misses a rebuilt prompt`.

@@ -610,7 +610,9 @@ async def _chat_completions_deepseek(req: ChatCompletionRequest) -> Any:
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
-    attachments = _collect_attachments(req)
+    # A live session already holds the attachments from earlier turns, so only
+    # the current turn's input needs uploading (see _history_end_index).
+    attachments = _collect_attachments(req, skip_sent_history=has_session)
     _validate_attachments(attachments, model_type)
     ref_file_ids = None
     if attachments:

@@ -1380,7 +1380,10 @@ def test_content_text_variants():
 
 def test_content_fingerprint_variants():
     assert _content_fingerprint(42) == ""
-    assert _content_fingerprint([{"type": "image_url", "image_url": "data:x"}]) == "data:x"
+    # An image URI is fingerprinted by digest, not copied verbatim.
+    fp = _content_fingerprint([{"type": "image_url", "image_url": "data:x"}])
+    assert fp.startswith("image:")
+    assert "data:x" not in fp
 
 
 def test_render_tool_call_mention_variants():

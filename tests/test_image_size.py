@@ -99,6 +99,82 @@ def test_resize_converts_cmyk_jpeg_to_rgb():
         assert out.mode in ("RGB", "L")
 
 
+def _img_uri(tag: str) -> str:
+    import base64
+
+    return "data:image/png;base64," + base64.b64encode(tag.encode()).decode()
+
+
+def test_collect_attachments_skips_history_already_sent():
+    """With a live session, only the current turn's attachments need uploading.
+
+    A client resends the whole conversation, so the same image would otherwise be
+    re-uploaded on every turn even though the upstream session already holds it.
+    """
+    from types import SimpleNamespace
+
+    from danyapi.api.attachments import _collect_attachments
+
+    def msg(role, content):
+        return SimpleNamespace(role=role, content=content)
+
+    old_image = [{"type": "image_url", "image_url": {"url": _img_uri("OLD")}}]
+    new_image = [{"type": "image_url", "image_url": {"url": _img_uri("NEW")}}]
+    req = SimpleNamespace(
+        messages=[msg("user", old_image), msg("assistant", "seen"), msg("user", new_image)],
+        files=None,
+    )
+
+    # Without a session every attachment is new and must be uploaded.
+    assert len(_collect_attachments(req)) == 2
+    # With a live session only the turn after the last assistant reply counts.
+    fresh = _collect_attachments(req, skip_sent_history=True)
+    assert len(fresh) == 1
+    assert fresh[0].data == b"NEW"
+
+
+def test_collect_attachments_skip_history_with_no_assistant_keeps_all():
+    from types import SimpleNamespace
+
+    from danyapi.api.attachments import _collect_attachments
+
+    image = [{"type": "image_url", "image_url": {"url": _img_uri("ONLY")}}]
+    req = SimpleNamespace(messages=[SimpleNamespace(role="user", content=image)], files=None)
+    assert len(_collect_attachments(req, skip_sent_history=True)) == 1
+
+
+def test_content_fingerprint_hashes_image_instead_of_copying_it():
+    """An image data URI must be fingerprinted by digest, not embedded whole.
+
+    Embedding it produced an 11 MB string on every request that carried one.
+    The digest keeps the same image stable across calls without the copy.
+    """
+    from danyapi.tools.prompt import _content_fingerprint
+
+    uri = "data:image/png;base64," + "A" * 20000
+    msg = [{"type": "text", "text": "describe"}, {"type": "image_url", "image_url": {"url": uri}}]
+
+    fp = _content_fingerprint(msg)
+    assert "describe" in fp
+    assert "image:" in fp
+    # The bulky URI itself must not be reproduced.
+    assert uri not in fp
+    assert len(fp) < 200
+    # Same image -> same fingerprint; different image -> different one.
+    assert _content_fingerprint(msg) == fp
+    other = [{"type": "image_url", "image_url": {"url": uri + "B"}}]
+    assert _content_fingerprint(other) != fp
+
+
+def test_content_fingerprint_accepts_plain_string_image_url():
+    from danyapi.tools.prompt import _content_fingerprint
+
+    uri = "data:image/png;base64,QUJD"
+    as_str = [{"type": "image_url", "image_url": uri}]
+    as_dict = [{"type": "image_url", "image_url": {"url": uri}}]
+    assert _content_fingerprint(as_str) == _content_fingerprint(as_dict)
+
+
 @pytest.mark.parametrize(
     ("dims", "expected"),
     [

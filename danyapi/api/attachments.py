@@ -33,9 +33,25 @@ def _split_data_uri(uri: str) -> tuple[str, bytes]:
     return content_type, data
 
 
-def _collect_attachments(req: ChatCompletionRequest) -> list[Attachment]:
+def _history_end_index(messages: list) -> int:
+    """Index just past the last assistant message.
+
+    Attachments in messages up to and including the last assistant reply were
+    uploaded when that turn ran, and the upstream session still holds them, so
+    re-uploading them on every later turn is pure waste. Messages after it (the
+    current turn's input) are new and must be uploaded.
+    """
+    last = -1
+    for index, msg in enumerate(messages):
+        if getattr(msg, "role", None) == "assistant":
+            last = index
+    return last + 1
+
+
+def _collect_attachments(req: ChatCompletionRequest, skip_sent_history: bool = False) -> list[Attachment]:
     attachments: list[Attachment] = []
-    for msg in req.messages:
+    start = _history_end_index(req.messages) if skip_sent_history else 0
+    for msg in req.messages[start:]:
         if not isinstance(msg.content, list):
             continue
         for item in msg.content:
