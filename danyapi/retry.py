@@ -40,6 +40,20 @@ def _is_retryable_http(exc: HTTPException) -> bool:
     return exc.status_code in RETRYABLE_HTTP_STATUSES
 
 
+# DeepSeek answers a stale session pointer with biz error 26 ("invalid message
+# id"): the message we asked it to continue from no longer exists, so the
+# session cannot be resumed. This is permanent, not transient — retrying just
+# resends the same dead id five times and leaves the session broken. The session
+# is dropped instead, so the next request starts a fresh one.
+STALE_SESSION_MARKERS: tuple[str, ...] = ("error 26", "invalid message id")
+
+
+def _is_stale_session_error(exc: HTTPException) -> bool:
+    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    lowered = detail.lower()
+    return any(marker in lowered for marker in STALE_SESSION_MARKERS)
+
+
 def _is_rate_limit_hint(rec) -> bool:
     """True when a hint means "your account is throttled for sending too fast"."""
     hint = getattr(rec, "hint_error", None)

@@ -153,6 +153,42 @@ async def test_non_stream_raises_429_after_retries():
     assert "busy" in exc.detail.lower()
 
 
+async def test_non_stream_stale_session_drops_and_recreates():
+    """DeepSeek biz error 26 (invalid message id) means the session's parent
+    pointer is dead. It must NOT be retried five times with the same id — the
+    session is dropped and a fresh one is created, so the request can go on."""
+    acct = FakeAccount([OK_SSE])
+    # First attempt fails with the stale-session error; the retry uses a new session.
+    calls = {"n": 0}
+
+    async def stale_then_ok(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise openai_mod.HTTPException(502, "DeepSeek error 26: invalid message id")
+        return FakeResp(OK_SSE)
+
+    acct.client.completion = AsyncMock(side_effect=stale_then_ok)
+    acct.sessions.obtain = AsyncMock(side_effect=[(FakeSession(sid="dead"), "dead"), (FakeSession(sid="fresh"), "fresh")])
+    pool = MagicMock()
+    result = await _collect_non_stream(**_args(acct, pool=pool, existing_sid=None))
+    assert result["choices"][0]["message"]["content"] == "Привет"
+    pool.forget.assert_called_once_with("dead")
+    acct.sessions.forget.assert_called_once_with("dead")
+    assert acct.client.completion.await_count == 2
+
+
+async def test_non_stream_stale_session_is_not_retried_forever():
+    """If the fresh session also answers 26, we stop rather than loop."""
+    acct = FakeAccount([OK_SSE] * 3)
+    acct.client.completion = AsyncMock(side_effect=openai_mod.HTTPException(502, "DeepSeek error 26: invalid message id"))
+    acct.sessions.obtain = AsyncMock(side_effect=[(FakeSession(sid=f"s{i}"), f"s{i}") for i in range(10)])
+    with pytest.raises(openai_mod.HTTPException) as excinfo:
+        await _collect_non_stream(**_args(acct, pool=MagicMock(), existing_sid=None))
+    assert excinfo.value.status_code == 502
+    # MAX_RETRIES+1 attempts total, not an unbounded loop.
+    assert acct.client.completion.await_count == openai_mod.MAX_RETRIES + 1
+
+
 async def test_non_stream_rate_limit_hint_does_not_record_message_id():
     """A rate-limit hint must not poison the session's parent pointer.
 

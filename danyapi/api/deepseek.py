@@ -23,6 +23,7 @@ from ..retry import (  # noqa: F401
     _drop_session,
     _is_rate_limit_hint,
     _is_retryable_http,
+    _is_stale_session_error,
     _log_rate_limit_hint,
 )
 from ..tooltrace import ToolTraceLogger

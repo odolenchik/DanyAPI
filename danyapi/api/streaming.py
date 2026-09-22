@@ -36,6 +36,7 @@ from .deepseek import (
     _is_rate_limit_hint,
     _is_retryable_hint,
     _is_retryable_http,
+    _is_stale_session_error,
     _log_rate_limit_hint,
     _prepare_session,
     _send_with_auth,
@@ -553,6 +554,15 @@ async def _collect_non_stream(
                         rec = MessageReconstructor()
                         rec.hint_error = input_hint
                         break
+                    if _is_stale_session_error(exc) and attempt < MAX_RETRIES:
+                        # The session's parent pointer is dead upstream (the message
+                        # it refers to no longer exists). Retrying would resend the
+                        # same dead id, so drop the session and continue in a fresh
+                        # one instead of burning five attempts on a permanent error.
+                        log.warning("stale session (%s), re-creating session", exc.detail)
+                        _drop_session(pool, account, session_key)
+                        session, session_key, parent_message_id = await _prepare_session(account, pool, None, context_seq)
+                        continue
                     if _is_retryable_http(exc) and attempt < MAX_RETRIES:
                         log.warning(
                             "deepseek provider error (%s), attempt %d/%d",
@@ -844,6 +854,13 @@ async def _stream_openai(
                     rec = MessageReconstructor()
                     rec.hint_error = input_hint
                     break
+                if _is_stale_session_error(exc) and attempt < MAX_RETRIES:
+                    # Same permanent error as the non-stream path: drop the dead
+                    # session and continue in a fresh one rather than retrying.
+                    log.warning("stale session (%s), re-creating session", exc.detail)
+                    _drop_session(pool, account, session_key)
+                    session, session_key, parent_message_id = await _prepare_session(account, pool, None, context_seq)
+                    continue
                 if _is_retryable_http(exc) and attempt < MAX_RETRIES:
                     log.warning(
                         "deepseek provider error (%s), attempt %d/%d",

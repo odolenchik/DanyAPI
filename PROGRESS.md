@@ -2,6 +2,17 @@
 
 ## Готово
 
+- Починен второй триггер `invalid message id`: протухший дисковый кэш сессий.
+  Кэш (`deepseek-sessions-default.json` и др. в `DANYAPI_CACHE_DIR`) переживает
+  перезапуск, и лежащий там `last_message_id` может указывать на сообщение,
+  которого на апстриме уже нет. `_deepseek_status` мапил biz-ошибку 26 в **502**,
+  а 502 — retryable, поэтому мёртвый id повторялся 5 раз и сессия ломалась
+  навсегда (лечилось только `rm` кэша). Добавлен `_is_stale_session_error`
+  (`danyapi/retry.py`): ошибка 26 распознаётся как **постоянная**, сессия
+  сбрасывается через `_drop_session` и создаётся новая — в обоих путях
+  (не-стриминг `streaming.py:557`, стриминг `:859`). Тесты:
+  `tests/test_retry.py` (+2), проверены на откате фикса — падают без него.
+  Верификация: `ruff` (4 файла) + `pytest -q` → 1051 passed, `arch-check` OK.
 - Перепроверен хвост инструментов: **подтверждено живьём, что его можно не слать**.
   Тест: CALL-A — tool-раунд (секрет только в результате инструмента), CALL-B —
   минимальный промпт в ту же сессию без assistant/tool-сообщений, поэтому
@@ -239,6 +250,7 @@
 
 ## Текущий commit
 
-Закоммичено: `docs(backlog): record the resend audit and the stale-cache bug` —
-`BACKLOG.md`, `PROGRESS.md`. Предыдущий коммит:
-`fix(deepseek): don't record message id on a rate-limit hint`.
+Закоммичено: `fix(deepseek): drop a stale session instead of retrying error 26` —
+`danyapi/retry.py`, `danyapi/api/deepseek.py`, `danyapi/api/streaming.py`,
+`tests/test_retry.py`, `PROGRESS.md`. Предыдущий коммит:
+`docs(backlog): record the resend audit and the stale-cache bug`.
