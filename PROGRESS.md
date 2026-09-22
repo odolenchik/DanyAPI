@@ -2,6 +2,13 @@
 
 ## Готово
 
+- Перепроверен хвост инструментов: **подтверждено живьём, что его можно не слать**.
+  Тест: CALL-A — tool-раунд (секрет только в результате инструмента), CALL-B —
+  минимальный промпт в ту же сессию без assistant/tool-сообщений, поэтому
+  `_render_tool_tail` не вызывается. Модель ответила секретом верно (`RW7L11Z5`),
+  в `tooltrace.ndjson` на CALL-B ушло 66 символов вместо 178. По ходу теста
+  вскрыт второй баг: `invalid message id` из-за протухшего дискового кэша сессий
+  (детали и фикс — в BACKLOG). Оба записаны в BACKLOG.
 - Починен баг `invalid message id`: в не-стриминговом пути `touch_last_message`
   вызывался **до** проверки rate-limit хинта, поэтому в сессию записывался id
   сообщения, которого апстрим не сохранил. Следующий запрос слал его как
@@ -232,6 +239,6 @@
 
 ## Текущий commit
 
-Закоммичено: `fix(deepseek): don't record message id on a rate-limit hint` —
-`danyapi/api/streaming.py`, `tests/test_retry.py`, `BACKLOG.md`, `PROGRESS.md`.
-Предыдущий коммит: `docs: note the DanyAPI3 working copy`.
+Закоммичено: `docs(backlog): record the resend audit and the stale-cache bug` —
+`BACKLOG.md`, `PROGRESS.md`. Предыдущий коммит:
+`fix(deepseek): don't record message id on a rate-limit hint`.
