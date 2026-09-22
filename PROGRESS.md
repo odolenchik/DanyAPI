@@ -2,6 +2,17 @@
 
 ## Готово
 
+- Хвост tool-раунда больше не переотправляется целиком. `build_prompt`
+  (`danyapi/tools/prompt.py`) на шагах внутри раунда отправляет только **новейший
+  обмен** (последний assistant с tool_calls + ответившие ему tool-результаты) —
+  предыдущие шаги уже лежат в сессии апстрима. Новые хелперы `_has_tool_call` и
+  `_latest_tool_exchange`; без tool-вызова поведение прежнее. Замер на
+  `tooltrace.ndjson` (4660 запросов): 61% запросов — шаги tool-раунда, перерасход
+  был **4.5x** (12773 единицы промпта вместо 2860). Живой E2E (2-шаговый раунд,
+  сервер на 6660): на шаге 2 ушло 199 символов вместо повторения всего хвоста,
+  модель всё равно назвала код из первого обмена (`ALPHA-NXKUYD`). Тесты:
+  `tests/test_tools.py` (+2), проверены на откате фикса. Верификация:
+  `ruff` + `pytest -q` → 1053 passed, `arch-check` OK.
 - Починен второй триггер `invalid message id`: протухший дисковый кэш сессий.
   Кэш (`deepseek-sessions-default.json` и др. в `DANYAPI_CACHE_DIR`) переживает
   перезапуск, и лежащий там `last_message_id` может указывать на сообщение,
@@ -250,7 +261,6 @@
 
 ## Текущий commit
 
-Закоммичено: `fix(deepseek): drop a stale session instead of retrying error 26` —
-`danyapi/retry.py`, `danyapi/api/deepseek.py`, `danyapi/api/streaming.py`,
-`tests/test_retry.py`, `PROGRESS.md`. Предыдущий коммит:
-`docs(backlog): record the resend audit and the stale-cache bug`.
+Закоммичено: `perf(tools): send only the newest exchange of a tool round` —
+`danyapi/tools/prompt.py`, `tests/test_tools.py`, `PROGRESS.md`. Предыдущий
+коммит: `fix(deepseek): drop a stale session instead of retrying error 26`.

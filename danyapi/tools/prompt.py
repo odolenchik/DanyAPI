@@ -242,6 +242,39 @@ def render_message(msg: Any) -> str:
     return text
 
 
+def _has_tool_call(msg: Any) -> bool:
+    """True when an assistant message carries at least one tool call."""
+    if getattr(msg, "tool_calls", None):
+        return True
+    content = getattr(msg, "content", None)
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "tool_call":
+                return True
+    return False
+
+
+def _latest_tool_exchange(messages: list[Any]) -> list[Any]:
+    """The newest assistant tool-call plus the results answering it.
+
+    A client resends the whole tool round on every step, but steps 1..k-1 are
+    already in the upstream session: each exchange was sent once, when it was
+    new. Only the last call and its results are new material, so send just those
+    instead of the whole round. Leading assistant messages of the same turn are
+    kept, since prose and its call are often separate messages.
+    """
+    last = -1
+    for index, msg in enumerate(messages):
+        if getattr(msg, "role", None) == "assistant" and _has_tool_call(msg):
+            last = index
+    if last < 0:
+        return []
+    start = last
+    while start > 0 and getattr(messages[start - 1], "role", None) == "assistant":
+        start -= 1
+    return messages[start:]
+
+
 def _render_tool_tail(messages: list[Any], max_chars: int | None = None) -> str:
     parts = []
     tool_parts: list[str] = []
@@ -482,7 +515,8 @@ def build_prompt(
     if has_session:
         tail = _tail_after_last_user(messages)
         if _is_tool_round_tail(tail):
-            tail_prompt = _render_tool_tail(tail, max_chars=MAX_APPEND_PROMPT_CHARS)
+            exchange = _latest_tool_exchange(tail) or tail
+            tail_prompt = _render_tool_tail(exchange, max_chars=MAX_APPEND_PROMPT_CHARS)
             return tail_prompt, True
         base = extract_last_user(messages)
         blocks = []

@@ -852,6 +852,48 @@ def test_build_prompt_continuation_with_session():
     assert "What is the weather?" not in prompt
 
 
+def test_build_prompt_multi_step_tool_round_sends_only_latest_exchange():
+    """A multi-step tool round resends every exchange, but earlier steps are
+    already in the upstream session. Only the newest call and its results are
+    new material, so the tail must not repeat the earlier ones."""
+    messages = [
+        Message(role="user", content="Fix the bug."),
+        Message(
+            role="assistant",
+            content="First I read it.",
+            tool_calls=[{"id": "c1", "type": "function", "function": {"name": "Read", "arguments": '{"path": "a.py"}'}}],
+        ),
+        Message(role="tool", content="OLD-RESULT-alpha", tool_call_id="c1"),
+        Message(role="assistant", tool_calls=[{"id": "c2", "type": "function", "function": {"name": "Grep", "arguments": '{"pattern": "def"}'}}]),
+        Message(role="tool", content="NEW-RESULT-beta", tool_call_id="c2"),
+    ]
+    prompt, tool_mode = build_prompt(messages, None, None, has_session=True)
+    assert tool_mode
+    # The newest exchange is sent...
+    assert "NEW-RESULT-beta" in prompt
+    assert '"name": "Grep"' in prompt
+    # ...and the earlier one is not repeated.
+    assert "OLD-RESULT-alpha" not in prompt
+    assert '"name": "Read"' not in prompt
+
+
+def test_build_prompt_multi_step_tool_round_keeps_assistant_prose():
+    """Prose that precedes the newest call in the same turn is kept, since it
+    carries the model's stated intent."""
+    messages = [
+        Message(role="user", content="Fix the bug."),
+        Message(role="assistant", tool_calls=[{"id": "c1", "type": "function", "function": {"name": "Read", "arguments": '{"path": "a.py"}'}}]),
+        Message(role="tool", content="OLD-RESULT-alpha", tool_call_id="c1"),
+        Message(role="assistant", content="Now I will grep for it."),
+        Message(role="assistant", tool_calls=[{"id": "c2", "type": "function", "function": {"name": "Grep", "arguments": '{"pattern": "def"}'}}]),
+        Message(role="tool", content="NEW-RESULT-beta", tool_call_id="c2"),
+    ]
+    prompt, _ = build_prompt(messages, None, None, has_session=True)
+    assert "Now I will grep for it." in prompt
+    assert "NEW-RESULT-beta" in prompt
+    assert "OLD-RESULT-alpha" not in prompt
+
+
 def test_build_prompt_continuation_no_session():
     messages = [
         Message(role="user", content="What is the weather?"),
