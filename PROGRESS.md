@@ -2,6 +2,16 @@
 
 ## Готово
 
+- Заведена отдельная рабочая копия DanyAPI в `/home/odolen/ssd_new/DanyAPI3`:
+  свой git-репозиторий (ветка `main`, первый коммит `chore: initial import of
+  DanyAPI`), свой venv, свой порт `DANYAPI_PORT=6660`, свой кэш
+  `DANYAPI_CACHE_DIR=/tmp/danyapi3`. Копия импортирована из
+  `/home/odolen/ssd_new/DanyAPI` на коммите `efaf34b` без venv, кэшей и
+  untracked-черновиков. Изоляция кэша важна: обе копии по умолчанию писали в общий
+  `/tmp/danyapi`, из-за чего usage и сессии двух серверов смешивались (health на
+  свежем 6660 показывал чужие 368 запросов; после правки — 0). Живой E2E через
+  6660: `deepseek-v4-flash` вернул `DANYAPI3 OK`, usage считает только свои
+  запросы. Тесты в копии: `pytest -q` → 1048 passed.
 - Включены image-модели Qwen `qwen-image-2.0-pro` / `qwen-image-3.0-pro` в
   `POST /v1/images/generations`. Раньше оба id отдавали 502 `Model not found`.
   Причина: image-id уходил в `models[]`/верхнеуровневый `model`, а upstream Qwen
