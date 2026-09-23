@@ -102,6 +102,9 @@ class FakeAccount:
     def note_request_start(self):
         self.starts.append(None)
 
+    def note_request_end(self):
+        return None
+
     def recent_request_count(self, window):
         return len(self.starts)
 
@@ -627,6 +630,38 @@ def test_log_rate_limit_hint_reports_start_counts(caplog):
     assert "starts_60s=20" in caplog.text
     assert "acct#7" in caplog.text
     assert "elapsed_ms=1234" in caplog.text
+
+
+def test_log_rate_limit_hint_reports_end_to_start_gap(caplog):
+    class Acct:
+        last_end_gap = 2.5
+
+        def recent_request_count(self, window):
+            return 1
+
+    class Rec:
+        def __init__(self):
+            self.hint_error = {"finish_reason": "rate_limit_reached", "message": "Messages too frequent"}
+
+    with caplog.at_level(logging.WARNING, logger="danyapi.retry"):
+        _log_rate_limit_hint(Rec(), Acct(), where="stream")
+    assert "end_to_start_gap=2.5" in caplog.text
+
+
+def test_log_rate_limit_hint_without_end_gap(caplog):
+    """When no gap has been measured the field shows a placeholder, not 0."""
+
+    class Acct:
+        def recent_request_count(self, window):
+            return 1
+
+    class Rec:
+        def __init__(self):
+            self.hint_error = {"finish_reason": "rate_limit_reached", "message": "Messages too frequent"}
+
+    with caplog.at_level(logging.WARNING, logger="danyapi.retry"):
+        _log_rate_limit_hint(Rec(), Acct(), where="stream")
+    assert "end_to_start_gap=-" in caplog.text
 
 
 def test_log_rate_limit_hint_without_optional_fields(caplog):

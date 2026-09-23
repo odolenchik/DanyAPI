@@ -115,6 +115,16 @@ class Settings:
         except ValueError:
             self.min_start_gap = 0.0
 
+        # Minimum seconds between the END of one request and the START of the
+        # next on the same account. Start-to-start pacing misses this: a slow
+        # request (~80 s) makes consecutive starts look far apart while the
+        # account is re-hit seconds after each stream closes, which is exactly
+        # what trips DeepSeek's "Messages too frequent" throttle. 0 disables.
+        try:
+            self.min_end_gap = max(0.0, float(os.environ.get("DANYAPI_MIN_END_GAP", "5.0")))
+        except ValueError:
+            self.min_end_gap = 5.0
+
         # Token usage accounting: totals, per-model/provider/user breakdowns and
         # a bounded recent-request list, persisted through JsonStore.
         self.usage_enabled = os.environ.get("DANYAPI_USAGE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")

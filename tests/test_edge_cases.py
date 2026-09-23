@@ -73,6 +73,16 @@ def test_min_start_gap_parse():
     assert _settings({"DANYAPI_MIN_START_GAP": "-1"}).min_start_gap == 0.0
 
 
+def test_min_end_gap_parse():
+    # Default is 5 s when unset, and bad input falls back to the same default.
+    assert _settings({}).min_end_gap == 5.0
+    assert _settings({"DANYAPI_MIN_END_GAP": "bad"}).min_end_gap == 5.0
+    assert _settings({"DANYAPI_MIN_END_GAP": "2.5"}).min_end_gap == 2.5
+    # Explicitly disabling and negative input both clamp to 0.
+    assert _settings({"DANYAPI_MIN_END_GAP": "0"}).min_end_gap == 0.0
+    assert _settings({"DANYAPI_MIN_END_GAP": "-1"}).min_end_gap == 0.0
+
+
 def test_cache_root_mkdir_error(tmp_path, monkeypatch):
     monkeypatch.setattr(store_mod.settings, "cache_dir", str(tmp_path))
     blocker = Path(tmp_path) / "blocker"

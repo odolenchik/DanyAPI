@@ -21,18 +21,27 @@ class AccountPoolBusy(Exception):
 
 
 @asynccontextmanager
-async def account_lock(sem: asyncio.Semaphore, max_wait: float | None = None):
+async def account_lock(sem: asyncio.Semaphore, max_wait: float | None = None, account=None):
+    """Hold an account for the whole request and mark when it is released.
+
+    The lock is held from just before the session is prepared until the response
+    body has been fully consumed, so releasing it is the moment the account is
+    free again. Marking that moment on the account is what lets pacing measure a
+    gap from the end of the previous request, not only from its start (see
+    DeepSeekAccount.seconds_until_ready).
+    """
     if max_wait is None:
-        async with sem:
-            yield
-        return
-    try:
-        await asyncio.wait_for(sem.acquire(), timeout=max_wait)
-    except TimeoutError as exc:
-        raise AccountPoolBusy() from exc
+        await sem.acquire()
+    else:
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=max_wait)
+        except TimeoutError as exc:
+            raise AccountPoolBusy() from exc
     try:
         yield
     finally:
+        if account is not None:
+            account.note_request_end()
         sem.release()
 
 
@@ -155,7 +164,10 @@ class ContextIndex:
 class DeepSeekAccount:
     __slots__ = (
         "_burst",
+        "_last_end",
+        "_last_gap",
         "_last_start",
+        "_min_end_gap",
         "_min_interval",
         "_min_start_gap",
         "_since_gap",
@@ -179,6 +191,7 @@ class DeepSeekAccount:
         min_interval: float = 0.0,
         burst: int = 1,
         min_start_gap: float = 0.0,
+        min_end_gap: float = 0.0,
     ) -> None:
         self.index = index
         self.client = client
@@ -191,8 +204,11 @@ class DeepSeekAccount:
         self._min_interval = max(0.0, min_interval)
         self._burst = max(1, burst)
         self._min_start_gap = max(0.0, min_start_gap)
+        self._min_end_gap = max(0.0, min_end_gap)
         self._since_gap = 0
         self._last_start = 0.0
+        self._last_end = 0.0
+        self._last_gap: float | None = None
 
     def mark_broken(self) -> None:
         if not self.broken:
@@ -213,6 +229,15 @@ class DeepSeekAccount:
         """How many requests may start back-to-back before the interval applies."""
         return self._burst
 
+    @property
+    def last_end_gap(self) -> float | None:
+        """Seconds between the previous request's end and this request's start.
+
+        ``None`` until a request has both started and ended, so a rate-limit log
+        never reports a gap that was never measured.
+        """
+        return self._last_gap
+
     def seconds_until_ready(self, now: float | None = None) -> float:
         """How long to wait before this account may start another request.
 
@@ -227,6 +252,12 @@ class DeepSeekAccount:
         against frequent single-shot requests with small gaps that individually
         look harmless but together trip per-account throttling.
 
+        ``min_end_gap`` is measured from the previous request's *end* rather than
+        its start, and the later of the two deadlines wins. Start-to-start pacing
+        alone misses a client that chains long requests: an ~80 s request makes
+        consecutive starts look far apart while the account is re-hit seconds
+        after the previous stream closed, which is what trips the throttle.
+
         Returns 0 when pacing is disabled or the account is ready now. Callers
         hold the account lock, so this reading is stable.
         """
@@ -236,8 +267,10 @@ class DeepSeekAccount:
         elif self._min_start_gap > 0:
             interval = self._min_start_gap
         else:
-            return 0.0
-        return max(0.0, self._last_start + interval - ts)
+            interval = 0.0
+        start_deadline = self._last_start + interval if interval > 0 else 0.0
+        end_deadline = self._last_end + self._min_end_gap if self._min_end_gap > 0 else 0.0
+        return max(0.0, max(start_deadline, end_deadline) - ts)
 
     async def wait_turn(self) -> None:
         """Sleep until this account is allowed to start another request.
@@ -251,6 +284,15 @@ class DeepSeekAccount:
         if delay > 0:
             await asyncio.sleep(delay)
 
+    def note_request_end(self, now: float | None = None) -> None:
+        """Record that a request against this account has finished.
+
+        Called when the account lock is released, which is after the response
+        body has been fully read. ``seconds_until_ready`` paces the next start
+        from this moment as well as from the previous start.
+        """
+        self._last_end = time.monotonic() if now is None else now
+
     def note_request_start(self, now: float | None = None) -> None:
         """Record that a request is being sent to this account.
 
@@ -258,7 +300,9 @@ class DeepSeekAccount:
         advances the pacing cycle: the counter resets once a gap has been served.
         """
         ts = time.monotonic() if now is None else now
-        if self._min_interval > 0 or self._min_start_gap > 0:
+        if self._last_end:
+            self._last_gap = max(0.0, ts - self._last_end)
+        if self._min_interval > 0 or self._min_start_gap > 0 or self._min_end_gap > 0:
             if self._since_gap >= self._burst:
                 self._since_gap = 0
             self._since_gap += 1

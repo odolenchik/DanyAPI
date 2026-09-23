@@ -105,6 +105,9 @@ class FakeAccount:
     def note_request_start(self):
         self.starts.append(None)
 
+    def note_request_end(self):
+        return None
+
     def recent_request_count(self, window):
         return len(self.starts)
 

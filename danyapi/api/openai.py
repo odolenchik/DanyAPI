@@ -80,6 +80,7 @@ async def lifespan(app: FastAPI):
                         min_interval=settings.min_request_interval,
                         burst=settings.request_burst,
                         min_start_gap=settings.min_start_gap,
+                        min_end_gap=settings.min_end_gap,
                     )
                 )
             log.info("deepseek accounts ready: %d", len(accounts))

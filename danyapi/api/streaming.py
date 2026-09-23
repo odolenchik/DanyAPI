@@ -523,7 +523,7 @@ async def _collect_non_stream(
     rebuild_prompt: Callable[[], str] | None = None,
 ):
     await _human_delay()
-    async with account_lock(lock, settings.acquire_timeout):
+    async with account_lock(lock, settings.acquire_timeout, account):
         session, session_key, parent_message_id = await _prepare_session(account, pool, existing_sid, context_seq)
         if trace is not None:
             trace.dany(request_id, prompt=prompt, session_id=session_key, model=model)
@@ -805,7 +805,7 @@ async def _stream_openai(
     created = int(time.time())
 
     await _human_delay()
-    async with account_lock(lock, settings.acquire_timeout):
+    async with account_lock(lock, settings.acquire_timeout, account):
         try:
             session, session_key, parent_message_id = await _prepare_session(account, pool, existing_sid, context_seq)
         except HTTPException as exc:

@@ -88,8 +88,13 @@ def _log_rate_limit_hint(
     hint = getattr(rec, "hint_error", None) or {}
     counts = {f"starts_{int(window)}s": account.recent_request_count(window) for window in START_WINDOWS}
     fields = " ".join(f"{name}={value}" for name, value in counts.items())
+    # Seconds between the previous request's end and this request's start. The
+    # starts_* counters alone hide the failure mode this diagnoses: a long
+    # request makes starts look far apart while the account is re-hit seconds
+    # after the previous stream closed.
+    gap = getattr(account, "last_end_gap", None)
     log.warning(
-        "rate limit hint (%s) where=%s account=%s session=%s request=%s model=%s reason=%s message=%.200s elapsed_ms=%s %s",
+        "rate limit hint (%s) where=%s account=%s session=%s request=%s model=%s reason=%s message=%.200s elapsed_ms=%s end_to_start_gap=%s %s",
         hint.get("finish_reason"),
         where,
         getattr(account, "label", "?"),
@@ -99,6 +104,7 @@ def _log_rate_limit_hint(
         hint.get("finish_reason"),
         hint.get("message") or "",
         f"{elapsed_ms:.0f}" if elapsed_ms is not None else "-",
+        f"{gap:.1f}" if gap is not None else "-",
         fields,
     )
 

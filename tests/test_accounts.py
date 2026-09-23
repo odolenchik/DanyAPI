@@ -138,12 +138,64 @@ async def test_account_lock_timeout_busy():
         sem.release()
 
 
+async def test_account_lock_marks_request_end_on_release():
+    """Releasing the lock is what tells the account a request has finished."""
+    sem = asyncio.Semaphore(1)
+    account = MagicMock()
+    async with account_lock(sem, 1.0, account):
+        account.note_request_end.assert_not_called()
+    account.note_request_end.assert_called_once_with()
+
+
+async def test_account_lock_without_account_still_works():
+    """The account argument is optional; qwen call sites pass no account."""
+    sem = asyncio.Semaphore(1)
+    async with account_lock(sem, 1.0):
+        pass
+    assert not sem.locked()
+
+
+async def test_account_lock_marks_request_end_on_exception():
+    sem = asyncio.Semaphore(1)
+    account = MagicMock()
+    with pytest.raises(RuntimeError):
+        async with account_lock(sem, 1.0, account):
+            raise RuntimeError("boom")
+    account.note_request_end.assert_called_once_with()
+
+
 async def test_account_lock_exception_releases():
     sem = asyncio.Semaphore(1)
     with pytest.raises(ValueError):
         async with account_lock(sem, 1.0):
             raise ValueError("boom")
     assert not sem.locked()
+
+
+async def test_account_lock_end_marks_hold_back_the_next_start():
+    """Full cycle: the lock release is what sets the end-gap deadline.
+
+    This is the integration point the fix hinges on — the unit tests on
+    ``note_request_end`` and ``account_lock`` are only meaningful if passing the
+    account to the lock actually makes the next request wait.
+
+    ``instant_sleep`` in conftest disables real sleeping, so the wait is checked
+    via ``seconds_until_ready()`` rather than by letting the clock run.
+    """
+    acct = DeepSeekAccount(0, MagicMock(spec=DeepSeekClient), min_end_gap=1.0)
+
+    async with account_lock(acct.sem, 1.0, acct):
+        acct.note_request_start()
+    # The release happened just now, so the end-gap deadline is still in the future.
+    assert acct.seconds_until_ready() > 0.0
+
+
+async def test_account_lock_without_account_does_not_record_end():
+    """Omitting the account leaves it unaware the request finished."""
+    acct = DeepSeekAccount(0, MagicMock(spec=DeepSeekClient), min_end_gap=1.0)
+    async with account_lock(acct.sem, 1.0):
+        acct.note_request_start()
+    assert acct.seconds_until_ready() == 0.0
 
 
 @pytest.fixture
@@ -525,6 +577,73 @@ def test_pacing_deadline_never_moves_backwards():
     acct.note_request_start(now=101.0)
     assert acct.seconds_until_ready(now=101.0) == 4.0
     assert acct.seconds_until_ready(now=105.0) == 0.0
+
+
+def test_min_end_gap_waits_after_the_previous_request_finished():
+    """A chained long request must still leave a gap after the stream closes.
+
+    Start-to-start pacing alone is satisfied here: the previous request started
+    100 s ago, far more than any interval. The wait has to come from the moment
+    the previous request *ended*.
+    """
+    acct = DeepSeekAccount(0, MagicMock(spec=DeepSeekClient), min_interval=4.0, min_end_gap=5.0)
+    acct.note_request_start(now=100.0)
+    # The request ran for 80 s, so by the time it ends the start deadline is long past.
+    acct.note_request_end(now=180.0)
+    assert acct.seconds_until_ready(now=180.0) == 5.0
+    assert acct.seconds_until_ready(now=183.0) == 2.0
+    assert acct.seconds_until_ready(now=185.0) == 0.0
+
+
+def test_min_end_gap_uses_the_later_of_the_two_deadlines():
+    acct = DeepSeekAccount(0, MagicMock(spec=DeepSeekClient), min_interval=8.0, burst=1, min_end_gap=3.0)
+    acct.note_request_start(now=100.0)
+    acct.note_request_end(now=101.0)
+    # Start deadline (108) is later than the end deadline (104).
+    assert acct.seconds_until_ready(now=101.0) == 7.0
+
+
+def test_min_end_gap_disabled_by_default():
+    acct = DeepSeekAccount(0, MagicMock(spec=DeepSeekClient), min_interval=4.0)
+    acct.note_request_end(now=180.0)
+    # No pacing configured at all -> ready immediately.
+    assert acct.seconds_until_ready(now=180.0) == 0.0
+
+
+def test_min_end_gap_only_pacing():
+    """min_end_gap works on its own, with start pacing disabled."""
+    acct = DeepSeekAccount(0, MagicMock(spec=DeepSeekClient), min_end_gap=5.0)
+    acct.note_request_end(now=200.0)
+    assert acct.seconds_until_ready(now=200.0) == 5.0
+    assert acct.seconds_until_ready(now=204.0) == 1.0
+    assert acct.seconds_until_ready(now=205.0) == 0.0
+
+
+def test_min_end_gap_negative_is_clamped():
+    acct = DeepSeekAccount(0, MagicMock(spec=DeepSeekClient), min_end_gap=-3.0)
+    acct.note_request_end(now=200.0)
+    assert acct.seconds_until_ready(now=200.0) == 0.0
+
+
+def test_last_end_gap_reports_end_to_start_delay():
+    acct = DeepSeekAccount(0, MagicMock(spec=DeepSeekClient))
+    assert acct.last_end_gap is None
+    acct.note_request_start(now=100.0)
+    # No end recorded yet -> still unknown, never a fake value.
+    assert acct.last_end_gap is None
+    acct.note_request_end(now=160.0)
+    acct.note_request_start(now=163.0)
+    assert acct.last_end_gap == 3.0
+
+
+def test_last_end_gap_is_not_updated_by_end_alone():
+    """The gap is measured end->start, so a second end cannot move it."""
+    acct = DeepSeekAccount(0, MagicMock(spec=DeepSeekClient))
+    acct.note_request_end(now=10.0)
+    acct.note_request_start(now=14.0)
+    assert acct.last_end_gap == 4.0
+    acct.note_request_end(now=99.0)
+    assert acct.last_end_gap == 4.0
 
 
 def test_burst_allows_back_to_back_starts_without_wait():
