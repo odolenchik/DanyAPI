@@ -3022,3 +3022,66 @@ def test_dsml_shared_close_three_fused_params():
     assert args["-n"] is True
     assert args["head_limit"] == 120
     assert isinstance(args["head_limit"], int) and not isinstance(args["head_limit"], bool)
+
+
+def test_extract_system_skips_ephemeral_reminder():
+    """A client-injected <system-reminder> must not become the system prompt."""
+    messages = [
+        Message(role="system", content="You are helpful."),
+        Message(role="user", content="x"),
+        Message(role="system", content="<system-reminder>\nToday is 2026-09-23.\n</system-reminder>"),
+    ]
+    assert extract_system(messages) == "You are helpful."
+
+
+def test_has_history_ignores_user_role_reminder():
+    """A single real user turn plus a reminder is still not 'history'."""
+    reminder = "<system-reminder>\nThe TodoList tool has not been updated recently.\n</system-reminder>"
+    messages = [
+        Message(role="user", content="hello"),
+        Message(role="user", content=reminder),
+    ]
+    assert not _has_history(messages)
+
+
+def test_has_history_counts_real_user_turns_only():
+    reminder = "<system-reminder>\nnoise\n</system-reminder>"
+    messages = [
+        Message(role="user", content="first"),
+        Message(role="assistant", content="a1"),
+        Message(role="user", content="second"),
+        Message(role="user", content=reminder),
+    ]
+    assert _has_history(messages)
+
+
+def test_compact_ignores_user_role_reminder():
+    """A trailing reminder must not replace the real last user turn."""
+    from danyapi.tools import build_compact_prompt
+
+    reminder = "<system-reminder>\nThe TodoList tool has not been updated recently.\n</system-reminder>"
+    msgs = [
+        Message(role="user", content="first"),
+        Message(role="assistant", content="one"),
+        Message(role="user", content="second"),
+        Message(role="user", content=reminder),
+        Message(role="assistant", content="two"),
+    ]
+    _, body = build_compact_prompt(msgs)
+    assert "User: second" in body
+    assert "system-reminder" not in body
+
+
+def test_build_prompt_history_skips_reminder_in_rendered_context():
+    """On the new-chat history path a reminder must not appear as User: text."""
+    reminder = "<system-reminder>\nThe TodoList tool has not been updated recently.\n</system-reminder>"
+    messages = [
+        Message(role="user", content="first"),
+        Message(role="assistant", content="a1"),
+        Message(role="user", content=reminder),
+        Message(role="user", content="second"),
+        Message(role="assistant", content="a2"),
+    ]
+    prompt, _ = build_prompt(messages)
+    assert "User: second" in prompt
+    assert "system-reminder" not in prompt

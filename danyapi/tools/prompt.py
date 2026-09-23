@@ -383,6 +383,9 @@ def _has_history(messages: list[Any]) -> bool:
     for msg in messages:
         role = getattr(msg, "role", None)
         if role == "user":
+            # A client-injected <system-reminder> is not a real user turn.
+            if _is_ephemeral_system(_content_text(getattr(msg, "content", ""))):
+                continue
             user_count += 1
             continue
         text = _content_text(getattr(msg, "content", ""))
@@ -426,7 +429,9 @@ def extract_system(messages: list[Any]) -> str:
     for msg in messages:
         if getattr(msg, "role", None) == "system":
             text = _content_text(getattr(msg, "content", "")).strip()
-            if text:
+            # Skip client-injected <system-reminder>/<system> blocks: they change
+            # every turn (date, TodoList) and must not become the system prompt.
+            if text and not _is_ephemeral_system(text):
                 parts.append(text)
     return "\n".join(parts)
 
@@ -481,6 +486,10 @@ def build_compact_prompt(
         text = _content_text(getattr(msg, "content", ""))
         has_calls = bool(getattr(msg, "tool_calls", None))
         if role == "user":
+            # A client-injected <system-reminder> is not a user turn: skip it
+            # entirely so the preceding real question stays pending.
+            if _is_ephemeral_system(text):
+                continue
             pending_user = text or ""
         elif role == "assistant" and (text or has_calls):
             # Only include assistant messages that have actual content
@@ -556,7 +565,8 @@ def build_prompt(
             if role == "system":
                 continue
             text = render_message(msg)
-            if text:
+            # A client-injected reminder is not conversation history.
+            if text and not _is_ephemeral_system(text):
                 history_parts.append(f"{role.capitalize()}: {text}")
         history = "\n".join(history_parts)
         fixed_blocks = [b for b in (system, schema, json_block) if b]
