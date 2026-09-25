@@ -18,6 +18,7 @@ from ..config import settings
 from ..deepseek.stream import IncrementalSSE, MessageReconstructor
 from ..tokens import count_messages_tokens
 from ..tools.prompt import build_compact_prompt
+from ..tools.validate import build_repair_prompt, validate_calls
 from ..tooltrace import ToolTraceLogger
 from ..tooltrace import classify as _classify_trace
 from ..usage import record_usage
@@ -106,15 +107,122 @@ def _trace_parse(
     )
 
 
+def _validate_parsed(calls: Any, tool_schemas: Any) -> list[Any]:
+    """Validate already-parsed calls against the client schemas."""
+    as_dicts = [{"name": call.name, "arguments": call.arguments} for call in calls]
+    return validate_calls(as_dicts, tool_schemas)
+
+
+async def _repair_tool_calls(
+    account,
+    session,
+    parent_message_id,
+    issues: list[Any],
+    model_type: str,
+    thinking: bool,
+    search: bool,
+    ref_file_ids: Any,
+    tool_schemas: Any,
+    request_id: str | None,
+    trace: ToolTraceLogger | None,
+    model: str,
+) -> tuple[list[Any], str] | None:
+    """Ask the model once to redo a tool call that failed schema validation.
+
+    Runs in the same upstream session, so the model still sees its own rejected
+    answer. Returns the corrected ``(calls, text)`` only if the retry both parses
+    and validates; any other outcome returns ``None`` so the caller keeps the
+    original (imperfect) result rather than losing it.
+    """
+    try:
+        rec = await _collect_continuation(
+            account,
+            session,
+            parent_message_id,
+            model_type,
+            thinking,
+            search,
+            ref_file_ids,
+            request_id=request_id,
+            trace=trace,
+            model=model,
+            prompt=build_repair_prompt(issues),
+        )
+    except Exception as exc:
+        # Repair is best-effort: a transport/session failure here must never
+        # abort a request that already has a (merely imperfect) tool call.
+        log.warning("tool-call repair failed: %s", exc)
+        return None
+    if rec is None or not rec.content:
+        return None
+    parsed = toolemu.parse_tool_calls(rec.content, tool_schemas)
+    if parsed is None:
+        return None
+    calls, text = parsed
+    if _validate_parsed(calls, tool_schemas):
+        return None
+    return calls, text
+
+
 # ---------------------------------------------------------------------------
-# Compact retry: on CONTEXT_LENGTH_EXCEEDED, create a fresh session, send the
-# system prompt first (so DeepSeek knows its role), then send a compact body
-# with the last N user/assistant pairs + recent tool results. This keeps each
-# individual prompt under DeepSeek's per-request limit (~15000 chars).
+# Compact retry: on CONTEXT_LENGTH_EXCEEDED, hand the conversation over to a
+# fresh session. Older turns are compressed into a model-written summary (so
+# facts survive instead of being dropped), the last N pairs and recent tool
+# results are kept verbatim, and the current turn is always preserved. The
+# summary and the final prompt are sent as single messages, each kept under
+# DeepSeek's per-request input limit.
 # ---------------------------------------------------------------------------
 
 COMPACT_MAX_PAIRS = 8
 COMPACT_MAX_TOOL_RESULTS = 3
+# Cap on the dropped-history text handed to the summarizer, so the summarize
+# request itself stays well within the per-request limit.
+COMPACT_SUMMARY_MAX_CHARS = 24000
+
+
+async def _summarize_for_handoff(
+    account,
+    dropped_source: str,
+    model_type: str,
+    thinking: bool,
+    search: bool,
+    ref_file_ids: Any,
+    request_id: str | None,
+    trace: ToolTraceLogger | None,
+    model: str,
+) -> tuple[Any, str, str | None, str] | None:
+    """Open a session and summarize the history that compaction will drop.
+
+    Runs the summary on the *fresh* session, not the full one (the full session
+    is exactly what cannot take more input). On success the session is returned
+    so the caller reuses it for the real answer: the model then sees the summary
+    it just wrote plus the compact prompt. Returns ``None`` when the session
+    could not be created; a failed summary still returns the session with an
+    empty summary, so the caller can continue without one.
+    """
+    prompt = f"{toolemu.HANDOFF_SUMMARY_INSTRUCTION}\n\n{dropped_source}"
+    try:
+        session, sid = await account.sessions.obtain(None)
+    except Exception as exc:
+        log.warning("compact summary: failed to create session: %s", exc)
+        return None
+    rec = await _collect_continuation(
+        account,
+        session,
+        None,
+        model_type,
+        thinking,
+        search,
+        ref_file_ids,
+        request_id=request_id,
+        trace=trace,
+        model=model,
+        prompt=prompt,
+    )
+    if rec is None:
+        log.info("compact summary: no summary produced, continuing without one")
+        return session, sid, None, ""
+    return session, sid, rec.id, (rec.content or "").strip()
 
 
 async def _compact_retry(
@@ -134,67 +242,75 @@ async def _compact_retry(
     trace: ToolTraceLogger | None,
     model: str = "",
     user: str | None = None,
+    tools: Any = None,
+    tool_choice: Any = None,
+    response_format: Any = None,
 ) -> dict | None:
-    """Build compact prompt and retry on a fresh session. Returns result dict or None."""
+    """Summarize the dropped history, then answer in a fresh session.
+
+    Returns the result dict, or None when compaction could not run.
+    """
     if not messages:
         return None
-    system, compact_body = build_compact_prompt(messages, COMPACT_MAX_PAIRS, COMPACT_MAX_TOOL_RESULTS)
-    if not compact_body.strip():
-        log.warning("compact retry: empty body, giving up")
-        _drop_session(pool, account, old_session_key)
-        return None
 
-    log.info(
-        "compact retry: old_session=%s system_len=%d body_len=%d",
-        old_session_key,
-        len(system),
-        len(compact_body),
-    )
-
-    # Drop the old session so it's freed.
+    # Free the overflowing session before creating the replacement.
     _drop_session(pool, account, old_session_key)
 
-    # Create a fresh session.
-    try:
-        new_session, new_sid = await account.sessions.obtain(None)
+    # Summarize the older turns that compaction would otherwise drop, so facts
+    # and decisions survive the move instead of being lost to a truncation note.
+    summary: str | None = None
+    new_session = None
+    new_sid = None
+    parent_id = None
+    dropped_source = toolemu.dropped_pairs_source(messages, COMPACT_MAX_PAIRS, COMPACT_SUMMARY_MAX_CHARS)
+    if dropped_source:
+        summarized = await _summarize_for_handoff(
+            account,
+            dropped_source,
+            model_type,
+            thinking,
+            search,
+            ref_file_ids,
+            request_id,
+            trace,
+            model,
+        )
+        if summarized is None:
+            return None
+        new_session, new_sid, parent_id, summary = summarized
         pool.register(account.index, new_sid)
-    except Exception as exc:
-        log.warning("compact retry: failed to create session: %s", exc)
+
+    system, compact_body = build_compact_prompt(
+        messages,
+        COMPACT_MAX_PAIRS,
+        COMPACT_MAX_TOOL_RESULTS,
+        tools=tools,
+        tool_choice=tool_choice,
+        response_format=response_format,
+        summary=summary,
+    )
+    prompt = "\n\n".join(part for part in (system, compact_body) if part).strip()
+    if not prompt:
+        log.warning("compact retry: empty prompt, giving up")
         return None
 
-    # Two-step send: system first (so DeepSeek knows its role), then compact body.
-    parent_id = None
-    if system:
+    if new_session is None:
         try:
-            pow_headers = await _fresh_pow_headers(account)
-            resp_sys = await _send_with_auth(
-                account,
-                account.client,
-                pow_headers,
-                new_sid,
-                None,
-                system,
-                model_type,
-                thinking,
-                search,
-                ref_file_ids,
-            )
-        except HTTPException as exc:
-            log.warning("compact retry: system send failed (%s)", exc.status_code)
+            new_session, new_sid = await account.sessions.obtain(None)
+            pool.register(account.index, new_sid)
+        except Exception as exc:
+            log.warning("compact retry: failed to create session: %s", exc)
             return None
-        rec_sys = MessageReconstructor()
-        incr_sys = IncrementalSSE()
-        try:
-            async for chunk in resp_sys.aiter_bytes():
-                for event in incr_sys.feed(chunk):
-                    rec_sys.handle(event)
-            for event in incr_sys.finish():
-                rec_sys.handle(event)
-        finally:
-            await resp_sys.aclose()
-        parent_id = rec_sys.id
 
-    # Send the compact body as the second message.
+    log.info(
+        "compact retry: old_session=%s new_session=%s summary_len=%d prompt_len=%d",
+        old_session_key,
+        new_sid,
+        len(summary or ""),
+        len(prompt),
+    )
+
+    # One combined send: system prompt, summary, kept history and current turn.
     try:
         pow_headers = await _fresh_pow_headers(account)
         resp = await _send_with_auth(
@@ -203,14 +319,14 @@ async def _compact_retry(
             pow_headers,
             new_sid,
             parent_id,
-            compact_body,
+            prompt,
             model_type,
             thinking,
             search,
             ref_file_ids,
         )
     except HTTPException as exc:
-        log.warning("compact retry: body send failed (%s)", exc.status_code)
+        log.warning("compact retry: send failed (%s)", exc.status_code)
         return None
 
     rec = MessageReconstructor()
@@ -300,64 +416,72 @@ async def _compact_retry_stream(
     created: int,
     model: str,
     user: str | None = None,
+    tools: Any = None,
+    tool_choice: Any = None,
+    response_format: Any = None,
 ) -> AsyncIterator[str] | None:
-    """Build compact prompt and retry on a fresh session. Returns async generator or None."""
+    """Summarize the dropped history, then answer in a fresh session.
+
+    Returns an async generator, or None when compaction could not run.
+    """
     if not messages:
         return None
-    system, compact_body = build_compact_prompt(messages, COMPACT_MAX_PAIRS, COMPACT_MAX_TOOL_RESULTS)
-    if not compact_body.strip():
-        log.warning("compact retry (stream): empty body, giving up")
-        _drop_session(pool, account, old_session_key)
-        return None
-
-    log.info(
-        "compact retry (stream): old_session=%s system_len=%d body_len=%d",
-        old_session_key,
-        len(system),
-        len(compact_body),
-    )
 
     _drop_session(pool, account, old_session_key)
 
-    try:
-        new_session, new_sid = await account.sessions.obtain(None)
+    summary: str | None = None
+    new_session = None
+    new_sid = None
+    parent_id = None
+    dropped_source = toolemu.dropped_pairs_source(messages, COMPACT_MAX_PAIRS, COMPACT_SUMMARY_MAX_CHARS)
+    if dropped_source:
+        summarized = await _summarize_for_handoff(
+            account,
+            dropped_source,
+            model_type,
+            thinking,
+            search,
+            ref_file_ids,
+            request_id,
+            trace,
+            model,
+        )
+        if summarized is None:
+            return None
+        new_session, new_sid, parent_id, summary = summarized
         pool.register(account.index, new_sid)
-    except Exception as exc:
-        log.warning("compact retry (stream): failed to create session: %s", exc)
+
+    system, compact_body = build_compact_prompt(
+        messages,
+        COMPACT_MAX_PAIRS,
+        COMPACT_MAX_TOOL_RESULTS,
+        tools=tools,
+        tool_choice=tool_choice,
+        response_format=response_format,
+        summary=summary,
+    )
+    prompt = "\n\n".join(part for part in (system, compact_body) if part).strip()
+    if not prompt:
+        log.warning("compact retry (stream): empty prompt, giving up")
         return None
 
-    # Two-step send: system first, then compact body.
-    parent_id = None
-    if system:
+    if new_session is None:
         try:
-            pow_headers = await _fresh_pow_headers(account)
-            resp_sys = await _send_with_auth(
-                account,
-                account.client,
-                pow_headers,
-                new_sid,
-                None,
-                system,
-                model_type,
-                thinking,
-                search,
-                ref_file_ids,
-            )
-        except HTTPException as exc:
-            log.warning("compact retry (stream): system send failed (%s)", exc.status_code)
+            new_session, new_sid = await account.sessions.obtain(None)
+            pool.register(account.index, new_sid)
+        except Exception as exc:
+            log.warning("compact retry (stream): failed to create session: %s", exc)
             return None
-        rec_sys = MessageReconstructor()
-        incr_sys = IncrementalSSE()
-        try:
-            async for chunk in resp_sys.aiter_bytes():
-                for event in incr_sys.feed(chunk):
-                    rec_sys.handle(event)
-            for event in incr_sys.finish():
-                rec_sys.handle(event)
-        finally:
-            await resp_sys.aclose()
-        parent_id = rec_sys.id
 
+    log.info(
+        "compact retry (stream): old_session=%s new_session=%s summary_len=%d prompt_len=%d",
+        old_session_key,
+        new_sid,
+        len(summary or ""),
+        len(prompt),
+    )
+
+    # One combined send: system prompt, summary, kept history and current turn.
     try:
         pow_headers = await _fresh_pow_headers(account)
         resp = await _send_with_auth(
@@ -366,14 +490,14 @@ async def _compact_retry_stream(
             pow_headers,
             new_sid,
             parent_id,
-            compact_body,
+            prompt,
             model_type,
             thinking,
             search,
             ref_file_ids,
         )
     except HTTPException as exc:
-        log.warning("compact retry (stream): body send failed (%s)", exc.status_code)
+        log.warning("compact retry (stream): send failed (%s)", exc.status_code)
         return None
 
     if context_seq:
@@ -439,6 +563,24 @@ async def _compact_retry_stream(
             parsed = toolemu.parse_tool_calls(content_buf, tool_schemas)
             if parsed is not None:
                 tool_calls, tool_text = parsed
+                issues = _validate_parsed(tool_calls, tool_schemas)
+                if issues:
+                    repaired = await _repair_tool_calls(
+                        account,
+                        new_session,
+                        rec.id,
+                        issues,
+                        model_type,
+                        thinking,
+                        search,
+                        ref_file_ids,
+                        tool_schemas,
+                        request_id,
+                        trace,
+                        model,
+                    )
+                    if repaired is not None:
+                        tool_calls, tool_text = repaired
                 for delta in toolemu.tool_call_deltas(tool_calls, tool_text):
                     yield _sse(
                         {
@@ -521,6 +663,9 @@ async def _collect_non_stream(
     messages: list[Any] | None = None,
     user: str | None = None,
     rebuild_prompt: Callable[[], str] | None = None,
+    tools: Any = None,
+    tool_choice: Any = None,
+    response_format: Any = None,
 ):
     await _human_delay()
     async with account_lock(lock, settings.acquire_timeout, account):
@@ -628,6 +773,9 @@ async def _collect_non_stream(
                 trace,
                 model=model,
                 user=user,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
             )
             if compact_result is not None:
                 return compact_result
@@ -658,6 +806,9 @@ async def _collect_non_stream(
                     trace,
                     model=model,
                     user=user,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    response_format=response_format,
                 )
                 if compact_result is not None:
                     return compact_result
@@ -739,6 +890,24 @@ async def _collect_non_stream(
             parsed = toolemu.parse_tool_calls(content, tool_schemas)
             if parsed is not None:
                 tool_calls, tool_text = parsed
+                issues = _validate_parsed(tool_calls, tool_schemas)
+                if issues:
+                    repaired = await _repair_tool_calls(
+                        account,
+                        session,
+                        rec.id or response_message_id,
+                        issues,
+                        model_type,
+                        thinking,
+                        search,
+                        ref_file_ids,
+                        tool_schemas,
+                        request_id,
+                        trace,
+                        model,
+                    )
+                    if repaired is not None:
+                        tool_calls, tool_text = repaired
                 finish = "tool_calls"
                 message = toolemu.format_tool_message(tool_calls, tool_text, reasoning)
             else:
@@ -800,6 +969,9 @@ async def _stream_openai(
     messages: list[Any] | None = None,
     user: str | None = None,
     rebuild_prompt: Callable[[], str] | None = None,
+    tools: Any = None,
+    tool_choice: Any = None,
+    response_format: Any = None,
 ):
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -1055,6 +1227,9 @@ async def _stream_openai(
                 created,
                 model,
                 user=user,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
             )
             if compact_gen is not None:
                 async for item in compact_gen:
@@ -1115,6 +1290,9 @@ async def _stream_openai(
                     created,
                     model,
                     user=user,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    response_format=response_format,
                 )
                 if compact_gen is not None:
                     async for item in compact_gen:
@@ -1284,6 +1462,24 @@ async def _stream_openai(
             parsed = toolemu.parse_tool_calls(content_buf, tool_schemas)
             if parsed is not None:
                 tool_calls, tool_text = parsed
+                issues = _validate_parsed(tool_calls, tool_schemas)
+                if issues:
+                    repaired = await _repair_tool_calls(
+                        account,
+                        session,
+                        rec.id or response_message_id,
+                        issues,
+                        model_type,
+                        thinking,
+                        search,
+                        ref_file_ids,
+                        tool_schemas,
+                        request_id,
+                        trace,
+                        model,
+                    )
+                    if repaired is not None:
+                        tool_calls, tool_text = repaired
                 for delta in toolemu.tool_call_deltas(tool_calls, tool_text):
                     yield _sse(
                         {

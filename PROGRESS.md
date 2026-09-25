@@ -2,6 +2,141 @@
 
 ## Готово
 
+- **Compaction: сохранение текущего хода + суммаризация + один запрос.**
+  Переход в новый чат при переполнении контекста
+  (`_compact_retry`/`_compact_retry_stream`) был сделан плохо, с прямыми багами:
+  - **Текущий вопрос терялся.** `build_compact_prompt` собирал только
+    *завершённые* пары user→assistant, поэтому последнее сообщение пользователя
+    (ради которого и делается запрос) в новый чат не попадало — модель отвечала
+    на старый вопрос. Теперь текущий ход всегда сохраняется (вопрос + для
+    tool-раунда сам вызов и результаты).
+  - **Не было ограничения размера.** «Компактное» тело собиралось из 8 пар без
+    учёта длины и могло превысить лимит (замер: 124k символов при рабочем
+    лимите 52k). Теперь тело обрезается до `MAX_APPEND_PROMPT_CHARS`: сначала
+    выбрасываются старейшие пары, затем усекаются tool-результаты.
+  - **Схема инструментов и JSON-режим терялись** (параметр `tool_schemas` был
+    мёртвым). Теперь `build_compact_prompt` принимает raw `tools`/`tool_choice`/
+    `response_format` и рендерит их в system-блок; проброшено из `openai.py`
+    через `_collect_non_stream`/`_stream_openai`.
+  - **Суммаризация вместо обрезки.** Перед переездом старый контекст
+    сжимается в резюме моделью на *новой* сессии (`_summarize_for_handoff`,
+    инструкция `HANDOFF_SUMMARY_INSTRUCTION`); резюме кладётся в новый чат над
+    сохранённой историей, так что факты/решения/пути не теряются. Нет пар для
+    суммаризации → сразу обычный компакт.
+  - **Один запрос вместо двух.** Раньше system и тело шли двумя сообщениями
+    (2 PoW, 2 точки отказа); теперь system+резюме+история+текущий ход уходят
+    одним промптом. При использовании сессии под резюме ответ приходит в неё же.
+  - Попутно исправлен `_truncate_head`: при лимите меньше маркера результат
+    превышал лимит.
+  Тесты: `tests/test_tools.py` (+8), `tests/test_api_helpers.py` (+1, обновлён
+  один под один запрос), `tests/test_prompt_accounts_coverage.py` (переписан
+  под новые семантики). Верификация: `ruff` + `ruff format --check` +
+  `pytest -q` → **1153 passed**, `arch-check` OK; `tools/prompt.py` — 100%
+  покрытие. Живой E2E: DeepSeek принял входы до 400k символов, поэтому
+  `CONTEXT_LENGTH_EXCEEDED` вживую не воспроизвести — путь покрыт мок-тестами,
+  которые дёргают именно эти ветки.
+
+- **Qwen: reattach + sticky-чат для генерации картинок (анти-блок).**
+  Причина суточного блока генерации: в `_image_generations` не было ни context
+  dedup, ни reattach, поэтому при `session_id=None` **каждый** запрос картинки
+  создавал новый чат, а Qwen за это ограничивает и в итоге блокирует генерацию.
+  - **Sticky-чат на пару «аккаунт + image-модель».** `QwenAccount` держит
+    привязку в `qwen-sticky` JsonStore (`sticky_image_chat` /
+    `set_sticky_image_chat`); `collect_image` без `session_id` переиспользует
+    закреплённый чат (явный `session_id` уважается и не перезаписывает pin).
+  - **Reattach для Qwen.** `QwenClient.fetch_chat` (`GET /api/v2/chats/{id}`),
+    `QwenSessionRegistry._attach` восстанавливает `last_response_id` из
+    `history.currentId` (фолбэк — id последнего assistant). Чат-тип учтён:
+    чат возобновляется только при совпадении `chat_type` (`t2t`/`t2i`), поэтому
+    текстовый чат не продолжается image-запросом. Image-сессии создаются
+    `chat_type="t2i"`.
+  - Reattach-хук добавлен и в Qwen chat-путь (`_chat_completions_qwen`),
+    зеркально DeepSeek (до `build_prompt`).
+  - Диагностика вживую: у image-чатов (t2i) история и `history.currentId`
+    работают так же, как у t2t (чат с 66 сообщениями); `create_chat` принимает
+    `chat_type` и создаёт t2i-чат; `response_id` из стрима == `id` assistant в
+    истории == `history.currentId`; продолжение по одному chat_id сохраняет
+    контекст. Прежний тезис «у Qwen нет API истории» **опровергнут**.
+  Тесты: `tests/test_sessions.py` (+9 Qwen attach), `tests/test_edge_cases.py`
+  (+3 sticky), `tests/test_qwen_image.py` (+3 sticky/reattach). Верификация:
+  `ruff` + `ruff format --check` + `pytest -q` → **1143 passed**, `arch-check` OK.
+  E2E (порт 6720): два image-запроса без `session_id` → **1** `create chat`,
+  sticky-файл указывает на тот же чат; reboot (удалены `qwen-sessions`, оставлен
+  `qwen-sticky`) → генерация вернула картинку, `reattached: true`, **0**
+  `create chat`.
+
+- **Возврат к тому же чату после потери локальной записи (reattach).**
+  Раньше `session_id` == upstream `chat_session_id`, но при промахе локального
+  реестра (`SessionRegistry.obtain`) создавался **новый** чат: LRU-вытеснение,
+  TTL, перезапуск или очищенный temp-кэш рвали связку, а чат на стороне
+  DeepSeek оставался жив.
+  - `SessionRegistry.attach()` + провайдерный хук `_attach()`
+    (`danyapi/sessions.py`): при промахе реестра пробует восстановить сессию.
+  - `DeepSeekSessionRegistry` (`danyapi/accounts.py`): `_attach` тянет
+    `history_messages`, берёт **max(message_id)** как `last_message_id` и
+    `accumulated_token_usage` как восстановленный счётчик, ставит
+    `reattached=True`. Ошибка/пустая история → `None` (мягкий фолбэк на новый чат).
+  - `api/openai.py` вызывает reattach **до** `build_prompt`, поэтому при успехе
+    `has_session=True` и уходит дельта-промпт, а не вся история; сессия
+    регистрируется в пуле (`pool.register`).
+  - `_attach` выставляет `accounted_tokens = accumulated_tokens`, чтобы первый
+    ход после возврата не пересчитывал всю историю в usage.
+  - Долговечная привязка session→account: `account_for_session` при TTL чистит
+    только in-memory запись и падает в персистентный `JsonStore`
+    (`_affinity_lookup`), поэтому сессия и после рестарта маршрутизируется на
+    аккаунт-владелец чата. Сбрасывается только при broken-аккаунте или `forget()`.
+  - Диагностика на живом DeepSeek: поле id сообщения — `message_id` (не `id`),
+    порядок брать по max, `last_message_id`/токены восстанавливаются, чужой UUID
+    → biz_code 1 «invalid chat session id», не-UUID → biz_code 400; оба ловятся.
+  Тесты: `tests/test_sessions.py` (+14), `tests/test_accounts.py` (+2, обновлён
+  один под новые TTL-семантики). Верификация: `ruff` + `ruff format --check` +
+  `pytest -q` → **1129 passed**, `arch-check` OK. E2E (порт 6712): создать чат →
+  убить процесс → удалить `deepseek-sessions-default.json`, оставить
+  `deepseek-affinities-default.json` → перезапуск → запрос с тем же
+  `session_id` → тот же chat id, кодовое слово сохранено, в логе нет
+  `create session`.
+
+- **Парсер ловит tool-вызов с неквотированным ключом (`<{tool_calls: [...]}>`).**
+  «Холостые» вызовы инструментов: DeepSeek иногда теряет кавычки вокруг ключа
+  `tool_calls` и оборачивает объект в угловые скобки — `<{tool_calls: [{...}]}>`.
+  Ни один repair-путь (`_normalize_single_quotes`, `_strip_trailing_commas`,
+  `_fix_invalid_escapes`, `_fix_unbalanced_json`) голый ключ не чинил, поэтому
+  `parse_tool_calls` возвращал `None`, и весь JSON уходил клиенту как обычный
+  `content` — вызов «не срабатывал». Добавлен `_quote_bare_keys`
+  (`danyapi/tools/parse.py`): кавычит идентификатор только там, где ожидается
+  ключ (после `{` или `,`), и никогда внутри строки — URL/проза не задеты.
+  Подключён в `_loads_lenient` (в т.ч. в комбинации с `_fix_invalid_escapes`).
+  Уголки отдельно не чинятся: `_balanced_json` игнорирует `<`/`>` вокруг `{...}`.
+  Проверено на реальном контенте из лога (rid `93870405f7794e73b8cd7f71065372e2`,
+  426 симв.): было `NONE` → стало 3 вызова, `classify: ok`.
+  Тесты: `tests/test_tools.py` (+6) — angle-wrapper, без обёртки, вложенные
+  голые ключи, неизменность валидного JSON, URL-проза, строковые значения.
+  Верификация: `ruff` + `ruff format --check` + `pytest -q` → **1115 passed**,
+  `arch-check` OK.
+
+- **Фаза D переработки tool use: валидация по JSON Schema + repair-цикл.**
+  Раньше парсер `danyapi/tools/parse.py` принимал любой распарсенный вызов без
+  проверки против схемы клиента — коверканье (`extra_argument`, `wrong_type`,
+  отсутствие required-поля) уходило клиенту как есть, и Kimi ругался
+  «Invalid args for tool». Добавлен единый валидатор `danyapi/tools/validate.py`
+  (`type_matches` / `validate_call` / `validate_calls` / `summarize` /
+  `build_repair_prompt`), а диагностический `tooltrace._check_calls` теперь
+  делегирует в него — раньше логика типов дублировалась и могла разойтись.
+  Новое: `missing_required` (по ключу `__required__` из `tool_schema_map`).
+  При провале валидации основной путь делает **одну** repair-попытку в той же
+  сессии (`_repair_tool_calls` в `streaming.py`, через обобщённый
+  `_collect_continuation(prompt=...)`); сбой repair не роняет запрос —
+  сохраняется исходный результат. Подключено во все три точки DeepSeek
+  (non-stream, основной stream, compact-retry). `tool_schema_map` и `parse.py`
+  не трогались — нулевой риск для 242 существующих тестов парсера.
+  Тесты: `tests/test_validate.py` (+21), `tests/test_tools_api.py` (+5).
+  Верификация: `ruff` + `ruff format --check` + `pytest -q` → **1109 passed**,
+  `arch-check` OK. E2E через живой сервер (порт 6670): non-stream и stream
+  вернули валидные tool_calls без утечки мусора в `content`; `tooltrace`
+  `parse.result=ok`, `issue=None`.
+  Осталось (Фаза B): инкрементальный разбор потока вместо буферизации
+  `content_buf`; Фаза C — точечно, только если D не хватит.
+
 - Пейсинг DeepSeek теперь считает паузу **от конца** предыдущего запроса, а не только от
   старта. Причина инцидента 2026-09-23: клиент шлёт длинные запросы цепочкой (~80 с
   каждый), старт-старт интервал удовлетворён, а аккаунт получает следующий запрос через
@@ -322,15 +457,21 @@
 
 ## Известные проблемы (см. BACKLOG.md)
 
-- Полный CI-гейт `pytest --cov-fail-under=100` падает: покрытие ~96% — дефицит
-  рефакторинга в `streaming.py`, `tooltrace.py`, `prompt.py` и др., не относится к
-  текущим фиксам (локальный `pytest -q` → 848 passed).
+- Полный CI-гейт `pytest --cov-fail-under=100` падает: покрытие ~97% — дефицит
+  рефакторинга в `api/streaming.py` (~102 строки), `tools/parse.py` (~52) и др.,
+  не относится к текущим фиксам (локальный `pytest -q` → 1143 passed).
+  Пять coverage-сюит (`tests/test_*_coverage.py`) подняли покрытие с 94% до 97%.
 - `ruff format --check` ранее падал на `scripts/smoke_tooltrace.py` и
   `tests/test_tooltrace.py`; оба отформатированы, сейчас формат-гейт зелёный.
 
 ## Текущий commit
 
-Закоммичено: `perf(api): stop re-uploading attachments and hashing whole images` —
-`danyapi/api/attachments.py`, `danyapi/api/openai.py`, `danyapi/tools/prompt.py`,
-`tests/test_image_size.py`, `tests/test_tools.py`, `PROGRESS.md`. Предыдущий
-коммит: `docs(backlog): note that trace.dany misses a rebuilt prompt`.
+В работе (не закоммичено): compaction — сохранение текущего хода, суммаризация
+старого контекста, один запрос вместо двух; см. «Готово» выше.
+
+Последний коммит: `test: add targeted coverage suites and a CLAUDE.md agent guide`
+(`3568633`). До него: `feat(sessions): reattach lost chats and pin one chat per image model`
+(`33ad32b`).
+
+Следующее: добить покрытие до 100% для CI-гейта — начать с `api/streaming.py`
+(см. «Известные проблемы»).

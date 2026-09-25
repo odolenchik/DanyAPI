@@ -1085,8 +1085,9 @@ async def test_non_stream_input_exceeds_fresh_session_compacts():
         ],
     )
     assert result["choices"][0]["message"]["content"] == "Hi"
-    # first completion (failed) + system send + compact body send
-    assert acct.client.completion.await_count == 3
+    # first completion (failed) + one combined compact send (system + body).
+    # No summary call here: this history is short enough that nothing is dropped.
+    assert acct.client.completion.await_count == 2
 
 
 async def test_stream_input_exceeds_fresh_session_compacts():
@@ -1111,6 +1112,41 @@ async def test_stream_input_exceeds_fresh_session_compacts():
     joined = "".join(await _collect_agen(gen))
     assert '"content": "Hi"' in joined
     assert joined.rstrip().endswith("data: [DONE]")
+
+
+async def test_non_stream_compact_summarizes_dropped_history():
+    """With more pairs than the compact view keeps, the dropped prefix is
+    summarized first and the summary is carried into the new session."""
+    messages = [openai_mod.ChatMessage(role="system", content="sys")]
+    for i in range(12):
+        messages.append(openai_mod.ChatMessage(role="user", content=f"question {i}"))
+        messages.append(openai_mod.ChatMessage(role="assistant", content=f"answer {i}"))
+    messages.append(openai_mod.ChatMessage(role="user", content="CURRENT"))
+
+    # failed full attempt, summary, combined compact answer
+    acct = FakeAccount([INPUT_SSE, OK_SSE, OK_SSE])
+    acct.sessions.obtain = AsyncMock(return_value=(FakeSession(), "s2"))
+    result = await openai_mod._collect_non_stream(
+        account=acct,
+        pool=MagicMock(),
+        existing_sid="s1",
+        lock=acct.sem,
+        prompt="x",
+        model="deepseek-v4-flash",
+        model_type="default",
+        thinking=False,
+        search=False,
+        messages=messages,
+    )
+    assert result["choices"][0]["message"]["content"] == "Hi"
+    # summary send + compact send on top of the failed attempt
+    assert acct.client.completion.await_count == 3
+    summary_prompt = acct.client.completion.call_args_list[1].kwargs["prompt"]
+    compact_prompt = acct.client.completion.call_args_list[2].kwargs["prompt"]
+    assert "Summarize it for handoff" in summary_prompt
+    # The current turn and the summary header reach the fresh chat.
+    assert "CURRENT" in compact_prompt
+    assert "Summary of earlier conversation" in compact_prompt
 
 
 INPUT_HTTP_BODY = '{"message":"Content is too long. Please shorten it and try again.","finish_reason":"input_exceeds_limit"}'

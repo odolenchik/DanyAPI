@@ -96,9 +96,9 @@ def _handle_account_error(account, exc: Exception) -> None:
         log.warning("qwen account #%d error: %s", account.index, exc)
 
 
-async def _prepare_session(account, pool, existing_sid: str | None, model_id: str, context_seq: tuple[str, ...] | None = None):
+async def _prepare_session(account, pool, existing_sid: str | None, model_id: str, context_seq: tuple[str, ...] | None = None, chat_type: str = "t2t"):
     try:
-        session, session_key = await account.sessions.obtain(existing_sid, model_id)
+        session, session_key = await account.sessions.obtain(existing_sid, model_id, chat_type=chat_type)
     except QwenError as exc:
         _handle_account_error(account, exc)
         raise HTTPException(_error_status(exc.code), f"Qwen error: {exc}") from exc
@@ -367,7 +367,16 @@ async def collect_image(
 ):
     await _human_delay()
     async with account_lock(lock, settings.acquire_timeout):
-        session, session_key = await _prepare_session(account, pool, existing_sid, IMAGE_CHAT_MODEL, context_seq)
+        # Keep every prompt for this account + image model in one chat. Qwen
+        # starts limiting (then blocks for a day) once an account opens many new
+        # chats, so reuse the pinned chat unless the caller explicitly pinned
+        # one, and reattach it if its local registry entry was lost.
+        pinned = existing_sid or account.sticky_image_chat(model_id)
+        if pinned is not None and account.sessions.get(pinned) is None:
+            await account.sessions.attach(pinned, model=IMAGE_CHAT_MODEL, chat_type="t2i")
+        session, session_key = await _prepare_session(account, pool, pinned, IMAGE_CHAT_MODEL, context_seq, chat_type="t2i")
+        if existing_sid is None:
+            account.set_sticky_image_chat(model_id, session_key)
         stop_response_id: str | None = None
         try:
             rec: QwenStreamReconstructor | None = None

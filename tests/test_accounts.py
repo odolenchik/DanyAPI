@@ -466,13 +466,34 @@ def test_forget_discards_affinity(pool_store):
     assert "s1" not in store
 
 
-def test_account_for_session_expired_discards(pool_store):
+def test_account_for_session_expired_keeps_durable_affinity(pool_store):
+    # TTL only drops the in-memory entry; the durable mapping survives so a
+    # resumed session still routes to the account that owns its chat.
     store = JsonStore("aff4", "default")
     pool = AccountPool([make_acct(0)], ttl=0.05, affinity_store=store)
     pool.register(0, "s1")
     pool._by_session["s1"] = (0, time.monotonic() - 10)
+    assert pool.account_for_session("s1") is not None
+    assert "s1" in store
+
+
+def test_account_for_session_expired_without_store_returns_none(pool_store):
+    pool = AccountPool([make_acct(0)], ttl=0.05)
+    pool.register(0, "s1")
+    pool._by_session["s1"] = (0, time.monotonic() - 10)
     assert pool.account_for_session("s1") is None
-    assert "s1" not in store
+
+
+def test_account_for_session_reads_durable_affinity_after_restart(pool_store):
+    # A fresh pool (simulating a restart) has an empty in-memory map but the
+    # persisted affinity routes the session back to its owner account.
+    store = JsonStore("aff7", "default")
+    AccountPool([make_acct(0)], affinity_store=store).register(0, "s1")
+    pool2 = AccountPool([make_acct(0)], affinity_store=JsonStore("aff7", "default"))
+    pool2._by_session.clear()
+    acct = pool2.account_for_session("s1")
+    assert acct is not None
+    assert acct.index == 0
 
 
 def test_account_for_session_broken_discards(pool_store):

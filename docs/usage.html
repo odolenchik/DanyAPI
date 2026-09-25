@@ -181,7 +181,7 @@
                     <li data-i18n-html="ug_persist_b4">Set <span class="env-var">DANYAPI_CACHE_DISABLED=1</span> to keep everything in memory only.</li>
                     <li data-i18n-html="ug_persist_b5">In Docker, mount <span class="env-var">DANYAPI_CACHE_DIR</span> as a volume if you want sessions to survive container recreation.</li>
                 </ul>
-                <p data-i18n-html="ug_persist_note">Note that the upstream chats themselves live on the provider side; the local cache only maps your <code>session_id</code> / message context to them.</p>
+                <p data-i18n-html="ug_persist_note">Note that the upstream chats themselves live on the provider side; the local cache only maps your <code>session_id</code> / message context to them. If the local mapping is lost (eviction, restart, temp cache wiped) but you still send the same <code>session_id</code>, DanyAPI reattaches to the existing DeepSeek chat via its message history instead of starting a new one, so the conversation continues in place.</p>
 
                 <h2 id="file-attachments" data-i18n="ug_h_files">File attachments (DeepSeek)</h2>
                 <p data-i18n-html="ug_files_p">Send files as base64 in the <code>files</code> field, or as <code>image_url</code> (data URI) parts inside a message:</p>
@@ -466,6 +466,133 @@ curl http://127.0.0.1:8000/v1/chat/completions \
                     <code>size</code> makes the server download and re-encode the image, which is
                     slower; plain <code>"url"</code> just returns the upstream link.
                 </p>
+                <p data-i18n="ug_images_sticky">
+                    Without a <code>session_id</code>, every image prompt for the same account and
+                    model is generated in <strong>one pinned chat</strong> that is reused across
+                    requests and survives restarts. Qwen rate-limits image generation once an
+                    account opens many new chats and can block it for a day, so reuse keeps
+                    generation available; pass an explicit <code>session_id</code> to target a
+                    specific chat instead.
+                </p>
+
+                <h2 id="staying-in-one-chat" data-i18n="ug_h_onechat">Staying in one chat (client guide)</h2>
+                <p data-i18n-html="ug_onechat_p">
+                    Every request that continues a conversation must target the <strong>same
+                    upstream chat</strong>. DanyAPI maps your <code>session_id</code> to that chat; if
+                    you keep creating new chats, the provider starts rate-limiting (Qwen image
+                    generation can be blocked for a day). The rules below keep a client inside one
+                    chat.
+                </p>
+
+                <h3 id="onechat-pin" data-i18n="ug_onechat_h_pin">1. Pin the chat with session_id</h3>
+                <p data-i18n-html="ug_onechat_pin">
+                    The response carries a <code>session_id</code>. Store it and send it back on every
+                    following request to stay in that chat. Treat it like a conversation handle,
+                    one per logical dialog:
+                </p>
+                <div class="code-header">python</div>
+                <pre><code>from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="dummy")
+
+sid = None
+for question in ["2+2?", "And times 10?", "Now subtract 5?"]:
+    r = client.chat.completions.create(
+        model="deepseek-v4-flash",
+        messages=[{"role": "user", "content": question}],
+        extra_body={"session_id": sid},
+    )
+    sid = r.session_id          # keep the handle for the next turn
+    print(r.choices[0].message.content)</code></pre>
+                <p data-i18n-html="ug_onechat_pin_note">
+                    <code>session_id</code> is a non-standard field, so with the OpenAI SDK pass it
+                    through <code>extra_body</code> (shown above) or send raw JSON. With plain
+                    <code>curl</code> it is just a top-level field:
+                </p>
+                <div class="code-header">bash</div>
+                <pre><code>curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen3.8-max",
+       "messages": [{"role": "user", "content": "Hello again"}],
+       "session_id": "&lt;id from the previous response&gt;"}'</code></pre>
+
+                <h3 id="onechat-start" data-i18n="ug_onechat_h_start">2. Start a chat once, then reuse it</h3>
+                <p data-i18n-html="ug_onechat_start">
+                    Send the <strong>first</strong> request with no <code>session_id</code> (or an empty
+                    one). Read <code>session_id</code> from the reply and use it for every later turn.
+                    Do not start a fresh chat per message: that is exactly what trips the
+                    provider limits.
+                </p>
+                <ul>
+                    <li data-i18n-html="ug_onechat_b_send">Send only the <strong>new</strong> user message on a
+                        continued turn. The full history already lives in the chat; replaying it every
+                        time is unnecessary and costs tokens. DanyAPI sends just the delta.</li>
+                    <li data-i18n-html="ug_onechat_b_tools">The system prompt and tool schema are injected
+                        <strong>once</strong>, into the first message of the chat.</li>
+                    <li data-i18n-html="ug_onechat_b_stream">For streaming, read <code>session_id</code> from
+                        the final SSE chunk (the one with an empty <code>choices</code> array, before
+                        <code>data: [DONE]</code>).</li>
+                </ul>
+
+                <h3 id="onechat-stateless" data-i18n="ug_onechat_h_stateless">3. Stateless clients (no session_id)</h3>
+                <p data-i18n-html="ug_onechat_stateless">
+                    If a client cannot store <code>session_id</code>, DanyAPI still keeps one chat by
+                    matching a fingerprint of the <code>system</code>/<code>user</code> messages: a
+                    request that continues a previously seen conversation reuses its chat, and an
+                    identical one reuses the same chat. Isolation is per <code>user</code> value, so
+                    multi-tenant clients should always send <code>user</code>. This works for chat, but
+                    sending an explicit <code>session_id</code> is always more reliable.
+                </p>
+
+                <h3 id="onechat-images" data-i18n="ug_onechat_h_images">4. Image generation (Qwen)</h3>
+                <p data-i18n-html="ug_onechat_images">
+                    Image requests are the strictest case: Qwen limits an account once it opens
+                    many new chats. DanyAPI pins <strong>one image chat per account + model</strong>
+                    automatically, so when you send no <code>session_id</code> every prompt for that
+                    model lands in the same chat, and it survives restarts. To keep it that way:
+                </p>
+                <ul>
+                    <li data-i18n-html="ug_onechat_img_b1">Do <strong>not</strong> invent a new
+                        <code>session_id</code> per image; send none and let the pin do its job.</li>
+                    <li data-i18n-html="ug_onechat_img_b2">Use a <strong>stable</strong>
+                        <span class="env-var">DANYAPI_CACHE_DIR</span> (a real directory, not a wiped
+                        temp dir) and run a single instance per Qwen account — the pin lives there.</li>
+                    <li data-i18n-html="ug_onechat_img_b3">Pass an explicit <code>session_id</code> only
+                        to target a specific chat; it is honoured but does not overwrite the pin.</li>
+                    <li data-i18n-html="ug_onechat_img_b4">Do not switch image models per request
+                        (<code>qwen-image-2.0-pro</code> vs <code>qwen-image-3.0-pro</code>): each model
+                        has its own pinned chat, so mixing them uses two chats.</li>
+                </ul>
+                <div class="code-header">bash</div>
+                <pre><code># No session_id: every prompt for this model stays in the pinned chat.
+curl http://127.0.0.1:8000/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen-image-2.0-pro", "prompt": "a red apple", "n": 1}'</code></pre>
+
+                <h3 id="onechat-recovery" data-i18n="ug_onechat_h_recovery">5. If the local cache is lost</h3>
+                <p data-i18n-html="ug_onechat_recovery">
+                    The upstream chat lives on the provider, so losing the local mapping does not
+                    lose the conversation. When you send a <code>session_id</code> DanyAPI no longer
+                    has locally, it reattaches to that upstream chat (DeepSeek reads
+                    <code>history_messages</code>; Qwen reads <code>/api/v2/chats/{id}</code>) and
+                    continues in place. This needs a stable <span class="env-var">DANYAPI_CACHE_DIR</span>
+                    and the session → account affinity, so keep the cache on a persistent volume.
+                </p>
+
+                <h3 id="onechat-checklist" data-i18n="ug_onechat_h_checklist">Quick checklist</h3>
+                <ul>
+                    <li data-i18n-html="ug_onechat_c1">Store <code>session_id</code> from the first
+                        response and echo it on every turn.</li>
+                    <li data-i18n-html="ug_onechat_c2">Send only the new message, not the whole
+                        history.</li>
+                    <li data-i18n-html="ug_onechat_c3">Always send <code>user</code> for multi-tenant
+                        isolation.</li>
+                    <li data-i18n-html="ug_onechat_c4">For images, send no <code>session_id</code> and
+                        keep one model.</li>
+                    <li data-i18n-html="ug_onechat_c5">Keep
+                        <span class="env-var">DANYAPI_CACHE_DIR</span> persistent and run one instance
+                        per account.</li>
+                </ul>
 
                 <hr />
                 <p class="footer-note" data-i18n="footer_note">

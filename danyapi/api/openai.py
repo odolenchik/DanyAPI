@@ -62,6 +62,7 @@ async def lifespan(app: FastAPI):
     qwen_context_store = JsonStore("qwen-contexts", "default" if cache_enabled else None)
     deepseek_affinity_store = JsonStore("deepseek-affinities", "default" if cache_enabled else None)
     qwen_affinity_store = JsonStore("qwen-affinities", "default" if cache_enabled else None)
+    qwen_sticky_store = JsonStore("qwen-sticky", "default" if cache_enabled else None)
     try:
         if settings.deepseek_tokens:
             for i, token in enumerate(settings.deepseek_tokens):
@@ -106,6 +107,7 @@ async def lifespan(app: FastAPI):
                         session_cache_size=settings.session_cache_size,
                         ttl=settings.session_ttl,
                         store=qwen_session_store,
+                        sticky_store=qwen_sticky_store,
                     )
                 )
             log.info("qwen accounts ready: %d", len(qwen_accounts))
@@ -598,6 +600,13 @@ async def _chat_completions_deepseek(req: ChatCompletionRequest) -> Any:
 
     # If the resolved session was evicted from local LRU, build a full prompt
     # (system + tools + history) so the recreated session gets complete context.
+    # Before deciding, try to reattach a known chat whose local entry is gone:
+    # the chat still lives upstream, and recovering it lets this turn continue
+    # in place with a delta prompt instead of starting a fresh chat.
+    if existing_sid is not None and account.sessions.get(existing_sid) is None:
+        reattached = await account.sessions.attach(existing_sid)
+        if reattached is not None:
+            pool.register(account.index, existing_sid)
     has_session = existing_sid is not None and account.sessions.get(existing_sid) is not None
 
     try:
@@ -637,6 +646,11 @@ async def _chat_completions_deepseek(req: ChatCompletionRequest) -> Any:
         "trace": trace,
         "messages": req.messages,
         "user": getattr(req, "user", None),
+        # Passed through to compaction so the fresh session keeps the tool
+        # schema and JSON mode instead of losing them on the move.
+        "tools": getattr(req, "tools", None),
+        "tool_choice": getattr(req, "tool_choice", None),
+        "response_format": getattr(req, "response_format", None),
         # Rebuild the prompt with full history if the session dies mid-flight
         # (stale parent pointer): the fresh session has no context, so a delta
         # prompt would arrive with nothing behind it.
@@ -683,6 +697,12 @@ async def _chat_completions_qwen(req: ChatCompletionRequest) -> Any:
         cached_sid = pool.resolve_context(context_seq) if context_seq else None
         account, existing_sid = await _acquire_account(pool, cached_sid)
 
+    # Reattach a known chat whose local entry is gone before deciding whether to
+    # send a delta or the whole history, exactly as on the DeepSeek path.
+    if existing_sid is not None and account.sessions.get(existing_sid) is None:
+        reattached = await account.sessions.attach(existing_sid, model=req.model, chat_type="t2t")
+        if reattached is not None:
+            pool.register(account.index, existing_sid)
     # If the resolved session was evicted from local LRU, build a full prompt
     # (system + tools + history) so the recreated session gets complete context.
     has_session = existing_sid is not None and account.sessions.get(existing_sid) is not None

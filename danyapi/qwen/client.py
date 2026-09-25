@@ -50,8 +50,10 @@ class QwenSession:
     title: str = ""
     last_response_id: str | None = None
     model: str | None = None
+    chat_type: str = "t2t"
     accumulated_input_tokens: int = 0
     accumulated_output_tokens: int = 0
+    reattached: bool = False
     extra: dict = field(default_factory=dict)
 
 
@@ -161,6 +163,16 @@ class QwenClient:
         biz = await self._get("/api/v2/models/")
         models = biz.get("data")
         return models if isinstance(models, list) else []
+
+    async def fetch_chat(self, chat_id: str) -> dict:
+        """Fetch a chat's metadata and history.
+
+        The response carries ``chat_type`` (``t2t``/``t2i``) plus
+        ``chat.history`` and ``chat.messages``; ``history.currentId`` is the tail
+        message id to continue from. Used to reattach a chat whose local registry
+        entry was lost.
+        """
+        return await self._get(f"/api/v2/chats/{chat_id}")
 
     async def create_chat(self, model: str, chat_mode: str = "normal", chat_type: str = "t2t") -> str:
         started = time.monotonic()

@@ -117,6 +117,43 @@ def test_mark_broken_and_label():
     assert acct.broken
 
 
+def test_sticky_image_chat_memory_only():
+    acct = QwenAccount(0, MagicMock(spec=QwenClient))
+    assert acct.sticky_image_chat("qwen-image-2.0-pro") is None
+    acct.set_sticky_image_chat("qwen-image-2.0-pro", "chat-a")
+    assert acct.sticky_image_chat("qwen-image-2.0-pro") == "chat-a"
+    # Different model keeps its own pinned chat.
+    assert acct.sticky_image_chat("qwen-image-3.0-pro") is None
+    acct.set_sticky_image_chat("qwen-image-3.0-pro", "chat-b")
+    assert acct.sticky_image_chat("qwen-image-2.0-pro") == "chat-a"
+    assert acct.sticky_image_chat("qwen-image-3.0-pro") == "chat-b"
+    acct.forget_sticky_image_chat("qwen-image-2.0-pro")
+    assert acct.sticky_image_chat("qwen-image-2.0-pro") is None
+
+
+def test_sticky_image_chat_persists(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_mod.settings, "cache_dir", str(tmp_path))
+    store = store_mod.JsonStore("qwen-sticky", "default")
+    acct = QwenAccount(0, MagicMock(spec=QwenClient), sticky_store=store)
+    acct.set_sticky_image_chat("qwen-image-2.0-pro", "chat-x")
+    # A fresh account (restart) reads the pinned chat back from disk.
+    acct2 = QwenAccount(0, MagicMock(spec=QwenClient), sticky_store=store_mod.JsonStore("qwen-sticky", "default"))
+    assert acct2.sticky_image_chat("qwen-image-2.0-pro") == "chat-x"
+    acct2.forget_sticky_image_chat("qwen-image-2.0-pro")
+    acct3 = QwenAccount(0, MagicMock(spec=QwenClient), sticky_store=store_mod.JsonStore("qwen-sticky", "default"))
+    assert acct3.sticky_image_chat("qwen-image-2.0-pro") is None
+
+
+def test_sticky_image_chat_ignores_empty_and_bad_store(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_mod.settings, "cache_dir", str(tmp_path))
+    store = store_mod.JsonStore("qwen-sticky-bad", "default")
+    store.set("0:qwen-image-2.0-pro", 123)
+    acct = QwenAccount(0, MagicMock(spec=QwenClient), sticky_store=store)
+    assert acct.sticky_image_chat("qwen-image-2.0-pro") is None
+    acct.set_sticky_image_chat("qwen-image-2.0-pro", "")
+    assert acct.sticky_image_chat("qwen-image-2.0-pro") is None
+
+
 def test_set_path_through_scalar():
     target = {"a": [5]}
     _set_path(target, ["a", "0", "b"], 1)

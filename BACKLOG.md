@@ -57,6 +57,13 @@ DANYAPI_LOG_FILE=/tmp/danyapi3/danyapi.log DANYAPI_MIN_REQUEST_INTERVAL=0 \
 сценария, поднимать не нужно. `MIN_END_GAP=5.0` оставлен по расчёту и пока не
 подтверждён замером.
 
+### `DeepSeekClient.fetch_page` шлёт POST вместо GET (найдено 2026-09-23)
+
+`fetch_page` (`danyapi/deepseek/client.py:152`) делает `POST /api/v0/chat_session/fetch_page`
+и получает **405 Method Not Allowed**; эндпоинт ожидает GET (как `history_messages`
+и `fetch_files`). В горячем пути не вызывается, поэтому не проявляется, но метод
+сломан. Найдено попутно при диагностике reattach.
+
 ## История
 
 Предыдущие записи (разбор переотправок, `invalid message id`, хвост tool-раунда,

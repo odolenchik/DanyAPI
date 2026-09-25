@@ -7,13 +7,20 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 
-from .deepseek.client import DeepSeekClient
+from .deepseek.client import DeepSeekClient, DeepSeekError, DeepSeekSession
 from .pow import PowManager
 from .retry import START_BUFFER_SEC
 from .sessions import SessionRegistry
 from .store import JsonStore
 
 log = logging.getLogger("danyapi.accounts")
+
+
+def _message_order(message_id: object) -> tuple[int, int, str]:
+    """Sort key for DeepSeek message ids, which are usually numeric but may be strings."""
+    if isinstance(message_id, int) and not isinstance(message_id, bool):
+        return (1, message_id, "")
+    return (0, 0, str(message_id))
 
 
 class AccountPoolBusy(Exception):
@@ -161,6 +168,48 @@ class ContextIndex:
         self._ts[session_id] = now
 
 
+class DeepSeekSessionRegistry(SessionRegistry):
+    """Session registry that can reattach to an existing DeepSeek chat.
+
+    When the local entry for a known ``chat_session_id`` is gone (LRU/TTL
+    eviction, restart, lost cache), the chat itself still exists on DeepSeek's
+    side. ``history_messages`` recovers the tail message id and the token total
+    so the conversation can be continued in place instead of starting a new
+    chat.
+    """
+
+    async def _attach(self, session_id: str, **kwargs) -> DeepSeekSession | None:
+        try:
+            messages = await self._client.history_messages(session_id)
+        except DeepSeekError:
+            return None
+        if not messages:
+            return None
+        last_id: str | None = None
+        last_tokens = 0
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            message_id = message.get("message_id")
+            if message_id is None:
+                continue
+            if last_id is None or _message_order(message_id) >= _message_order(last_id):
+                last_id = message_id
+                tokens = message.get("accumulated_token_usage")
+                last_tokens = int(tokens) if isinstance(tokens, (int, float)) else last_tokens
+        if last_id is None:
+            return None
+        # accounted_tokens starts equal to the recovered total so the first turn
+        # after reattaching counts only its own new tokens, not the whole history.
+        return DeepSeekSession(
+            id=session_id,
+            last_message_id=last_id,
+            accumulated_tokens=max(0, last_tokens),
+            accounted_tokens=max(0, last_tokens),
+            reattached=True,
+        )
+
+
 class DeepSeekAccount:
     __slots__ = (
         "_burst",
@@ -198,7 +247,7 @@ class DeepSeekAccount:
         self.pow = PowManager()
         self.pow_upload = PowManager()
         self.sem = asyncio.Semaphore(1)
-        self.sessions = SessionRegistry(client, session_cache_size, ttl, store=store, key_prefix=f"{index}:")
+        self.sessions = DeepSeekSessionRegistry(client, session_cache_size, ttl, store=store, key_prefix=f"{index}:")
         self.broken = False
         self._starts: deque[float] = deque()
         self._min_interval = max(0.0, min_interval)
@@ -365,6 +414,27 @@ class AccountPool:
             if 0 <= idx < len(self.accounts):
                 self._by_session[session_id] = (idx, now)
 
+    def _affinity_lookup(self, session_id: str) -> tuple[int, float] | None:
+        """Read a persisted session → account mapping into the in-memory cache.
+
+        Used when the in-memory entry is gone (TTL eviction or a restart that
+        restored affinities lazily) so a known session still routes to the
+        account that owns its upstream chat.
+        """
+        if self._affinity_store is None:
+            return None
+        record = self._affinity_store.get(session_id)
+        idx = record
+        if isinstance(record, list) and record:
+            idx = record[0]
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            return None
+        if not 0 <= idx < len(self.accounts):
+            return None
+        now = time.monotonic()
+        self._by_session[session_id] = (idx, now)
+        return (idx, now)
+
     @property
     def healthy(self) -> list[DeepSeekAccount]:
         return [a for a in self.accounts if not a.broken]
@@ -396,17 +466,25 @@ class AccountPool:
         self._contexts.forget(session_id)
 
     def account_for_session(self, session_id: str) -> DeepSeekAccount | None:
-        entry = self._by_session.get(session_id)
-        if entry is None:
-            return None
-        idx, ts = entry
         now = time.monotonic()
-        if self._ttl > 0 and now - ts > self._ttl:
+        entry = self._by_session.get(session_id)
+        if entry is not None and self._ttl > 0 and now - entry[1] > self._ttl:
+            # Drop the in-memory entry (and its context fingerprint) to bound
+            # memory, but keep the durable affinity: the session may still be
+            # resumed later, and the owner account is what lets a reattach find
+            # the right upstream chat after a restart. Only a broken account or
+            # an explicit forget() clears the persisted mapping.
             self._by_session.pop(session_id, None)
             self._contexts.forget(session_id)
-            if self._affinity_store is not None:
-                self._affinity_store.discard(session_id)
-            return None
+            entry = None
+        if entry is None:
+            # Fall back to the persisted mapping so a session whose in-memory
+            # entry expired (or a freshly restarted process) still routes to the
+            # account that owns its upstream chat.
+            entry = self._affinity_lookup(session_id)
+            if entry is None:
+                return None
+        idx = entry[0]
         acct = self.accounts[idx]
         if acct is None or acct.broken:
             self._by_session.pop(session_id, None)

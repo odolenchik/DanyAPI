@@ -99,6 +99,16 @@ Shared constants in `retry.py`:
 ### Session Persistence
 `SessionRegistry` is an LRU cache backed by `JsonStore` on disk. Sessions survive restarts within TTL. Both DeepSeek and Qwen use the same pattern — Qwen overrides `_create`, `_reuse`, and deserialization to pass `model_id`. Sessions carry two token counters: `accumulated_tokens` (running total reported to the client) and `accounted_tokens` (how much of it has already been recorded in the usage tracker). Both are persisted so a restarted session does not re-count its earlier turns.
 
+### Reattaching to an Existing Chat
+A chat lives on the provider side; the registry only maps a `session_id` to it. When that local entry is gone (LRU/TTL eviction, restart, lost cache) but the client still sends the same `session_id`, DeepSeek can resume the chat in place instead of starting a new one. `SessionRegistry.attach()` calls the provider hook `_attach()`, which for DeepSeek (`DeepSeekSessionRegistry`, `accounts.py`) fetches `history_messages`, recovers the tail `message_id` and `accumulated_token_usage`, and returns a session with `reattached=True`. `api/openai.py` runs this **before** `build_prompt`, so a successful reattach yields `has_session=True` and the turn sends a delta prompt rather than the whole history. `accounted_tokens` starts equal to the recovered total, so the first turn after reattaching counts only its own new tokens. On any failure `attach()` returns `None` and the caller falls back to creating a fresh chat. Qwen has no history API, so its `_attach` stays the base no-op.
+
+Session → account affinity is durable: `account_for_session` drops only the in-memory entry on TTL expiry and falls back to the persisted `JsonStore` mapping, so a resumed session still routes to the account that owns its chat (cleared only for a broken account or an explicit `forget()`).
+
+Qwen reattaches the same way (`QwenSessionRegistry._attach`): `QwenClient.fetch_chat` reads `GET /api/v2/chats/{id}`, and `history.currentId` (or the last assistant message id) restores `last_response_id`. Reattach is chat-type aware — a chat is only resumed when its `chat_type` (`t2t`/`t2i`) matches the request, so a text chat is never continued as an image request or vice versa.
+
+### Sticky Image Chats (Qwen)
+Qwen starts rate-limiting image generation once an account opens many new chats, and repeated creation can block the account for a day. `QwenAccount` therefore pins one image chat per **account + image model** in a `qwen-sticky` JsonStore (`sticky_image_chat` / `set_sticky_image_chat`). `collect_image` reuses that pinned chat for every prompt when the client sends no `session_id` (an explicit `session_id` is honoured and does not overwrite the pin), and reattaches it via `sessions.attach(..., chat_type="t2i")` if its local registry entry was lost. Image sessions are created with `chat_type="t2i"` so upstream keys them as image chats.
+
 ### Token Usage Accounting
 `usage.py` holds a process-wide `UsageTracker` (singleton via `init_tracker` / `get_tracker` / `reset_tracker`) that accumulates totals, per-model / per-provider / per-user breakdowns, and a bounded `recent` list. State persists through `JsonStore` under the `usage` key and is restored on startup.
 

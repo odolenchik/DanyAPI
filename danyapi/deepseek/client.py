@@ -33,6 +33,7 @@ class DeepSeekSession:
     last_message_id: str | None = None
     accumulated_tokens: int = 0
     accounted_tokens: int = 0
+    reattached: bool = False
     extra: dict = field(default_factory=dict)
 
 

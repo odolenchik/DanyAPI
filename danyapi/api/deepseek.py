@@ -159,6 +159,7 @@ async def _collect_continuation(
     request_id: str | None = None,
     trace: ToolTraceLogger | None = None,
     model: str | None = None,
+    prompt: str = CONTINUE_PROMPT,
 ) -> MessageReconstructor | None:
     for attempt in range(MAX_RETRIES + 1):
         if attempt:
@@ -171,7 +172,7 @@ async def _collect_continuation(
                 pow_headers,
                 session.id,
                 parent_message_id,
-                CONTINUE_PROMPT,
+                prompt,
                 model_type,
                 thinking,
                 search,

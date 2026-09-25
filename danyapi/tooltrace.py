@@ -173,23 +173,6 @@ def _looks_like_call(text: str) -> bool:
     return any(marker in compact for marker in _CALL_MARKERS)
 
 
-def _type_matches(value: Any, expected: str | None) -> bool:
-    if not expected:
-        return True
-    if expected == "integer":
-        # JSON integers only; booleans are a distinct type in Python.
-        return isinstance(value, int) and not isinstance(value, bool)
-    if expected == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if expected == "boolean":
-        return isinstance(value, bool)
-    if expected == "string":
-        return isinstance(value, str)
-    if expected in ("array", "object"):
-        return isinstance(value, list) or isinstance(value, dict)
-    return True
-
-
 def _classify_via_parser(text: str, tool_schemas: dict[str, dict[str, Any]]) -> tuple[str, Any] | None:
     """Validate a response with the real parser instead of guessing at its shape.
 
@@ -304,51 +287,14 @@ def _classify_dsml(text: str, tool_schemas: dict[str, dict[str, Any]]) -> tuple[
 
 
 def _check_calls(calls: Any, tool_schemas: dict[str, dict[str, Any]]) -> tuple[str, Any]:
-    """Validate a list of tool-call dicts (name + arguments) against the schema."""
-    issues: list[str] = []
-    details: list[Any] = []
-    for call in calls:
-        if not isinstance(call, dict):
-            continue
-        name = call.get("name")
-        args_raw = call.get("arguments", {})
-        if isinstance(args_raw, str):
-            try:
-                args = json.loads(args_raw)
-            except ValueError:
-                issues.append("json_malformed")
-                details.append(name or "?")
-                continue
-            if not isinstance(args, dict):
-                issues.append("wrong_type")
-                details.append(f"{name}: arguments not an object")
-                continue
-        elif isinstance(args_raw, dict):
-            args = args_raw
-        else:
-            args = {}
+    """Validate a list of tool-call dicts (name + arguments) against the schema.
 
-        schema = tool_schemas.get(name) if isinstance(name, str) else None
-        if schema is None and tool_schemas:
-            issues.append("unknown_tool")
-            details.append(f"tool '{name}' not declared")
-            continue
-        allowed = set(schema.keys()) if schema else None
-        for key, value in args.items():
-            if allowed is not None and key not in allowed:
-                issues.append("extra_argument")
-                details.append(f"{name}.{key}")
-                continue
-            expected = (schema or {}).get(key)
-            if not _type_matches(value, expected):
-                issues.append("wrong_type")
-                details.append(f"{name}.{key}={value!r} expected {expected}")
+    Delegates to :mod:`danyapi.tools.validate` so live validation and this
+    diagnostic classifier share one implementation and cannot drift apart.
+    """
+    from .tools.validate import summarize, validate_calls
 
-    order = ["unknown_tool", "json_malformed", "extra_argument", "wrong_type"]
-    for issue in order:
-        if issue in issues:
-            return issue, "; ".join(str(d) for d in details[:5]) or None
-    return "ok", None
+    return summarize(validate_calls(calls, tool_schemas))
 
 
 def _strip_fences(text: str) -> str:

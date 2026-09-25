@@ -321,3 +321,83 @@ async def test_parse_event_flags_mangle(tmp_path):
     parse_event = next(e for e in events if e["actor"] == "parse")
     assert "extra_argument" in parse_event["result"]
     assert "offset" in (parse_event.get("issue") or "")
+
+
+# ---------------------------------------------------------------------------
+# Repair loop: a call that parses but fails schema validation is re-requested
+# once; a good retry replaces it, a bad/absent one keeps the original result.
+# ---------------------------------------------------------------------------
+
+_WEATHER_SCHEMAS = {"get_weather": {"city": "string", "__required__": {"city"}}}
+
+
+def _ds_tool_sse(content: str) -> str:
+    return (
+        "event: ready\n"
+        'data: {"request_message_id":1,"response_message_id":2,"model_type":"default"}\n'
+        "\n"
+        'data: {"v":{"response":{"message_id":2,"parent_id":1,"status":"WIP","fragments":['
+        '{"id":2,"type":"RESPONSE","content":' + json.dumps(content) + "}]}}}\n"
+        "\n"
+        'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n'
+        "\n"
+    )
+
+
+_MANGLED_TOOL_JSON = '{"tool_calls": [{"name": "get_weather", "arguments": {"city": "Moscow", "offset": 5}}]}'
+_FIXED_TOOL_JSON = '{"tool_calls": [{"name": "get_weather", "arguments": {"city": "Moscow"}}]}'
+
+
+def _stream_arguments(lines: list[str]) -> str:
+    arguments = ""
+    for line in lines:
+        if not line.startswith("data: ") or line.startswith("data: [DONE]"):
+            continue
+        payload = json.loads(line[6:])
+        for chunk in payload.get("choices") or []:
+            for tc in (chunk.get("delta") or {}).get("tool_calls") or []:
+                arguments += tc.get("function", {}).get("arguments", "")
+    return arguments
+
+
+async def test_non_stream_repairs_mangled_tool_call():
+    acct = FakeAccount([_ds_tool_sse(_MANGLED_TOOL_JSON), _ds_tool_sse(_FIXED_TOOL_JSON)])
+    args = dict(_deepseek_args(acct), tool_schemas=_WEATHER_SCHEMAS)
+    result = await openai_mod._collect_non_stream(**args)
+    call = result["choices"][0]["message"]["tool_calls"][0]
+    assert json.loads(call["function"]["arguments"]) == {"city": "Moscow"}
+    # One repair round-trip = two upstream completions.
+    assert acct.client.completion.await_count == 2
+
+
+async def test_non_stream_keeps_original_when_repair_does_not_help():
+    acct = FakeAccount([_ds_tool_sse(_MANGLED_TOOL_JSON), _ds_tool_sse(_MANGLED_TOOL_JSON)])
+    args = dict(_deepseek_args(acct), tool_schemas=_WEATHER_SCHEMAS)
+    result = await openai_mod._collect_non_stream(**args)
+    call = result["choices"][0]["message"]["tool_calls"][0]
+    # The imperfect original is preserved rather than dropped.
+    assert json.loads(call["function"]["arguments"])["offset"] == 5
+
+
+async def test_non_stream_keeps_original_when_repair_raises():
+    # Only one upstream response is staged; the repair call exhausts the mock and
+    # raises, which must not take down a request that already has a call.
+    acct = FakeAccount([_ds_tool_sse(_MANGLED_TOOL_JSON)])
+    args = dict(_deepseek_args(acct), tool_schemas=_WEATHER_SCHEMAS)
+    result = await openai_mod._collect_non_stream(**args)
+    call = result["choices"][0]["message"]["tool_calls"][0]
+    assert json.loads(call["function"]["arguments"])["offset"] == 5
+
+
+async def test_stream_repairs_mangled_tool_call():
+    acct = FakeAccount([_ds_tool_sse(_MANGLED_TOOL_JSON), _ds_tool_sse(_FIXED_TOOL_JSON)])
+    args = dict(_deepseek_args(acct), tool_schemas=_WEATHER_SCHEMAS)
+    lines = await collect_stream(openai_mod._stream_openai(**args))
+    assert json.loads(_stream_arguments(lines)) == {"city": "Moscow"}
+
+
+async def test_valid_call_does_not_trigger_repair():
+    acct = FakeAccount([_ds_tool_sse(_FIXED_TOOL_JSON)])
+    args = dict(_deepseek_args(acct), tool_schemas=_WEATHER_SCHEMAS)
+    await openai_mod._collect_non_stream(**args)
+    assert acct.client.completion.await_count == 1

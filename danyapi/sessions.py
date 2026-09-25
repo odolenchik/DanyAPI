@@ -42,6 +42,7 @@ class SessionRegistry:
             "last_message_id": getattr(session, "last_message_id", None),
             "accumulated_tokens": getattr(session, "accumulated_tokens", 0),
             "accounted_tokens": getattr(session, "accounted_tokens", 0),
+            "reattached": bool(getattr(session, "reattached", False)),
         }
 
     def _deserialize(self, record: Any) -> Any:
@@ -59,6 +60,7 @@ class SessionRegistry:
             last_message_id=record.get("last_message_id"),
             accumulated_tokens=accumulated_tokens,
             accounted_tokens=accounted_tokens,
+            reattached=bool(record.get("reattached", False)),
         )
 
     def _restore(self) -> None:
@@ -88,6 +90,52 @@ class SessionRegistry:
 
     def _reuse(self, session: Any, session_id: str, **kwargs) -> bool:
         return True
+
+    async def _attach(self, session_id: str, **kwargs) -> Any | None:
+        """Reconstruct an upstream session missing from the local registry.
+
+        Returns a session bound to ``session_id`` when the provider can recover
+        it from its own state, or ``None`` when reattachment is unsupported or
+        the session no longer exists upstream. The base implementation never
+        reattaches; providers that can (DeepSeek) override it.
+        """
+        return None
+
+    def _store_session(self, session_id: str, session: Any) -> None:
+        now = self._now()
+        with self._lock:
+            self._sessions[session_id] = (session, now)
+            self._sessions.move_to_end(session_id)
+            while len(self._sessions) > self._maxsize:
+                evicted, _ = self._sessions.popitem(last=False)
+                if self._store is not None:
+                    self._store.discard(self._session_key(evicted))
+            if self._store is not None:
+                self._store.set(self._session_key(session_id), self._serialize(session))
+
+    async def attach(self, session_id: str | None, **kwargs) -> Any | None:
+        """Recover a registry entry for an existing upstream session.
+
+        Called when ``session_id`` is known (from the client or context
+        deduplication) but ``get()`` misses because the LRU/TTL evicted it, the
+        process restarted, or the on-disk cache was lost. A successful attach
+        inserts the recovered session under ``session_id``, so later turns
+        behave exactly like a cache hit. Any failure yields ``None`` so the
+        caller can fall back to creating a fresh session.
+        """
+        if not session_id:
+            return None
+        existing = self.get(session_id)
+        if existing is not None:
+            return existing
+        try:
+            session = await self._attach(session_id, **kwargs)
+        except Exception:
+            return None
+        if session is None:
+            return None
+        self._store_session(session_id, session)
+        return session
 
     def _update_last(self, session: Any, message_id: str) -> None:
         session.last_message_id = message_id

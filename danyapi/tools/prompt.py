@@ -458,26 +458,26 @@ def render_json_mode(response_format: Any) -> str | None:
     return JSON_MODE_INSTRUCTION.format(constraints=constraints)
 
 
-def build_compact_prompt(
-    messages: list[Any],
-    max_pairs: int = 10,
-    max_tool_results: int = 3,
-    tool_schemas: dict | None = None,
-) -> tuple[str, str]:
-    """Build a compact prompt for retry after CONTEXT_LENGTH_EXCEEDED.
+COMPACT_SUMMARY_HEADER = "[Summary of earlier conversation]"
+COMPACT_TRUNCATION_NOTE = "[Earlier conversation truncated — {n} message(s) omitted]"
 
-    Returns (system_text, compact_body). The caller must create a NEW session
-    and send system first, then compact_body as the second message. This keeps
-    each individual prompt under DeepSeek's per-request limit (~15000 chars).
+HANDOFF_SUMMARY_INSTRUCTION = (
+    "The conversation below is the earlier part of a long session that is being "
+    "carried over to a new chat because the original hit its context limit. "
+    "Summarize it for handoff. Keep every fact, decision, constraint, file path, "
+    "command and open task that the next turn might depend on; drop chit-chat. "
+    "Write plain prose, no markdown fences, and do not answer the conversation."
+)
 
-    Strategy: keep system + last N user/assistant pairs (no tool results in
-    middle) + last M raw tool results at the tail for immediate context.
+
+def _collect_pairs(messages: list[Any]) -> tuple[list[tuple[str, str]], str | None]:
+    """Split messages into completed (user, assistant) pairs and a pending user turn.
+
+    ``pending_user`` is the user message with no assistant reply yet — the request
+    currently being answered. A client-injected ``<system-reminder>`` is skipped
+    so it neither starts a pair nor replaces the real pending question.
     """
-    system = extract_system(messages)
-
-    # Collect user/assistant pairs, skipping tool messages and intermediate
-    # assistant tool-call-only turns.
-    pairs: list[tuple[str, str]] = []  # (user_text, assistant_text)
+    pairs: list[tuple[str, str]] = []
     pending_user: str | None = None
     for msg in messages:
         role = getattr(msg, "role", None)
@@ -486,50 +486,157 @@ def build_compact_prompt(
         text = _content_text(getattr(msg, "content", ""))
         has_calls = bool(getattr(msg, "tool_calls", None))
         if role == "user":
-            # A client-injected <system-reminder> is not a user turn: skip it
-            # entirely so the preceding real question stays pending.
             if _is_ephemeral_system(text):
                 continue
             pending_user = text or ""
-        elif role == "assistant" and (text or has_calls):
-            # Only include assistant messages that have actual content
-            if text:
-                if pending_user is not None:
-                    pairs.append((pending_user, text))
-                    pending_user = None
-            # tool-call-only assistants are skipped in the compact view
+        elif role == "assistant" and (text or has_calls) and text and pending_user is not None:
+            pairs.append((pending_user, text))
+            pending_user = None
+    return pairs, pending_user
 
-    # Take last N pairs
-    recent_pairs = pairs[-max_pairs:] if len(pairs) > max_pairs else pairs
 
-    # Render conversation body
+def dropped_pairs_source(messages: list[Any], max_pairs: int, max_chars: int) -> str:
+    """Render the older pairs that a compact prompt would drop, for summarization.
+
+    Returns "" when nothing would be dropped. The rendered text is truncated to
+    ``max_chars`` (keeping the newest material) so the summarize request stays
+    within the per-request limit.
+    """
+    pairs, _ = _collect_pairs(messages)
+    if len(pairs) <= max_pairs:
+        return ""
+    dropped = _render_pairs(pairs[:-max_pairs])
+    return _truncate_head(dropped, max_chars)
+
+
+def _render_pairs(pairs: list[tuple[str, str]]) -> str:
     parts: list[str] = []
-    if len(pairs) > max_pairs:
-        parts.append(f"[Earlier conversation truncated — {len(pairs) - max_pairs} message(s) omitted]")
-    for user_text, asst_text in recent_pairs:
+    for user_text, asst_text in pairs:
         if user_text:
             parts.append(f"User: {user_text}")
         if asst_text:
             parts.append(f"Assistant: {asst_text}")
+    return "\n\n".join(parts)
 
-    # Append last M tool results raw (these are the most actionable context)
+
+def _truncate_head(text: str, limit: int) -> str:
+    """Keep the end of ``text`` (the most recent material) within ``limit`` chars."""
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    marker = "…[earlier content truncated]\n"
+    if len(marker) >= limit:
+        # No room for the marker plus content: just hard-cut the tail.
+        return text[-limit:]
+    keep = limit - len(marker)
+    return marker + text[-keep:]
+
+
+def build_compact_prompt(
+    messages: list[Any],
+    max_pairs: int = 10,
+    max_tool_results: int = 3,
+    tools: list[Any] | None = None,
+    tool_choice: Any = None,
+    response_format: Any = None,
+    summary: str | None = None,
+    max_chars: int = MAX_APPEND_PROMPT_CHARS,
+) -> tuple[str, str]:
+    """Build a compact prompt for retry after CONTEXT_LENGTH_EXCEEDED.
+
+    Returns (system_text, compact_body) for a NEW session. The caller sends them
+    as a single prompt (system + body); splitting it into two messages is no
+    longer required.
+
+    The body keeps, in order: an optional summary of the dropped history, the
+    last N completed user/assistant pairs, the last M raw tool results, and the
+    **current turn** (the pending user question plus, for a tool round, the
+    latest tool call and its results). Preserving the current turn is essential:
+    without it the fresh session answers an older question. The assembled body
+    is trimmed to ``max_chars`` so the compact request cannot itself overflow.
+    """
+    system = "\n\n".join(
+        block
+        for block in (
+            extract_system(messages),
+            render_tool_schema(tools, tool_choice),
+            render_json_mode(response_format),
+        )
+        if block
+    )
+
+    pairs, pending_user = _collect_pairs(messages)
+    body_budget = max(0, max_chars - len(system) - 2)
+
+    # The current turn is everything after the last real user message. When it
+    # is a tool round, its tail is rendered as the current turn below and
+    # already carries the round's own tool results, so only tool results from
+    # *before* that turn go into the standalone "Recent tool results" section.
+    tail = _tail_after_last_user(messages)
+    tail_start = len(messages) - len(tail)
+    tail_has_tools = _is_tool_round_tail(tail)
+
+    current_parts: list[str] = []
+    if pending_user:
+        current_parts.append(f"User: {pending_user}")
+    if tail_has_tools:
+        exchange = _latest_tool_exchange(tail) or tail
+        rendered_tail = _render_tool_tail(exchange, max_chars=max(2000, body_budget))
+        if rendered_tail:
+            current_parts.append(rendered_tail)
+    current_text = "\n\n".join(current_parts)
+
+    # Last M older tool results, newest-kept, rendered back to chronological
+    # order. Tool results inside the current turn are skipped (see above).
     tool_results: list[str] = []
-    for msg in reversed(messages):
-        role = getattr(msg, "role", None)
-        if role in ("tool", "function"):
-            rendered = render_message(msg)
-            if rendered:
-                tool_results.append(rendered)
-            if len(tool_results) >= max_tool_results:
-                break
-    if tool_results:
-        parts.append("")
-        parts.append("Recent tool results:")
-        for tr in reversed(tool_results):  # restore chronological order
-            parts.append(tr)
+    for index in range(len(messages) - 1, -1, -1):
+        msg = messages[index]
+        if getattr(msg, "role", None) not in ("tool", "function"):
+            continue
+        if tail_has_tools and index >= tail_start:
+            continue
+        rendered = render_message(msg)
+        if rendered:
+            tool_results.append(rendered)
+        if len(tool_results) >= max_tool_results:
+            break
+    tool_results.reverse()
+    tool_text = "\n".join(tool_results)
 
-    compact_body = "\n\n".join(parts).strip()
-    return system, compact_body
+    header: list[str] = []
+    if summary and summary.strip():
+        header.append(f"{COMPACT_SUMMARY_HEADER}\n{summary.strip()}")
+
+    kept = pairs[-max_pairs:] if len(pairs) > max_pairs else list(pairs)
+    omitted = len(pairs) - len(kept)
+
+    def assemble() -> str:
+        parts = list(header)
+        if omitted:
+            parts.append(COMPACT_TRUNCATION_NOTE.format(n=omitted))
+        rendered_pairs = _render_pairs(kept)
+        if rendered_pairs:
+            parts.append(rendered_pairs)
+        if tool_text:
+            parts.append("Recent tool results:\n" + tool_text)
+        if current_text:
+            parts.append(current_text)
+        return "\n\n".join(p for p in parts if p).strip()
+
+    body = assemble()
+    while len(body) > body_budget:
+        if kept:
+            kept.pop(0)
+            omitted += 1
+        elif tool_text:
+            shrunk = _truncate_head(tool_text, max(0, len(tool_text) - (len(body) - body_budget) - 64))
+            tool_text = "" if len(shrunk) < 64 else shrunk
+        else:
+            body = _truncate_head(body, body_budget)
+            break
+        body = assemble()
+    return system, body
 
 
 def build_prompt(

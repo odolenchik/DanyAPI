@@ -167,6 +167,67 @@ def _fix_invalid_escapes(text: str) -> str:
     return "".join(out)
 
 
+def _quote_bare_keys(text: str) -> str:
+    """Wrap unquoted object keys in double quotes.
+
+    DeepSeek sometimes drops the quotes around the ``tool_calls`` wrapper key,
+    emitting ``{tool_calls: [...]}`` (often inside an angle-bracket wrapper,
+    ``<{tool_calls: ...}>``). Every existing repair leaves the bare key alone, so
+    the payload reaches the client as plain text instead of a tool call. Only
+    identifiers sitting where a key is expected — right after ``{`` or ``,`` —
+    are quoted, and never inside a string, so URLs and prose values are safe.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_string = False
+    escaped = False
+    expect_key = False
+    while i < n:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch in "{,":
+            out.append(ch)
+            expect_key = True
+            i += 1
+            continue
+        if expect_key:
+            if ch in " \t\r\n":
+                out.append(ch)
+                i += 1
+                continue
+            if ch.isalpha() or ch == "_":
+                j = i
+                while j < n and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                k = j
+                while k < n and text[k] in " \t\r\n":
+                    k += 1
+                if k < n and text[k] == ":":
+                    out.append('"' + text[i:j] + '"')
+                    i = j
+                    expect_key = False
+                    continue
+            expect_key = False
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _loads_lenient(text: str) -> Any:
     text = text.strip()
     try:
@@ -191,6 +252,15 @@ def _loads_lenient(text: str) -> Any:
             return json.loads(normalized)
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
+    # Unquoted keys: `{tool_calls: [...]}` instead of `{"tool_calls": [...]}`.
+    # An angle-bracket wrapper (`<{tool_calls: ...}>`) needs no separate handling:
+    # the balanced-brace scan ignores the surrounding `<`/`>` characters.
+    quoted = _quote_bare_keys(normalized)
+    if quoted != normalized:
+        try:
+            return json.loads(quoted)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
     # Repair invalid escape sequences (regex patterns with single backslashes).
     escaped = _fix_invalid_escapes(stripped)
     if escaped != stripped:
@@ -198,8 +268,15 @@ def _loads_lenient(text: str) -> Any:
             return json.loads(escaped)
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
-    # Combine both fixes for truncated JSON that also has invalid escapes.
-    fixed = _fix_unbalanced_json(escaped if escaped != stripped else text)
+    # Combined: unquoted keys and/or invalid escapes on a truncated payload.
+    escaped_quoted = _quote_bare_keys(escaped)
+    if escaped_quoted != escaped:
+        try:
+            return json.loads(escaped_quoted)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    base = escaped_quoted if escaped_quoted != escaped else (escaped if escaped != stripped else text)
+    fixed = _fix_unbalanced_json(base)
     if fixed is not None and fixed != text:
         try:
             return json.loads(fixed)

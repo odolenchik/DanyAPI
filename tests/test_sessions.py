@@ -11,6 +11,7 @@ import danyapi.qwen.api as qwen_api
 from danyapi.accounts import AccountPool, DeepSeekAccount
 from danyapi.deepseek.client import DeepSeekClient
 from danyapi.qwen.accounts import QwenSessionRegistry
+from danyapi.qwen.client import QwenSession
 from danyapi.sessions import SessionRegistry
 from danyapi.store import JsonStore
 from danyapi.tools import build_prompt, context_sequence
@@ -46,7 +47,7 @@ class FakeSessionClient:
         self.counter += 1
         return SimpleNamespace(id=f"s{self.counter}")
 
-    async def create_chat(self, model="", chat_mode="normal"):
+    async def create_chat(self, model="", chat_mode="normal", chat_type="t2t"):
         self.counter += 1
         return f"c{self.counter}"
 
@@ -339,6 +340,107 @@ def test_qwen_broken_records_skipped(sessions_store):
     assert reg.get("bad") is None
 
 
+class FakeQwenChatClient(FakeSessionClient):
+    def __init__(self, detail=None, error=None):
+        super().__init__()
+        self._detail = detail
+        self._error = error
+        self.fetch_calls = 0
+
+    async def fetch_chat(self, chat_id):
+        self.fetch_calls += 1
+        if self._error is not None:
+            raise self._error
+        return self._detail
+
+
+def _t2t_detail(current_id="r9", chat_type="t2t", title="T"):
+    return {
+        "title": title,
+        "chat_type": chat_type,
+        "chat": {
+            "history": {"currentId": current_id},
+            "messages": [],
+        },
+    }
+
+
+def test_qwen_attach_recovers_from_history():
+    client = FakeQwenChatClient(_t2t_detail(current_id="r9"))
+    reg = QwenSessionRegistry(client)
+    session = asyncio.run(reg.attach("chat-1", model="qwen3.8-max", chat_type="t2t"))
+    assert session is not None
+    assert session.id == "chat-1"
+    assert session.last_response_id == "r9"
+    assert session.chat_type == "t2t"
+    assert session.reattached is True
+    assert reg.get("chat-1") is session
+
+
+def test_qwen_attach_falls_back_to_last_assistant():
+    detail = {
+        "title": "T",
+        "chat_type": "t2t",
+        "chat": {
+            "history": {},
+            "messages": [
+                {"role": "user", "id": "u1"},
+                {"role": "assistant", "id": "a1"},
+                {"role": "assistant", "id": "a2"},
+            ],
+        },
+    }
+    reg = QwenSessionRegistry(FakeQwenChatClient(detail))
+    session = asyncio.run(reg.attach("chat-2", model="m", chat_type="t2t"))
+    assert session is not None
+    assert session.last_response_id == "a2"
+
+
+def test_qwen_attach_rejects_chat_type_mismatch():
+    reg = QwenSessionRegistry(FakeQwenChatClient(_t2t_detail(chat_type="t2t")))
+    assert asyncio.run(reg.attach("chat-3", model="m", chat_type="t2i")) is None
+    assert reg.get("chat-3") is None
+
+
+def test_qwen_attach_returns_none_on_error():
+    from danyapi.qwen.client import QwenError
+
+    reg = QwenSessionRegistry(FakeQwenChatClient(error=QwenError("not found", "x")))
+    assert asyncio.run(reg.attach("chat-4", model="m", chat_type="t2t")) is None
+
+
+def test_qwen_attach_returns_none_without_any_tail():
+    detail = {"title": "T", "chat_type": "t2t", "chat": {"history": {}, "messages": []}}
+    reg = QwenSessionRegistry(FakeQwenChatClient(detail))
+    assert asyncio.run(reg.attach("chat-5", model="m", chat_type="t2t")) is None
+
+
+def test_qwen_attach_returns_none_on_non_dict():
+    reg = QwenSessionRegistry(FakeQwenChatClient(detail=None))
+    assert asyncio.run(reg.attach("chat-6", model="m", chat_type="t2t")) is None
+
+
+def test_qwen_reattached_flag_persists(sessions_store):
+    reg = QwenSessionRegistry(FakeQwenChatClient(), store=sessions_store)
+    reg._store_session(
+        "chat-p",
+        QwenSession(id="chat-p", model="m", chat_type="t2i", last_response_id="r1", reattached=True),
+    )
+    reg2 = QwenSessionRegistry(FakeQwenChatClient(), store=JsonStore("sessions", "default"))
+    restored = reg2.get("chat-p")
+    assert restored is not None
+    assert restored.reattached is True
+    assert restored.chat_type == "t2i"
+
+
+def test_qwen_reuse_rejects_chat_type_change():
+    reg = QwenSessionRegistry(FakeQwenChatClient())
+    _, key = asyncio.run(reg.obtain(None, "qwen3.8-max", chat_type="t2t"))
+    # Same model but requesting an image chat must not reuse the text chat.
+    _, key2 = asyncio.run(reg.obtain(key, "qwen3.8-max", chat_type="t2i"))
+    assert key2 != key
+
+
 def test_account_pool_resolve_routes_to_owner():
     a0, a1 = make_acct(0), make_acct(1)
     pool = AccountPool([a0, a1])
@@ -531,3 +633,211 @@ def test_deepseek_non_stream_accepts_include_usage():
 
 def test_qwen_non_stream_accepts_include_usage():
     assert "include_usage" in qwen_api.collect_non_stream.__code__.co_varnames
+
+
+class FakeHistoryClient(FakeSessionClient):
+    def __init__(self, messages=None, error=None):
+        super().__init__()
+        self._messages = messages or []
+        self._error = error
+        self.history_calls = 0
+
+    async def history_messages(self, session_id):
+        self.history_calls += 1
+        if self._error is not None:
+            raise self._error
+        return self._messages
+
+
+def _ds_registry(client, store=None, key_prefix=""):
+    from danyapi.accounts import DeepSeekSessionRegistry
+
+    return DeepSeekSessionRegistry(client, store=store, key_prefix=key_prefix)
+
+
+def test_attach_base_returns_none():
+    reg = SessionRegistry(FakeSessionClient())
+    assert asyncio.run(reg.attach("missing")) is None
+    assert reg.get("missing") is None
+
+
+def test_attach_returns_existing_without_recovering():
+    client = FakeHistoryClient([{"message_id": 9}])
+    reg = _ds_registry(client)
+    _, key = asyncio.run(reg.obtain(None))
+    got = asyncio.run(reg.attach(key))
+    assert got is not None
+    assert client.history_calls == 0
+
+
+def test_attach_recovers_session_from_history():
+    client = FakeHistoryClient(
+        [
+            {"message_id": 1, "accumulated_token_usage": 10},
+            {"message_id": 2, "accumulated_token_usage": 30},
+        ]
+    )
+    reg = _ds_registry(client)
+    session = asyncio.run(reg.attach("chat-1"))
+    assert session is not None
+    assert session.id == "chat-1"
+    assert session.last_message_id == 2
+    assert session.accumulated_tokens == 30
+    assert session.accounted_tokens == 30
+    assert session.reattached is True
+    # Persisted under the recovered id, so the next lookup is a plain hit.
+    assert reg.get("chat-1") is session
+
+
+def test_attach_picks_max_message_id_regardless_of_order():
+    client = FakeHistoryClient(
+        [
+            {"message_id": 5, "accumulated_token_usage": 50},
+            {"message_id": 2, "accumulated_token_usage": 20},
+        ]
+    )
+    reg = _ds_registry(client)
+    session = asyncio.run(reg.attach("chat-2"))
+    assert session is not None
+    assert session.last_message_id == 5
+    assert session.accumulated_tokens == 50
+
+
+def test_attach_returns_none_on_error():
+    from danyapi.deepseek.client import DeepSeekError
+
+    client = FakeHistoryClient(error=DeepSeekError(1, "invalid chat session id"))
+    reg = _ds_registry(client)
+    assert asyncio.run(reg.attach("nope")) is None
+    assert reg.get("nope") is None
+
+
+def test_attach_returns_none_on_empty_history():
+    reg = _ds_registry(FakeHistoryClient([]))
+    assert asyncio.run(reg.attach("empty")) is None
+
+
+def test_attach_ignores_records_without_message_id():
+    client = FakeHistoryClient([{"role": "USER"}, "garbage", {"message_id": 7}])
+    reg = _ds_registry(client)
+    session = asyncio.run(reg.attach("chat-3"))
+    assert session is not None
+    assert session.last_message_id == 7
+
+
+def test_attach_empty_session_id():
+    reg = _ds_registry(FakeHistoryClient([{"message_id": 1}]))
+    assert asyncio.run(reg.attach(None)) is None
+    assert asyncio.run(reg.attach("")) is None
+
+
+def test_reattached_flag_persists(sessions_store):
+    from danyapi.deepseek.client import DeepSeekSession
+
+    reg = _ds_registry(FakeHistoryClient(), store=sessions_store)
+    reg._store_session(
+        "chat-p",
+        DeepSeekSession(id="chat-p", last_message_id=3, reattached=True),
+    )
+    reg2 = _ds_registry(FakeHistoryClient(), store=JsonStore("sessions", "default"))
+    restored = reg2.get("chat-p")
+    assert restored is not None
+    assert restored.reattached is True
+
+
+def test_attach_recovers_then_continues_via_obtain():
+    client = FakeHistoryClient([{"message_id": 4}])
+    reg = _ds_registry(client)
+    assert asyncio.run(reg.attach("chat-r")) is not None
+    session, key = asyncio.run(reg.obtain("chat-r"))
+    assert key == "chat-r"
+    assert session.id == "chat-r"
+    assert client.counter == 0  # no new chat created
+
+
+def test_openai_reattaches_before_build_prompt():
+    captured = {}
+    orig = openai_mod._collect_non_stream
+
+    async def fake_collect(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    openai_mod._collect_non_stream = fake_collect
+    try:
+        account = MagicMock()
+        account.index = 0
+        account.sem = MagicMock()
+        recovered = SimpleNamespace(id="chat-x", last_message_id="7", reattached=True)
+        # First get() is the reattach check (miss), second is has_session (hit).
+        account.sessions.get = MagicMock(side_effect=[None, recovered])
+
+        async def fake_attach(sid, **kwargs):
+            return recovered
+
+        account.sessions.attach = AsyncMock(side_effect=fake_attach)
+        pool = MagicMock()
+        pool.acquire = AsyncMock(return_value=(account, "chat-x"))
+        openai_mod.app.state.pool = pool
+        req = SimpleNamespace(
+            model="deepseek-v4-flash",
+            stream=False,
+            thinking=False,
+            search=False,
+            session_id="chat-x",
+            files=None,
+            tools=None,
+            tool_choice=None,
+            response_format=None,
+            messages=[
+                openai_mod.ChatMessage(role="user", content="first"),
+                openai_mod.ChatMessage(role="assistant", content="reply"),
+                openai_mod.ChatMessage(role="user", content="second"),
+            ],
+        )
+        asyncio.run(openai_mod._chat_completions_deepseek(req))
+        account.sessions.attach.assert_awaited_once()
+        pool.register.assert_called_once_with(0, "chat-x")
+        # A successful reattach sends only the new turn, not the whole history.
+        assert captured["prompt"] == "second"
+        assert captured["existing_sid"] == "chat-x"
+    finally:
+        openai_mod._collect_non_stream = orig
+
+
+def test_openai_falls_back_when_reattach_fails():
+    captured = {}
+    orig = openai_mod._collect_non_stream
+
+    async def fake_collect(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    openai_mod._collect_non_stream = fake_collect
+    try:
+        account = MagicMock()
+        account.index = 0
+        account.sem = MagicMock()
+        account.sessions.get = MagicMock(return_value=None)
+        account.sessions.attach = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.acquire = AsyncMock(return_value=(account, "chat-y"))
+        openai_mod.app.state.pool = pool
+        req = SimpleNamespace(
+            model="deepseek-v4-flash",
+            stream=False,
+            thinking=False,
+            search=False,
+            session_id="chat-y",
+            files=None,
+            tools=None,
+            tool_choice=None,
+            response_format=None,
+            messages=[openai_mod.ChatMessage(role="user", content="hello")],
+        )
+        asyncio.run(openai_mod._chat_completions_deepseek(req))
+        account.sessions.attach.assert_awaited_once()
+        pool.register.assert_not_called()
+        assert captured["existing_sid"] == "chat-y"
+    finally:
+        openai_mod._collect_non_stream = orig

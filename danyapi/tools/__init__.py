@@ -27,6 +27,7 @@ from .parse import (
 )
 from .prompt import (
     CHOICE_INSTRUCTIONS,
+    HANDOFF_SUMMARY_INSTRUCTION,
     JSON_MODE_INSTRUCTION,
     TOOL_CALL_INSTRUCTION,
     ToolCall,
@@ -40,6 +41,7 @@ from .prompt import (
     build_compact_prompt,
     build_prompt,
     context_sequence,
+    dropped_pairs_source,
     extract_last_user,
     extract_system,
     is_tool_round,
@@ -50,6 +52,7 @@ from .prompt import (
 
 __all__ = [
     "CHOICE_INSTRUCTIONS",
+    "HANDOFF_SUMMARY_INSTRUCTION",
     "JSON_MODE_INSTRUCTION",
     "TOOL_CALL_INSTRUCTION",
     "ToolCall",
@@ -83,6 +86,7 @@ __all__ = [
     "build_compact_prompt",
     "build_prompt",
     "context_sequence",
+    "dropped_pairs_source",
     "extract_last_user",
     "extract_system",
     "format_tool_message",

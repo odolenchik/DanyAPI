@@ -370,6 +370,69 @@ def test_parse_tool_calls_corrupted_separator_repaired():
     assert json.loads(calls[1].arguments) == {"command": "dpkg -S /usr/bin/coolercontrold"}
 
 
+def test_parse_tool_calls_unquoted_key_angle_wrapper():
+    # Regression (tooltrace 93870405): DeepSeek dropped the quotes around the
+    # `tool_calls` key and wrapped the object in angle brackets, producing
+    # `<{tool_calls: [...]}>`. The payload reached the client as plain text
+    # (a "dead" tool call) because no repair path handled a bare key.
+    text = (
+        "<{tool_calls: ["
+        '{"name": "Read", "arguments": {"path": "crates/agent00x-core/src/scope.rs", "line_offset": 19, "n_lines": 50}}, '
+        '{"name": "Bash", "arguments": {"command": "sed -n \'25,45p\' config.toml"}}'
+        "]}>"
+    )
+    parsed = parse_tool_calls(text)
+    assert parsed is not None
+    calls, _ = parsed
+    assert [c.name for c in calls] == ["Read", "Bash"]
+    assert json.loads(calls[0].arguments) == {"path": "crates/agent00x-core/src/scope.rs", "line_offset": 19, "n_lines": 50}
+    assert json.loads(calls[1].arguments) == {"command": "sed -n '25,45p' config.toml"}
+
+
+def test_parse_tool_calls_unquoted_key_no_wrapper():
+    text = '{tool_calls: [{"name": "Read", "arguments": {"path": "a.rs"}}]}'
+    parsed = parse_tool_calls(text)
+    assert parsed is not None
+    calls, _ = parsed
+    assert calls[0].name == "Read"
+    assert json.loads(calls[0].arguments) == {"path": "a.rs"}
+
+
+def test_parse_tool_calls_unquoted_nested_keys():
+    # Every bare key — not just the outer `tool_calls` — is quoted, so a payload
+    # that omitted all key quotes still parses.
+    text = '{tool_calls: [{name: "Read", arguments: {path: "a.rs"}}]}'
+    parsed = parse_tool_calls(text)
+    assert parsed is not None
+    calls, _ = parsed
+    assert calls[0].name == "Read"
+    assert json.loads(calls[0].arguments) == {"path": "a.rs"}
+
+
+def test_parse_tool_calls_quoted_json_unchanged():
+    # The repair must not alter already-valid JSON.
+    text = '{"tool_calls": [{"name": "Read", "arguments": {"path": "a.rs"}}]}'
+    parsed = parse_tool_calls(text)
+    assert parsed is not None
+    calls, _ = parsed
+    assert json.loads(calls[0].arguments) == {"path": "a.rs"}
+
+
+def test_parse_tool_calls_url_prose_not_treated_as_call():
+    # A bare word followed by `:` inside prose (a URL) must not be quoted into a
+    # bogus object; there is no enclosing brace, so this stays prose.
+    parsed = parse_tool_calls("See https://example.com/a?b=1 for details")
+    assert parsed is None
+
+
+def test_quote_bare_keys_leaves_string_values_intact():
+    from danyapi.tools.parse import _quote_bare_keys
+
+    assert _quote_bare_keys('{a: "x:y"}') == '{"a": "x:y"}'
+    assert _quote_bare_keys('{a: "http://x/y"}') == '{"a": "http://x/y"}'
+    assert _quote_bare_keys('{"a": 1}') == '{"a": 1}'
+
+
 def test_parse_tool_calls_bare_dict_trailing_comma():
     text = '{"name": "f", "arguments": {"x": 1,}}'
     parsed = parse_tool_calls(text)
@@ -1967,11 +2030,12 @@ def test_compact_no_system():
     assert "Assistant: Hi there!" in body
 
 
-def test_compact_skips_tool_call_only_assistants():
-    """Assistant messages with only tool_calls (no text) don't form a pair.
+def test_compact_keeps_pending_user_and_tool_round():
+    """A tool-call-only assistant forms no pair, but the current turn is kept.
 
-    The user message before such an assistant is dropped (no complete pair),
-    but the tool result still appears in the 'Recent tool results' section.
+    The user message before such an assistant is the request being answered now,
+    so it must survive compaction (as the current turn), together with the tool
+    call and its result.
     """
     from danyapi.tools import build_compact_prompt
 
@@ -1986,9 +2050,9 @@ def test_compact_skips_tool_call_only_assistants():
         Message(role="tool", content="done", tool_call_id="call_1"),
     ]
     _, body = build_compact_prompt(msgs)
-    # No user/assistant pair rendered (incomplete), but tool result is present
-    assert "User: Do something" not in body
-    assert "Recent tool results:" in body
+    # The pending question is the current turn, and the tool round is its context.
+    assert "User: Do something" in body
+    assert "run_cmd" in body
     assert "done" in body
 
 
@@ -2015,6 +2079,129 @@ def test_compact_custom_max_pairs():
     assert "User: second" in body
     assert "Assistant: two" in body
     assert "first" not in body
+
+
+def test_compact_keeps_current_pending_question():
+    """The unanswered last user message must survive compaction.
+
+    Regression: the compact view used to keep only completed user/assistant
+    pairs, so the question the request was actually answering was dropped and
+    the fresh session answered an older one.
+    """
+    from danyapi.tools import build_compact_prompt
+
+    msgs = [
+        Message(role="system", content="sys"),
+        Message(role="user", content="old question"),
+        Message(role="assistant", content="old answer"),
+        Message(role="user", content="THE CURRENT QUESTION"),
+    ]
+    _, body = build_compact_prompt(msgs)
+    assert "old question" in body
+    assert "THE CURRENT QUESTION" in body
+
+
+def test_compact_includes_summary_of_dropped_history():
+    """A provided handoff summary is rendered above the kept history."""
+    from danyapi.tools import build_compact_prompt
+
+    msgs = [
+        Message(role="user", content="old question"),
+        Message(role="assistant", content="old answer"),
+        Message(role="user", content="current"),
+    ]
+    _, body = build_compact_prompt(msgs, summary="We chose Postgres and must keep the API stable.")
+    assert "Summary of earlier conversation" in body
+    assert "We chose Postgres" in body
+
+
+def test_compact_renders_tool_schema_and_json_mode():
+    """Tool schema and JSON mode survive the move to the fresh chat."""
+    from danyapi.tools import build_compact_prompt
+
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        },
+    }
+    msgs = [Message(role="user", content="hi")]
+    system, _ = build_compact_prompt(msgs, tools=[tool], response_format="json_object")
+    assert "get_weather" in system
+    assert "JSON" in system
+
+
+def test_compact_respects_max_chars_budget():
+    """The assembled body never exceeds max_chars even with huge history."""
+    from danyapi.tools import build_compact_prompt
+
+    msgs = [Message(role="system", content="sys")]
+    for i in range(10):
+        msgs.append(Message(role="user", content=f"question {i}"))
+        msgs.append(Message(role="assistant", content="A" * 5000))
+    msgs.append(Message(role="tool", content="T" * 40000, tool_call_id="c1"))
+    msgs.append(Message(role="user", content="CURRENT"))
+    _, body = build_compact_prompt(msgs, max_chars=20000)
+    assert len(body) <= 20000
+    assert "CURRENT" in body
+
+
+def test_compact_truncates_tool_results_to_fit_budget():
+    """When even the kept pairs fit but tool results do not, tool results shrink."""
+    from danyapi.tools import build_compact_prompt
+
+    msgs = [
+        Message(role="user", content="q"),
+        Message(role="assistant", content="a"),
+        Message(role="tool", content="T" * 30000, tool_call_id="c1"),
+        Message(role="user", content="CURRENT"),
+    ]
+    _, body = build_compact_prompt(msgs, max_tool_results=3, max_chars=2000)
+    assert len(body) <= 2000
+    assert "CURRENT" in body
+
+
+def test_compact_drops_tool_results_entirely_when_too_small():
+    """A tiny budget drops the tool-results section rather than leaving a stub."""
+    from danyapi.tools import build_compact_prompt
+
+    msgs = [
+        Message(role="user", content="q"),
+        Message(role="assistant", content="a"),
+        Message(role="tool", content="T" * 30000, tool_call_id="c1"),
+        Message(role="user", content="CURRENT"),
+    ]
+    _, body = build_compact_prompt(msgs, max_tool_results=3, max_chars=40)
+    assert len(body) <= 40
+
+
+def test_truncate_head_edge_cases():
+    """`_truncate_head` returns empty for a non-positive limit and keeps the tail."""
+    from danyapi.tools.prompt import _truncate_head
+
+    assert _truncate_head("abc", 0) == ""
+    assert _truncate_head("abc", -5) == ""
+    assert _truncate_head("abc", 10) == "abc"
+    out = _truncate_head("x" * 100, 20)
+    assert len(out) <= 20
+    assert out.endswith("x")
+
+
+def test_dropped_pairs_source_reports_older_pairs():
+    """The summarizer source is the prefix a compact prompt would drop."""
+    from danyapi.tools import dropped_pairs_source
+
+    msgs = [
+        Message(role="user", content="first"),
+        Message(role="assistant", content="one"),
+        Message(role="user", content="second"),
+        Message(role="assistant", content="two"),
+        Message(role="user", content="third"),
+    ]
+    assert dropped_pairs_source(msgs, max_pairs=1, max_chars=10000) == "User: first\n\nAssistant: one"
+    assert dropped_pairs_source(msgs, max_pairs=10, max_chars=10000) == ""
 
 
 def test_parse_tool_calls_normalizes_read_aliases():

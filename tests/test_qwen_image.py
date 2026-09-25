@@ -58,6 +58,18 @@ class FakeAccount:
         self.sessions.obtain = AsyncMock(return_value=(FakeSession(), "s1"))
         self.sessions.touch_last_message = MagicMock()
         self.sessions.forget = MagicMock()
+        self.sessions.get = MagicMock(return_value=None)
+        self.sessions.attach = AsyncMock(return_value=None)
+        self._sticky: dict = {}
+
+    def sticky_image_chat(self, model):
+        return self._sticky.get(model)
+
+    def set_sticky_image_chat(self, model, chat_id):
+        self._sticky[model] = chat_id
+
+    def forget_sticky_image_chat(self, model):
+        self._sticky.pop(model, None)
 
     def mark_broken(self):
         self.broken = True
@@ -91,6 +103,39 @@ async def test_collect_image_success():
     assert result["session_id"] == "s1"
     assert "usage" in result
     acct.sessions.touch_last_message.assert_called_once_with("s1", "r1")
+
+
+async def test_collect_image_pins_and_reuses_sticky_chat():
+    acct = FakeAccount([IMG_SSE, IMG_SSE])
+    args = _args(acct)
+    args["existing_sid"] = None
+    await qwen_api.collect_image(**args)
+    assert acct.sticky_image_chat("qwen-image-gen") == "s1"
+    # Second call without an explicit session reuses the pinned chat.
+    await qwen_api.collect_image(**args)
+    assert acct.sessions.obtain.await_args_list[1].args[0] == "s1"
+
+
+async def test_collect_image_reattaches_pinned_chat():
+    acct = FakeAccount([IMG_SSE])
+    acct.set_sticky_image_chat("qwen-image-gen", "chat-old")
+    acct.sessions.get = MagicMock(return_value=None)
+    args = _args(acct)
+    args["existing_sid"] = None
+    await qwen_api.collect_image(**args)
+    acct.sessions.attach.assert_awaited_once_with("chat-old", model=qwen_api.IMAGE_CHAT_MODEL, chat_type="t2i")
+    assert acct.sessions.obtain.await_args.args[0] == "chat-old"
+
+
+async def test_collect_image_explicit_session_not_overridden_by_sticky():
+    acct = FakeAccount([IMG_SSE])
+    acct.set_sticky_image_chat("qwen-image-gen", "chat-old")
+    args = _args(acct)
+    args["existing_sid"] = "explicit-1"
+    await qwen_api.collect_image(**args)
+    assert acct.sessions.obtain.await_args.args[0] == "explicit-1"
+    # An explicit session must not rewrite the pinned chat.
+    assert acct.sticky_image_chat("qwen-image-gen") == "chat-old"
 
 
 async def test_collect_image_uses_t2i_chat_type():
