@@ -2,6 +2,17 @@
 
 ## Готово
 
+- **Парсер: имя параметра в атрибуте `parameter="X"`.** DeepSeek иногда отдаёт
+  opener без слова `name=` — `parameter="command"` вместо `parameter
+  name="command"` — а значение несёт висячую кавычку (`sleep 120"`).
+  `_DSML_PARAM_OPENER_RE` требует `parameter name=`, поэтому такие теги были
+  невидимы всем DSML-веткам и блок терялся (tooltrace `32629734`). Добавлен
+  `_DSML_PARAM_EQ_OPENER_RE` (отдельный паттерн, канонический не тронут),
+  `_parse_dsml_param_only` сканирует оба вида; висячая кавычка срезается только у
+  нового варианта. Тесты: `tests/test_tools.py` (+3). Playbook дополнен.
+  Верификация: `ruff check` + `ruff format --check` + `pytest -q` → **1170 passed**,
+  `arch-check` OK.
+
 - **Парсер: повтор имени параметра = несколько вызовов + аргументы в close-теге.**
   Блок DSML без `<invoke>` (только `<parameter>`) может кодировать **несколько**
   вызовов: DeepSeek повторяет имя аргумента по разу на вызов (tooltrace `24b809c9`:

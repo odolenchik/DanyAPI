@@ -95,6 +95,11 @@ PY
    - **Параметры, влитые в закрывающий тег**: хвостовые аргументы идут как `k=v`
      внутри close-тега — `</DSML|| line_offset=170 n_lines=18>`. Их собирает
      `_dsml_close_tag_attrs` (tooltrace `24b809c9`, `50ad2c8a`).
+   - **Имя в атрибуте `parameter="X"`**: opener без слова `name=` —
+     `<||DSML||parameter="command">`, а значение несёт висячую кавычку
+     (`sleep 120"`). `_DSML_PARAM_OPENER_RE` требует `parameter name=`, поэтому
+     такие теги невидимы. Матчит `_DSML_PARAM_EQ_OPENER_RE`; висячая кавычка
+     срезается (`_parse_dsml_param_only`, tooltrace `32629734`).
    - **Порча валидных `\\`-пар**: старый `_fix_invalid_escapes` матчил второй бэкслеш в `\\|`/`\\(`
      и делал `Invalid \escape` → переписан на посимвольный проход (см. `parse.py`).
 

@@ -3292,6 +3292,56 @@ def test_dsml_param_only_mixed_names_infer_per_call():
     ]
 
 
+def test_dsml_param_eq_opener_with_trailing_quote():
+    """A DSML parameter block whose argument name sits directly in the ``parameter``
+    attribute (``parameter="command"``) with no ``name=`` word, and whose values carry
+    a stray trailing quote (reported pattern: ``parameter="command">sleep 120"``). The
+    name-in-attribute opener must match and the trailing quote must be stripped from
+    every value.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f"<{S} calls>\n"
+        f'<{S} parameter="command">sleep 120"{S}>\n'
+        f'<{S} parameter="description">Wait for image generation and draft delivery"{S}>\n'
+        f'<{S} parameter="timeout">140"{S}>\n'
+        f"</{S} calls>"
+    )
+    schemas = {"Bash": {"command": "", "description": "", "timeout": 1}}
+    calls, _ = _parse_dsml(text, schemas)
+    assert calls is not None and len(calls) == 1
+    assert calls[0].name == "Bash"
+    args = json.loads(calls[0].arguments)
+    assert args == {
+        "command": "sleep 120",
+        "description": "Wait for image generation and draft delivery",
+        "timeout": 140,
+    }
+
+
+def test_dsml_param_eq_opener_single_quotes_and_string_flag():
+    """The ``parameter='X'`` variant, with a trailing ``string="true"`` flag: the
+    name comes from the attribute, the flag is honoured, and the stray quote is gone.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = f"<{S} calls>\n<{S} parameter='command' string=\"true\">pwd'{S}>\n</{S} calls>"
+    calls, _ = _parse_dsml(text, {"Bash": {"command": ""}})
+    assert calls is not None and len(calls) == 1
+    assert calls[0].name == "Bash"
+    assert json.loads(calls[0].arguments) == {"command": "pwd"}
+
+
+def test_dsml_param_eq_opener_canonical_untouched():
+    """The new ``parameter="X"`` opener must not swallow the canonical
+    ``parameter name="X"`` form: both appear here and both must parse.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = f'<{S} calls>\n<{S} parameter name="command">echo hi</{S}>\n<{S} parameter="command">pwd"{S}>\n</{S} calls>'
+    calls, _ = _parse_dsml(text, {"Bash": {"command": ""}})
+    assert calls is not None
+    assert [json.loads(c.arguments)["command"] for c in calls] == ["echo hi", "pwd"]
+
+
 def test_wrapped_key_tool_calls_with_space():
     """DeepSeek emits a JSON wrapper with the key 'tool calls' (space instead of
     underscore). _WRAPPED_CALL_KEYS must include this variant.

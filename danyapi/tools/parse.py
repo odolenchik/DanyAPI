@@ -1117,9 +1117,23 @@ _DSML_PARAM_OPENER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Malformed DSML param opener variant: the argument name sits directly in the
+# ``parameter`` attribute (`parameter="command"`) with no ``name=`` word at all.
+# _DSML_PARAM_OPENER_RE requires ``parameter name=``, so these tags are invisible to
+# every DSML branch and the whole block is dropped (tooltrace 32629734; reported as
+# `parameter="command">sleep 120"`). The value also carries a stray trailing quote
+# because the opener reuses its attribute quote around the value.
+_DSML_PARAM_EQ_OPENER_RE = re.compile(
+    rf"</?{_DSML_SEP}DSML{_DSML_SEP}\s*parameter=(?P<q>['\"])(?P<pname>[^'\">]+)(?P=q)"
+    rf"(?:\s+string=(?P<sq>['\"])(?P<sval>true|false)(?P=sq))?"
+    r"\s*>",
+    re.IGNORECASE,
+)
+
 
 # Bare k=v attributes fused into a DSML close tag (tooltrace 24b809c9): DeepSeek
-# compresses trailing params into the close tag — `` `` — instead of emitting their own <parameter> tags.
+# compresses trailing params into the close tag (`line_offset=170 n_lines=18` before
+# the closing `>`) instead of emitting their own <parameter> tags.
 _DSML_CLOSE_ATTR_RE = re.compile(r"(?P<key>[a-zA-Z_][\w.-]*)\s*=\s*(?P<val>\"[^\"]*\"|'[^']*'|[^\s>]+)")
 
 
@@ -1127,7 +1141,7 @@ def _dsml_close_tag_attrs(tag: str) -> dict[str, Any]:
     """Extract bare ``k=v`` attributes fused into a DSML close tag.
 
     The ``DSML||`` marker is skipped so it is never mistaken for a key; an ordinary
-    close tag (`` ``) yields an empty dict.
+    close tag (no k=v tail) yields an empty dict.
     """
     marker = re.search(rf"DSML\s*{_DSML_SEP}", tag, re.IGNORECASE)
     body = tag[marker.end() :] if marker else tag
@@ -1153,8 +1167,17 @@ def _parse_dsml_param_only(text: str, tool_schemas: dict[str, dict[str, Any]] | 
     (tooltrace 24b809c9, f4275506), and trailing arguments fused into a close tag
     (the ``line_offset=170 n_lines=18`` tail of a close tag) are folded into the
     current call.
+
+    Two opener spellings are accepted: the canonical ``parameter name="X"`` and the
+    malformed ``parameter="X"`` where the name is the attribute itself, whose values
+    carry a stray trailing quote (tooltrace 32629734).
     """
-    openers = list(_DSML_PARAM_OPENER_RE.finditer(text))
+    # Pair each match with whether it came from the ``parameter="X"`` variant, whose
+    # values carry a stray trailing quote (`sleep 120"`) because the opener reuses its
+    # attribute quote around the value.
+    openers: list[tuple[re.Match[str], bool]] = [(m, False) for m in _DSML_PARAM_OPENER_RE.finditer(text)]
+    openers += [(m, True) for m in _DSML_PARAM_EQ_OPENER_RE.finditer(text)]
+    openers.sort(key=lambda item: item[0].start())
     if not openers:
         return None
 
@@ -1162,8 +1185,8 @@ def _parse_dsml_param_only(text: str, tool_schemas: dict[str, dict[str, Any]] | 
     # same parameter name once per call (tooltrace 24b809c9: four <parameter
     # name="path"> = four Read calls; f4275506: two <parameter name="command"> =
     # two Bash calls). It also fuses trailing params into the close tag
-    # (`` ``). Splitting the run on a repeated
-    # name is what turns the old single (last-wins) call into the full set.
+    # (`line_offset=170 n_lines=18` before the closing `>`). Splitting the run on a
+    # repeated name is what turns the old single (last-wins) call into the full set.
     _dsml_tag_any_re = re.compile(
         rf"(?:</?)?\s*{_DSML_SEP}DSML{_DSML_SEP}\s*(?:\w+\s*)?[^>]*>",
         re.IGNORECASE,
@@ -1172,14 +1195,19 @@ def _parse_dsml_param_only(text: str, tool_schemas: dict[str, dict[str, Any]] | 
     groups: list[list[tuple[str, str, Any, dict[str, Any]]]] = []
     current: list[tuple[str, str, Any, dict[str, Any]]] = []
     seen: set[str] = set()
-    for idx, m in enumerate(openers):
+    for idx, (m, is_eq) in enumerate(openers):
         pname = m.group("pname")
         value_start = m.end()
-        value_end = openers[idx + 1].start() if idx + 1 < len(openers) else len(text)
+        value_end = openers[idx + 1][0].start() if idx + 1 < len(openers) else len(text)
         region = text[value_start:value_end]
         # The value ends at the first DSML tag (close or open) in the region.
         tag_match = _dsml_tag_any_re.search(region)
         raw_value = region[: tag_match.start()] if tag_match else region
+        raw_value = raw_value.strip()
+        # The ``parameter="X"`` variant reuses the attribute quote around the value,
+        # leaving a stray trailing quote (tooltrace 32629734: `sleep 120"`).
+        if is_eq and raw_value.endswith(('"', "'")):
+            raw_value = raw_value[:-1].rstrip()
         attrs = _dsml_close_tag_attrs(tag_match.group(0)) if tag_match else {}
         # A repeated parameter name starts the next call. Tool calls are sets of
         # uniquely-named args, so a repeat — whether of an argument (two "command")
@@ -1188,7 +1216,7 @@ def _parse_dsml_param_only(text: str, tool_schemas: dict[str, dict[str, Any]] | 
             groups.append(current)
             current = []
             seen = set()
-        current.append((pname, raw_value.strip(), m.group("sval"), attrs))
+        current.append((pname, raw_value, m.group("sval"), attrs))
         seen.add(pname)
     if current:
         groups.append(current)
