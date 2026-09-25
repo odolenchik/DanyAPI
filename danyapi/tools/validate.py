@@ -135,6 +135,50 @@ def summarize(issues: list[ValidationIssue]) -> tuple[str, Any]:
     return issue, detail
 
 
+def _choice_mode(tool_choice: Any) -> str:
+    """Classify an OpenAI ``tool_choice`` value as ``force`` / ``none`` / ``auto``.
+
+    ``"required"`` and a specific function name (bare string or an OpenAI
+    ``{"function": {"name": ...}}`` object) force a call; ``"none"`` forbids one;
+    everything else (``"auto"``, ``None``, an empty string) leaves it optional.
+    """
+    if isinstance(tool_choice, str):
+        if tool_choice == "none":
+            return "none"
+        if tool_choice in ("", "auto"):
+            return "auto"
+        return "force"
+    if isinstance(tool_choice, dict):
+        fn = tool_choice.get("function")
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str) and fn["name"]:
+            return "force"
+    return "auto"
+
+
+def should_retry_unparsed(tool_choice: Any, issue: str | None, *, retry_auto: bool = False) -> bool:
+    """Whether an unparsed tool-mode reply warrants one repair retry.
+
+    ``parse_tool_calls`` returned no call. That is only worth re-asking upstream
+    when the model was *supposed* to call a tool:
+
+    * ``tool_choice`` forces a call (``"required"`` or a named function) — always
+      retry: the model had no prose option, so a parse failure is a mangle;
+    * ``"none"`` forbids tools — never retry, an unparsed reply is just text;
+    * otherwise retry only when ``retry_auto`` is set *and* the classifier judged
+      the text a malformed call (``"json_malformed"``), never for ordinary prose
+      (``"no_tool_call"``).
+
+    The caller supplies the classifier verdict so this stays a pure decision and a
+    normal answer is never re-sent upstream.
+    """
+    mode = _choice_mode(tool_choice)
+    if mode == "force":
+        return True
+    if mode == "none":
+        return False
+    return retry_auto and issue == "json_malformed"
+
+
 def build_repair_prompt(issues: list[ValidationIssue]) -> str:
     """A follow-up instruction asking the model to redo a rejected tool call.
 

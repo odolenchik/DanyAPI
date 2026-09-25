@@ -4,6 +4,7 @@ from danyapi.tools.prompt import ToolCall
 from danyapi.tools.validate import (
     ValidationIssue,
     build_repair_prompt,
+    should_retry_unparsed,
     summarize,
     type_matches,
     validate_call,
@@ -157,3 +158,42 @@ def test_build_repair_prompt_caps_listed_issues():
     prompt = build_repair_prompt(issues)
     assert "t.k4" in prompt
     assert "t.k5" not in prompt
+
+
+# --- should_retry_unparsed: gate for the retry-on-unparsed repair ------------
+
+
+def test_should_retry_unparsed_forced_choice_always_retries():
+    # tool_choice forces a call, so an unparsed reply is a mangle, not prose.
+    assert should_retry_unparsed("required", "no_tool_call") is True
+    assert should_retry_unparsed("required", None) is True
+    assert should_retry_unparsed("get_weather", "no_tool_call") is True
+    assert should_retry_unparsed({"type": "function", "function": {"name": "get_weather"}}, "no_tool_call") is True
+
+
+def test_should_retry_unparsed_none_choice_never_retries():
+    # tool_choice forbids tools, so an unparsed reply is a normal text answer.
+    assert should_retry_unparsed("none", "json_malformed", retry_auto=True) is False
+    assert should_retry_unparsed("none", "no_tool_call") is False
+
+
+def test_should_retry_unparsed_auto_off_by_default():
+    # Auto (and unset) choices must not re-send a normal answer upstream.
+    assert should_retry_unparsed("auto", "json_malformed") is False
+    assert should_retry_unparsed(None, "json_malformed") is False
+    assert should_retry_unparsed("", "json_malformed") is False
+
+
+def test_should_retry_unparsed_auto_retries_only_malformed():
+    # With the opt-in flag, only a call that looked mangled is retried; ordinary
+    # prose (no_tool_call) never is.
+    assert should_retry_unparsed("auto", "json_malformed", retry_auto=True) is True
+    assert should_retry_unparsed("auto", "no_tool_call", retry_auto=True) is False
+    assert should_retry_unparsed("auto", None, retry_auto=True) is False
+    assert should_retry_unparsed(None, "json_malformed", retry_auto=True) is True
+
+
+def test_should_retry_unparsed_non_string_choice_is_auto():
+    # A malformed tool_choice object without a function name is treated as auto.
+    assert should_retry_unparsed({"type": "function"}, "json_malformed") is False
+    assert should_retry_unparsed(123, "json_malformed", retry_auto=True) is True
