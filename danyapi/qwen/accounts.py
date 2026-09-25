@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from ..sessions import SessionRegistry
@@ -104,7 +105,7 @@ class QwenSessionRegistry(SessionRegistry):
 
 
 class QwenAccount:
-    __slots__ = ("_sticky", "_sticky_store", "broken", "client", "index", "sem", "sessions")
+    __slots__ = ("_sticky", "_sticky_store", "broken", "client", "index", "quota_until", "sem", "sessions")
 
     def __init__(
         self,
@@ -120,6 +121,10 @@ class QwenAccount:
         self.sem = asyncio.Semaphore(1)
         self.sessions = QwenSessionRegistry(client, session_cache_size, ttl, store=store, key_prefix=f"{index}:")
         self.broken = False
+        # Monotonic deadline until which a quota-exhausted account stays out of
+        # rotation. 0.0 means no timed block (either healthy, or broken forever
+        # by an auth error).
+        self.quota_until = 0.0
         self._sticky_store = sticky_store
         self._sticky: dict[str, str] = {}
 
@@ -159,6 +164,33 @@ class QwenAccount:
         if not self.broken:
             self.broken = True
             log.warning("qwen account #%d marked broken (invalid/expired token)", self.index)
+
+    def mark_quota_exhausted(self, cooldown_seconds: float) -> None:
+        """Take the account out of rotation until its quota window resets.
+
+        Unlike an auth failure this is temporary: the deadline stored in
+        ``quota_until`` lets ``is_available`` return the account on its own.
+        """
+        self.broken = True
+        self.quota_until = time.monotonic() + max(0.0, cooldown_seconds)
+        log.warning(
+            "qwen account #%d marked quota-exhausted, cooling down %.0fs",
+            self.index,
+            max(0.0, cooldown_seconds),
+        )
+
+    def is_available(self) -> bool:
+        """True when the account may be used for a request right now.
+
+        A quota cooldown that has elapsed automatically puts the account back
+        into rotation. Accounts broken by ``mark_broken`` (auth errors) carry
+        ``quota_until == 0.0`` and stay unavailable forever.
+        """
+        if self.broken and self.quota_until and time.monotonic() >= self.quota_until:
+            self.broken = False
+            self.quota_until = 0.0
+            log.info("qwen account #%d quota cooldown elapsed, back in rotation", self.index)
+        return not self.broken
 
     @property
     def label(self) -> str:

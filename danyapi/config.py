@@ -68,6 +68,14 @@ class Settings:
             self.session_ttl = float(raw_ttl)
         except ValueError:
             self.session_ttl = 3600.0
+        # How long a Qwen account is dropped from rotation after it reports its
+        # daily quota is used up. Qwen resets the image quota daily, so the
+        # default cooldown is one day; the account returns on its own after it.
+        raw_quota = os.environ.get("DANYAPI_QWEN_QUOTA_COOLDOWN", "86400")
+        try:
+            self.qwen_quota_cooldown = float(raw_quota)
+        except ValueError:
+            self.qwen_quota_cooldown = 86400.0
         raw_level = os.environ.get("DANYAPI_LOG_LEVEL", "INFO").strip()
         self.log_level = raw_level or "INFO"
         self.log_file = os.environ.get("DANYAPI_LOG_FILE", "").strip()

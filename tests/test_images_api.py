@@ -295,6 +295,59 @@ async def test_image_fetch_exception_falls_back_to_url():
     assert resp.json()["data"] == [{"url": "https://cdn.qwenlm.ai/x.png"}]
 
 
+async def test_generations_failover_to_next_account_on_quota():
+    pool = _pool()
+    acct_a, acct_b = MagicMock(), MagicMock()
+    acct_a.sem = asyncio.Semaphore(1)
+    acct_b.sem = asyncio.Semaphore(1)
+    pool.accounts = [acct_a, acct_b]
+    pool.acquire = AsyncMock(side_effect=[(acct_a, "s1"), (acct_b, "s1")])
+    app.state.qwen_pool = pool
+    ok = {"image_urls": ["https://cdn.qwenlm.ai/b.png"], "revised_prompt": "", "usage": None, "session_id": "s1"}
+    collected = AsyncMock(side_effect=[openai_mod.qwen_api.QuotaExhausted("quota exhausted"), ok])
+    with patch.object(openai_mod.qwen_api, "collect_image", collected):
+        client = TestClient(app)
+        resp = client.post("/v1/images/generations", json={"model": "qwen-image-gen", "prompt": "a cat"})
+        client.close()
+    assert resp.status_code == 200
+    assert resp.json()["data"] == [{"url": "https://cdn.qwenlm.ai/b.png"}]
+    assert collected.await_count == 2
+
+
+async def test_generations_all_accounts_quota_returns_429():
+    pool = _pool()
+    acct_a, acct_b = MagicMock(), MagicMock()
+    acct_a.sem = asyncio.Semaphore(1)
+    acct_b.sem = asyncio.Semaphore(1)
+    pool.accounts = [acct_a, acct_b]
+    pool.acquire = AsyncMock(side_effect=[(acct_a, "s1"), (acct_b, "s1")])
+    app.state.qwen_pool = pool
+    with patch.object(
+        openai_mod.qwen_api,
+        "collect_image",
+        AsyncMock(side_effect=openai_mod.qwen_api.QuotaExhausted("daily image generation quota exhausted")),
+    ):
+        client = TestClient(app)
+        resp = client.post("/v1/images/generations", json={"model": "qwen-image-gen", "prompt": "a cat"})
+        client.close()
+    assert resp.status_code == 429
+    assert "quota" in resp.json()["detail"]
+
+
+async def test_generations_no_data_with_revised_prompt_returns_502_with_text():
+    app.state.qwen_pool = _pool()
+    with patch.object(
+        openai_mod.qwen_api,
+        "collect_image",
+        AsyncMock(return_value={"image_urls": [], "revised_prompt": "quota notice", "usage": None, "session_id": "s1"}),
+    ):
+        client = TestClient(app)
+        resp = client.post("/v1/images/generations", json={"model": "qwen-image-gen", "prompt": "a cat"})
+        client.close()
+    assert resp.status_code == 502
+    assert "quota notice" in resp.json()["detail"]
+
+
 async def test_generations_busy_during_fetch_returns_429():
     app.state.qwen_pool = _pool()
     with patch.object(

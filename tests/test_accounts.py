@@ -374,6 +374,35 @@ def test_account_for_session_broken():
     assert "s1" not in pool._by_session
 
 
+class _QuotaAccount:
+    """Account stub whose availability is driven by an explicit flag."""
+
+    def __init__(self, index: int, available: bool = True) -> None:
+        self.index = index
+        self.sem = asyncio.Semaphore(1)
+        self._available = available
+
+    def is_available(self) -> bool:
+        return self._available
+
+
+async def test_pool_skips_quota_cooling_account():
+    a0, a1 = _QuotaAccount(0, available=False), _QuotaAccount(1)
+    pool = AccountPool([a0, a1])
+    assert a0 not in pool.healthy
+    acct, sid = await pool.acquire(None)
+    assert acct is a1
+    assert sid is None
+
+
+async def test_pool_returns_account_after_cooldown():
+    a0 = _QuotaAccount(0, available=False)
+    pool = AccountPool([a0])
+    assert pool.healthy == []
+    a0._available = True  # cooldown elapsed
+    assert pool.healthy == [a0]
+
+
 def test_stats():
     pool = AccountPool([make_acct(0), make_acct(1)])
     pool.register(0, "s1")

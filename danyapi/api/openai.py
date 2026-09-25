@@ -315,13 +315,8 @@ async def _image_generations(req: ImageGenerationRequest, pool: AccountPool) -> 
     dims = _parse_image_size(req.size)
     count = max(1, int(getattr(req, "n", 1) or 1))
 
-    account, existing_sid = await _acquire_account(pool, req.session_id)
-
     want_b64 = req.response_format == "b64_json"
     use_http = want_b64 or dims is not None
-    data: list[dict] = []
-    usage = None
-    result_sid = existing_sid
     hc = _image_http_client()
     download_sem = asyncio.Semaphore(4)
 
@@ -343,36 +338,58 @@ async def _image_generations(req: ImageGenerationRequest, pool: AccountPool) -> 
                 log.warning("image fetch failed for %s, returning url: %s", url, exc)
                 return {"url": url}
 
-    try:
-        for _ in range(count):
-            result = await qwen_api.collect_image(
-                account=account,
-                pool=pool,
-                existing_sid=result_sid,
-                lock=account.sem,
-                prompt=req.prompt,
-                model=req.model,
-                model_id=req.model,
-                image_size=_aspect_ratio(dims) if dims is not None else None,
-                user=req.user,
-            )
-            result_sid = result.get("session_id") or result_sid
-            if result.get("usage"):
-                usage = result.get("usage")
-            if result["image_urls"]:
-                data.extend(await asyncio.gather(*(_fetch_image(url) for url in result["image_urls"])))
-    except AccountPoolBusy:
-        raise HTTPException(429, "all accounts are busy, try again later") from None
+    # A quota-exhausted account is dropped from the pool by collect_image; try
+    # the next one. Bound the loop by the number of accounts so an all-quota
+    # pool fails fast instead of spinning.
+    max_attempts = max(1, len(pool.accounts))
+    quota_detail: str | None = None
+    revised_prompt = ""
+    for attempt in range(max_attempts):
+        try:
+            account, existing_sid = await _acquire_account(pool, req.session_id)
+        except AccountPoolBusy:
+            raise HTTPException(429, "all accounts are busy, try again later") from None
+        data: list[dict] = []
+        usage = None
+        result_sid = existing_sid
+        try:
+            for _ in range(count):
+                result = await qwen_api.collect_image(
+                    account=account,
+                    pool=pool,
+                    existing_sid=result_sid,
+                    lock=account.sem,
+                    prompt=req.prompt,
+                    model=req.model,
+                    model_id=req.model,
+                    image_size=_aspect_ratio(dims) if dims is not None else None,
+                    user=req.user,
+                )
+                result_sid = result.get("session_id") or result_sid
+                if result.get("usage"):
+                    usage = result.get("usage")
+                revised_prompt = result.get("revised_prompt") or revised_prompt
+                if result["image_urls"]:
+                    data.extend(await asyncio.gather(*(_fetch_image(url) for url in result["image_urls"])))
+        except AccountPoolBusy:
+            raise HTTPException(429, "all accounts are busy, try again later") from None
+        except qwen_api.QuotaExhausted as exc:
+            quota_detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            log.warning("image generation quota exhausted on account, trying next (attempt %d/%d)", attempt + 1, max_attempts)
+            continue
+        if data:
+            return {
+                "created": int(time.time()),
+                "data": data,
+                "usage": usage,
+                "session_id": result_sid,
+            }
 
-    if not data:
-        raise HTTPException(502, "image generation returned no data")
-
-    return {
-        "created": int(time.time()),
-        "data": data,
-        "usage": usage,
-        "session_id": result_sid,
-    }
+    if quota_detail is not None:
+        raise HTTPException(429, quota_detail)
+    if revised_prompt:
+        raise HTTPException(502, f"image generation returned no data: {revised_prompt}")
+    raise HTTPException(502, "image generation returned no data")
 
 
 app = FastAPI(title="DanyAPI", lifespan=lifespan)

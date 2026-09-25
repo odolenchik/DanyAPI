@@ -35,6 +35,18 @@ THINK_SSE = (
 
 BUSY_SSE = 'data: {"error": {"code": "Too_Many_Requests", "details": "please slow down"}, "response_id": "r1"}\n\n'
 
+QUOTA_CODE_SSE = 'data: {"error": {"code": "quotaLimited", "details": "daily quota reached"}, "response_id": "r1"}\n\n'
+
+QUOTA_TEXT_SSE = (
+    'data: {"response.created":{"chat_id":"c1","parent_id":"p0","response_id":"r1","response_index":"0"}} \n'
+    "\n"
+    'data: {"choices": [{"delta": {"role": "assistant", "content": "you\\u0027ve used up your daily image generation quota",'
+    ' "phase": "answer", "status": "typing"}}], "response_id": "r1"}\n'
+    "\n"
+    'data: {"choices": [{"delta": {"content": "", "role": "assistant", "status": "finished", "phase": "answer"}}], "response_id": "r1"}\n'
+    "\n"
+)
+
 CTX_SSE = 'data: {"error": {"code": "ContextLengthExceeded", "details": "too long"}, "response_id": "r1"}\n\n'
 
 
@@ -89,6 +101,16 @@ class FakeAccount:
 
     def mark_broken(self):
         self.broken = True
+
+    def mark_quota_exhausted(self, cooldown_seconds):
+        self.broken = True
+        self.quota_until = cooldown_seconds
+
+    def sticky_image_chat(self, model):
+        return None
+
+    def set_sticky_image_chat(self, model, chat_id):
+        pass
 
 
 @pytest.fixture(autouse=True)
@@ -609,3 +631,63 @@ async def test_non_stream_tool_mode_with_reasoning():
     message = result["choices"][0]["message"]
     assert message["content"] == "Answer"
     assert message["reasoning_content"] == "Think step"
+
+
+def _image_args(acct, pool=None, existing_sid="s1"):
+    return {
+        "account": acct,
+        "pool": pool or MagicMock(),
+        "existing_sid": existing_sid,
+        "lock": acct.sem,
+        "prompt": "x",
+        "model": "qwen3.8-max",
+        "model_id": "qwen3.8-max",
+    }
+
+
+async def test_collect_image_text_quota_marks_and_raises():
+    acct = FakeAccount([QUOTA_TEXT_SSE])
+    pool = MagicMock()
+    with pytest.raises(qwen_api.QuotaExhausted) as excinfo:
+        await qwen_api.collect_image(**_image_args(acct, pool=pool))
+    assert excinfo.value.status_code == 429
+    assert acct.broken
+    pool.forget.assert_called_once_with("s1")
+    acct.sessions.forget.assert_called_once_with("s1")
+
+
+async def test_collect_image_code_quota_marks_and_raises():
+    acct = FakeAccount([QUOTA_CODE_SSE])
+    pool = MagicMock()
+    with pytest.raises(qwen_api.QuotaExhausted) as excinfo:
+        await qwen_api.collect_image(**_image_args(acct, pool=pool))
+    assert excinfo.value.status_code == 429
+    assert acct.broken
+    # No retries on the same account: the provider was hit exactly once.
+    assert acct.client.completion.await_count == 1
+
+
+async def test_collect_non_stream_code_quota_marks_and_raises():
+    acct = FakeAccount([QUOTA_CODE_SSE])
+    pool = MagicMock()
+    with pytest.raises(qwen_api.QuotaExhausted) as excinfo:
+        await qwen_api.collect_non_stream(**_args(acct, pool=pool))
+    assert excinfo.value.status_code == 429
+    assert acct.broken
+    assert acct.client.completion.await_count == 1
+
+
+def test_is_quota_exhausted_variants():
+    rec = QwenStreamReconstructor()
+    rec.content = "You have used up your daily image generation quota"
+    assert qwen_api._is_quota_exhausted(rec) is not None
+    rec2 = QwenStreamReconstructor()
+    rec2.error = {"code": "quotaLimited"}
+    assert qwen_api._is_quota_exhausted(rec2) is not None
+    rec3 = QwenStreamReconstructor()
+    rec3.content = "Here is a picture of a quota"
+    assert qwen_api._is_quota_exhausted(rec3) is None
+    rec4 = QwenStreamReconstructor()
+    rec4.image_urls = ["https://cdn.qwenlm.ai/a.png"]
+    rec4.content = "used up your daily quota"
+    assert qwen_api._is_quota_exhausted(rec4) is None

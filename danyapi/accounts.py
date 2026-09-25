@@ -264,6 +264,10 @@ class DeepSeekAccount:
             self.broken = True
             log.warning("account #%d marked broken (invalid/expired token)", self.index)
 
+    def is_available(self) -> bool:
+        """DeepSeek accounts are either healthy or broken forever (auth errors)."""
+        return not self.broken
+
     @property
     def label(self) -> str:
         return f"acct#{self.index}"
@@ -437,7 +441,7 @@ class AccountPool:
 
     @property
     def healthy(self) -> list[DeepSeekAccount]:
-        return [a for a in self.accounts if not a.broken]
+        return [a for a in self.accounts if a.is_available()]
 
     def register(self, account_index: int, session_id: str) -> None:
         now = time.monotonic()
@@ -486,7 +490,7 @@ class AccountPool:
                 return None
         idx = entry[0]
         acct = self.accounts[idx]
-        if acct is None or acct.broken:
+        if acct is None or not acct.is_available():
             self._by_session.pop(session_id, None)
             self._contexts.forget(session_id)
             if self._affinity_store is not None:

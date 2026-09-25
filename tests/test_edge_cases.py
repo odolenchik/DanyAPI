@@ -117,6 +117,35 @@ def test_mark_broken_and_label():
     assert acct.broken
 
 
+def test_mark_quota_exhausted_blocks_then_recovers():
+    acct = QwenAccount(0, MagicMock(spec=QwenClient))
+    assert acct.is_available()
+    acct.mark_quota_exhausted(3600.0)
+    assert acct.broken
+    assert not acct.is_available()
+    # Simulate the cooldown elapsing: a past deadline lets the account return.
+    acct.quota_until = 1.0
+    assert acct.is_available()
+    assert not acct.broken
+    assert acct.quota_until == 0.0
+
+
+def test_is_available_expired_cooldown_resets():
+    acct = QwenAccount(0, MagicMock(spec=QwenClient))
+    acct.mark_quota_exhausted(3600.0)
+    acct.quota_until = 1.0  # far in the past on the monotonic clock
+    assert acct.is_available()
+    assert acct.quota_until == 0.0
+
+
+def test_mark_broken_stays_unavailable_forever():
+    acct = QwenAccount(0, MagicMock(spec=QwenClient))
+    acct.mark_broken()
+    # No quota deadline is set, so an auth-broken account never returns.
+    assert acct.quota_until == 0.0
+    assert not acct.is_available()
+
+
 def test_sticky_image_chat_memory_only():
     acct = QwenAccount(0, MagicMock(spec=QwenClient))
     assert acct.sticky_image_chat("qwen-image-2.0-pro") is None

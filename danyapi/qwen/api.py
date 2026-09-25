@@ -61,11 +61,69 @@ RATE_LIMIT_ERROR_CODES = {
     "quotaLimited",
 }
 
+# Error codes that mean the account's daily quota is used up, not a transient
+# throttle. Retrying the same account is pointless and only delays the failover.
+QUOTA_ERROR_CODES = {
+    "quotaLimited",
+    "quotaExhausted",
+    "QuotaExhausted",
+}
+
+# Qwen reports an exhausted image quota as plain answer text rather than an error
+# code, e.g. "you've used up your daily image generation quota". Match on whole
+# phrases so an ordinary answer mentioning "quota" is never mistaken for it.
+QUOTA_TEXT_MARKERS = (
+    "used up your daily",
+    "daily image generation quota",
+    "image generation quota",
+    "daily quota",
+    "quota exhausted",
+    "quota exceeded",
+)
+
 CONTEXT_LIMIT_MARKERS = ("context", "maxinput", "toolong", "lengthexceeded", "tokenlimit")
 
 
 class ContextLimitError(Exception):
     pass
+
+
+class QuotaExhausted(HTTPException):
+    """The account's (daily) quota is used up, so it must leave the rotation."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(429, detail)
+
+
+def _is_quota_error_code(code) -> bool:
+    return isinstance(code, str) and code in QUOTA_ERROR_CODES
+
+
+def _quota_text(content: str) -> str | None:
+    """Return the matching quota phrase when ``content`` says quota is gone."""
+    if not isinstance(content, str) or not content:
+        return None
+    lowered = content.lower()
+    for marker in QUOTA_TEXT_MARKERS:
+        if marker in lowered:
+            return marker
+    return None
+
+
+def _is_quota_exhausted(rec: QwenStreamReconstructor) -> str | None:
+    """Detect an exhausted quota in either of the two shapes Qwen sends it.
+
+    Returns a human-readable reason when the response is a quota exhaustion,
+    otherwise ``None``. A response with images is never treated as exhausted.
+    """
+    if rec.image_urls:
+        return None
+    code = error_code(rec.error)
+    if _is_quota_error_code(code):
+        return rec.error.get("details") or rec.error.get("message") or "quota exhausted"
+    if not rec.has_content:
+        return None
+    return _quota_text(rec.content)
 
 
 def _is_context_limit_code(code) -> bool:
@@ -94,6 +152,18 @@ def _handle_account_error(account, exc: Exception) -> None:
         log.warning("qwen account #%d auth error %s: %s", account.index, code, exc)
     else:
         log.warning("qwen account #%d error: %s", account.index, exc)
+
+
+def _mark_quota_exhausted(account, pool, session_key: str, reason: str) -> None:
+    """Drop a quota-exhausted account from the rotation and forget its session.
+
+    The account comes back on its own once ``settings.qwen_quota_cooldown``
+    elapses; the pinned image chat is dropped because Qwen's quota is per
+    account/day and the session cannot serve a request until it resets.
+    """
+    account.mark_quota_exhausted(settings.qwen_quota_cooldown)
+    _drop_session(pool, account, session_key)
+    log.warning("qwen account #%d quota exhausted: %s", account.index, reason)
 
 
 async def _prepare_session(account, pool, existing_sid: str | None, model_id: str, context_seq: tuple[str, ...] | None = None, chat_type: str = "t2t"):
@@ -299,6 +369,10 @@ async def collect_non_stream(
                     if rec.response_id:
                         stop_response_id = rec.response_id
                     await resp.aclose()
+                quota_reason = _is_quota_exhausted(rec)
+                if quota_reason is not None:
+                    _mark_quota_exhausted(account, pool, session_key, quota_reason)
+                    raise QuotaExhausted(f"quota exhausted: {quota_reason}")
                 if _is_retryable_error(rec) and attempt < MAX_RETRIES:
                     log.warning(
                         "qwen retryable error (%s), attempt %d/%d",
@@ -420,6 +494,10 @@ async def collect_image(
                     if rec.response_id:
                         stop_response_id = rec.response_id
                     await resp.aclose()
+                quota_reason = _is_quota_exhausted(rec)
+                if quota_reason is not None:
+                    _mark_quota_exhausted(account, pool, session_key, quota_reason)
+                    raise QuotaExhausted(f"image generation quota exhausted: {quota_reason}")
                 if _is_retryable_error(rec) and attempt < MAX_RETRIES:
                     log.warning(
                         "qwen image retryable error (%s), attempt %d/%d",

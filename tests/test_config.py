@@ -29,6 +29,7 @@ def test_defaults(settings_for):
     assert s.acquire_timeout is None
     assert s.session_cache_size == 128
     assert s.session_ttl == 3600.0
+    assert s.qwen_quota_cooldown == 86400.0
     assert s.log_level == "INFO"
     assert s.log_file == ""
     assert s.log_max_bytes == 10485760
@@ -61,6 +62,11 @@ def test_invalid_cache_size_falls_back(settings_for):
 def test_invalid_ttl_falls_back(settings_for):
     assert settings_for({"DANYAPI_SESSION_TTL_SECONDS": "bad"}).session_ttl == 3600.0
     assert settings_for({"DANYAPI_SESSION_TTL_SECONDS": "42"}).session_ttl == 42.0
+
+
+def test_qwen_quota_cooldown(settings_for):
+    assert settings_for({"DANYAPI_QWEN_QUOTA_COOLDOWN": "bad"}).qwen_quota_cooldown == 86400.0
+    assert settings_for({"DANYAPI_QWEN_QUOTA_COOLDOWN": "120"}).qwen_quota_cooldown == 120.0
 
 
 def test_log_level_empty_uses_info(settings_for):
