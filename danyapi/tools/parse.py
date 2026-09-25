@@ -1118,6 +1118,28 @@ _DSML_PARAM_OPENER_RE = re.compile(
 )
 
 
+# Bare k=v attributes fused into a DSML close tag (tooltrace 24b809c9): DeepSeek
+# compresses trailing params into the close tag — `` `` — instead of emitting their own <parameter> tags.
+_DSML_CLOSE_ATTR_RE = re.compile(r"(?P<key>[a-zA-Z_][\w.-]*)\s*=\s*(?P<val>\"[^\"]*\"|'[^']*'|[^\s>]+)")
+
+
+def _dsml_close_tag_attrs(tag: str) -> dict[str, Any]:
+    """Extract bare ``k=v`` attributes fused into a DSML close tag.
+
+    The ``DSML||`` marker is skipped so it is never mistaken for a key; an ordinary
+    close tag (`` ``) yields an empty dict.
+    """
+    marker = re.search(rf"DSML\s*{_DSML_SEP}", tag, re.IGNORECASE)
+    body = tag[marker.end() :] if marker else tag
+    attrs: dict[str, Any] = {}
+    for m in _DSML_CLOSE_ATTR_RE.finditer(body):
+        raw = m.group("val")
+        if raw[:1] in ('"', "'"):
+            raw = raw[1:-1]
+        attrs[m.group("key")] = _coerce_dsml(raw)
+    return attrs
+
+
 def _parse_dsml_param_only(text: str, tool_schemas: dict[str, dict[str, Any]] | None = None) -> list[ToolCall] | None:
     """Extract tool calls from DSML parameter tags that have no enclosing <invoke>.
 
@@ -1126,59 +1148,99 @@ def _parse_dsml_param_only(text: str, tool_schemas: dict[str, dict[str, Any]] | 
     inferred from the parameter names via schema matching. Handles malformed close
     tags (missing the word "parameter" after the DSML separator) by scanning to the
     next opener or end of text instead of relying on a strict close regex.
+
+    One block may encode several calls: a repeated parameter name starts a new call
+    (tooltrace 24b809c9, f4275506), and trailing arguments fused into a close tag
+    (the ``line_offset=170 n_lines=18`` tail of a close tag) are folded into the
+    current call.
     """
     openers = list(_DSML_PARAM_OPENER_RE.finditer(text))
     if not openers:
         return None
 
-    # Extract (name, value) for each param by scanning from its '>' to the next
-    # opener or end of text. The actual value ends at the first DSML close/open tag
-    # that appears after it — strip everything from there on. Handles proper closes,
-    # malformed ones (no word after separator), and missing-bracket variants where
-    # the opening '<' is absent before the DSML separator in the close tag.
+    # A single bare-parameter block can encode SEVERAL calls: DeepSeek repeats the
+    # same parameter name once per call (tooltrace 24b809c9: four <parameter
+    # name="path"> = four Read calls; f4275506: two <parameter name="command"> =
+    # two Bash calls). It also fuses trailing params into the close tag
+    # (`` ``). Splitting the run on a repeated
+    # name is what turns the old single (last-wins) call into the full set.
     _dsml_tag_any_re = re.compile(
         rf"(?:</?)?\s*{_DSML_SEP}DSML{_DSML_SEP}\s*(?:\w+\s*)?[^>]*>",
         re.IGNORECASE,
     )
-    params: list[tuple[str, str, Any]] = []  # (pname, raw_value, string_flag)
+    # Each param: (pname, raw_value, string_flag, fused_close_attrs).
+    groups: list[list[tuple[str, str, Any, dict[str, Any]]]] = []
+    current: list[tuple[str, str, Any, dict[str, Any]]] = []
+    seen: set[str] = set()
     for idx, m in enumerate(openers):
+        pname = m.group("pname")
         value_start = m.end()
-        if idx + 1 < len(openers):
-            value_end = openers[idx + 1].start()
+        value_end = openers[idx + 1].start() if idx + 1 < len(openers) else len(text)
+        region = text[value_start:value_end]
+        # The value ends at the first DSML tag (close or open) in the region.
+        tag_match = _dsml_tag_any_re.search(region)
+        raw_value = region[: tag_match.start()] if tag_match else region
+        attrs = _dsml_close_tag_attrs(tag_match.group(0)) if tag_match else {}
+        # A repeated parameter name starts the next call. Tool calls are sets of
+        # uniquely-named args, so a repeat — whether of an argument (two "command")
+        # or of "name" (two tool names in one block) — always marks a new call.
+        if pname in seen:
+            groups.append(current)
+            current = []
+            seen = set()
+        current.append((pname, raw_value.strip(), m.group("sval"), attrs))
+        seen.add(pname)
+    if current:
+        groups.append(current)
+
+    def _group_args(group: list[tuple[str, str, Any, dict[str, Any]]]) -> tuple[str | None, dict[str, Any]]:
+        name_value: str | None = None
+        args: dict[str, Any] = {}
+        for pname, raw_val, sval, attrs in group:
+            if pname == "name" and name_value is None:
+                name_value = _dsml_param_value(sval, raw_val)
+                continue
+            args[pname] = _dsml_param_value(sval, raw_val)
+            for key, value in attrs.items():
+                args.setdefault(key, value)
+        # A sole "arguments" param carrying JSON is unwrapped (tooltrace 626e51d6).
+        if list(args.keys()) == ["arguments"]:
+            inner = args["arguments"]
+            if isinstance(inner, str):
+                try:
+                    inner = _loads_lenient(inner)
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(inner, dict):
+                args = inner
+        return name_value, args
+
+    built = [_group_args(group) for group in groups]
+
+    # Resolve the tool name per call. A bare-parameter block is normally one tool
+    # invoked repeatedly, so an unresolved call (e.g. a lone {path}, ambiguous
+    # between Read/Edit/Write) borrows the block's single resolved name when that
+    # tool's schema accepts the call's keys.
+    resolved: list[str | None] = []
+    for name_value, args in built:
+        if isinstance(name_value, str) and name_value:
+            resolved.append(name_value)
         else:
-            value_end = len(text)
-        raw_value = text[value_start:value_end]
-        # Cut at the first DSML tag (close or open) that appears in the value region.
-        tag_match = _dsml_tag_any_re.search(raw_value)
-        if tag_match:
-            raw_value = raw_value[: tag_match.start()]
-        params.append((m.group("pname"), raw_value.strip(), m.group("sval")))
+            resolved.append(_infer_tool_from_params(args, tool_schemas))
+    unique_names = {name for name in resolved if name}
+    fallback = next(iter(unique_names)) if len(unique_names) == 1 else None
 
-    # Build args dict from all params. A param named "arguments" whose value is JSON
-    # gets unwrapped (tooltrace 626e51d6).
-    args: dict[str, Any] = {}
-    for pname, raw_val, sval in params:
-        if pname == "name":
-            continue  # tool name carried as its own param — handled via inference below
-        ptype = None
-        args[pname] = _dsml_param_value(sval, raw_val, ptype)
-
-    # If the sole param is named "arguments" with a JSON object value, unwrap it.
-    if list(args.keys()) == ["arguments"]:
-        inner = args["arguments"]
-        if isinstance(inner, str):
-            try:
-                inner = _loads_lenient(inner)
-            except (TypeError, ValueError):
-                pass
-        if isinstance(inner, dict):
-            args = inner
-
-    # Infer tool name from parameter names against available schemas.
-    inferred = _infer_tool_from_params(args, tool_schemas)
-    if inferred is None:
-        return None
-    return [ToolCall.create(inferred, args)]
+    calls: list[ToolCall] = []
+    for (_name_value, args), resolved_name in zip(built, resolved, strict=True):
+        name = resolved_name
+        if name is None and fallback is not None:
+            schema = (tool_schemas or {}).get(fallback, {})
+            if isinstance(schema, dict) and all(key in schema for key in args):
+                name = fallback
+        if name is None:
+            continue
+        calls.append(ToolCall.create(name, args))
+    return calls or None
 
 
 def _parse_dsml(text: str, tool_schemas: dict[str, dict[str, Any]] | None = None) -> tuple[list[ToolCall] | None, str]:

@@ -3207,6 +3207,91 @@ def test_dsml_single_pipe_repair_leaves_canonical_tags():
     assert _repair_dsml_separator("</\uff5cDSML\uff5c\uff5c>") == "</\uff5c\uff5cDSML\uff5c\uff5c>"
 
 
+def test_dsml_param_only_repeated_name_splits_calls():
+    """tooltrace 24b809c9: a bare-parameter block (no <invoke>) encodes SEVERAL calls
+    by repeating the same argument name — four <parameter name="path"> are four Read
+    calls, with trailing params fused into the close tag (line_offset/n_lines).
+
+    The old param-only path collapsed the whole run into one dict (last value wins),
+    so only the last path survived.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f"<{S} calls>\n"
+        f'<{S} parameter name="path">net-agent/AGENTS.md</{S}>\n'
+        f'<{S} parameter name="path">CONTRIBUTING.md</{S} line_offset=170 n_lines=18>\n'
+        f'<{S} parameter name="path">AGENTS.md</{S} line_offset=145 n_lines=15>\n'
+        f'<{S} parameter name="path">docs/en/architecture/commands.md</{S} line_offset=30 n_lines=8>\n'
+        f"</{S} calls>"
+    )
+    schemas = {
+        "Read": {"path": "", "line_offset": 1, "n_lines": 1},
+        "Edit": {"path": "", "old_string": "", "new_string": ""},
+        "Write": {"path": "", "content": ""},
+    }
+    parsed = parse_tool_calls(text, schemas)
+    assert parsed is not None
+    calls, _ = parsed
+    assert [c.name for c in calls] == ["Read", "Read", "Read", "Read"]
+    args = [json.loads(c.arguments) for c in calls]
+    assert args[0] == {"path": "net-agent/AGENTS.md"}
+    assert args[1] == {"path": "CONTRIBUTING.md", "line_offset": 170, "n_lines": 18}
+    assert args[2] == {"path": "AGENTS.md", "line_offset": 145, "n_lines": 15}
+    assert args[3] == {"path": "docs/en/architecture/commands.md", "line_offset": 30, "n_lines": 8}
+
+
+def test_dsml_param_only_repeated_command_splits_calls():
+    """tooltrace f4275506: two <parameter name="command"> are two distinct Bash
+    calls, not one (last-wins).
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = f'<{S} calls>\n<{S} parameter name="command">sed -n 1,10p a.md</{S}>\n<{S} parameter name="command">sed -n 25,40p b.md</{S}>\n</{S} calls>'
+    schemas = {"Bash": {"command": "", "timeout": 1}, "Read": {"path": ""}}
+    calls, _ = _parse_dsml(text, schemas)
+    assert calls is not None
+    assert [c.name for c in calls] == ["Bash", "Bash"]
+    args = [json.loads(c.arguments) for c in calls]
+    assert args[0] == {"command": "sed -n 1,10p a.md"}
+    assert args[1] == {"command": "sed -n 25,40p b.md"}
+
+
+def test_dsml_param_only_repeated_command_fused_timeout():
+    """tooltrace 50ad2c8a: a bare-parameter block whose close tag fuses timeout=300
+    onto the first of two repeated command params.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = f'<{S} calls>\n<{S} parameter name="command">cargo test</{S} timeout="300"{S}>\n<{S} parameter name="command">wc -l mod.rs</{S}>\n</{S} calls>'
+    schemas = {"Bash": {"command": "", "timeout": 1}}
+    calls, _ = _parse_dsml(text, schemas)
+    assert calls is not None
+    assert [c.name for c in calls] == ["Bash", "Bash"]
+    first = json.loads(calls[0].arguments)
+    assert first == {"command": "cargo test", "timeout": 300}
+    assert json.loads(calls[1].arguments) == {"command": "wc -l mod.rs"}
+
+
+def test_dsml_param_only_mixed_names_infer_per_call():
+    """A bare-parameter block mixing explicit <parameter name="name"> with a
+    repeated argument: each call resolves its own tool name.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f"<{S} calls>\n"
+        f'<{S} parameter name="name">Bash</{S}>'
+        f'<{S} parameter name="command">ls</{S}>\n'
+        f'<{S} parameter name="name">Read</{S}>'
+        f'<{S} parameter name="path">/a.md</{S}>\n'
+        f"</{S} calls>"
+    )
+    schemas = {"Bash": {"command": ""}, "Read": {"path": ""}}
+    calls, _ = _parse_dsml(text, schemas)
+    assert calls is not None
+    assert [(c.name, json.loads(c.arguments)) for c in calls] == [
+        ("Bash", {"command": "ls"}),
+        ("Read", {"path": "/a.md"}),
+    ]
+
+
 def test_wrapped_key_tool_calls_with_space():
     """DeepSeek emits a JSON wrapper with the key 'tool calls' (space instead of
     underscore). _WRAPPED_CALL_KEYS must include this variant.
