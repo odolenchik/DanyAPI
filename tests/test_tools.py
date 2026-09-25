@@ -20,6 +20,7 @@ from danyapi.tools import (
     _parse_dsml,
     _parse_xml_tool_calls,
     _render_tool_call_mention,
+    _repair_dsml_separator,
     _strip_dsml,
     _tail_after_last_user,
     _tool_function,
@@ -1619,11 +1620,40 @@ def test_extract_one_call_flat_arguments():
     assert json.loads(call.arguments) == {"command": "pwd"}
 
 
+def test_extract_one_call_parameters_synonym():
+    # DeepSeek emits `parameters` instead of `arguments` in the single-object form
+    # (tooltrace 6e02a45f: {"tool": "nmap", "parameters": {...}}).
+    call = _extract_one_call({"tool": "nmap", "parameters": {"target": "1.2.3.4"}})
+    assert call is not None
+    assert call.name == "nmap"
+    assert json.loads(call.arguments) == {"target": "1.2.3.4"}
+
+    # `function` wrapper form with `parameters`.
+    call = _extract_one_call({"function": {"name": "nmap", "parameters": {"target": "1.2.3.4"}}})
+    assert call is not None
+    assert json.loads(call.arguments) == {"target": "1.2.3.4"}
+
+    # An explicit `arguments` still wins over `parameters`.
+    call = _extract_one_call({"tool": "nmap", "arguments": {"target": "a"}, "parameters": {"target": "b"}})
+    assert json.loads(call.arguments) == {"target": "a"}
+
+    # `parameters` is not leaked as a flat argument when arguments are also flat.
+    call = _extract_one_call({"name": "nmap", "target": "1.2.3.4"})
+    assert json.loads(call.arguments) == {"target": "1.2.3.4"}
+
+
 def test_extract_calls_bare_dict():
     calls = _extract_calls({"name": "f", "arguments": {"x": 1}})
     assert calls is not None
     assert calls is not None
     assert calls[0].name == "f"
+
+
+def test_extract_calls_bare_dict_parameters_synonym():
+    calls = _extract_calls({"tool": "nmap", "parameters": {"target": "1.2.3.4"}})
+    assert calls is not None
+    assert calls[0].name == "nmap"
+    assert json.loads(calls[0].arguments) == {"target": "1.2.3.4"}
 
 
 def test_tool_schema_map():
@@ -3029,6 +3059,22 @@ def test_flat_tool_key_with_prose():
     assert "Коммичу" in wrapper
 
 
+def test_flat_tool_key_parameters_synonym_with_prose():
+    """tooltrace 6e02a45f: the flat single-object form uses `parameters` instead of
+    `arguments`, wrapped in a markdown fence with prose before it.
+    """
+    text = 'Запускаю скан.\n\n```json\n{"tool": "nmap", "parameters": {"target": "76.158.52.121", "ports": "80,443"}}\n```'
+    schemas = {"nmap": {"target": "", "ports": ""}}
+    parsed = parse_tool_calls(text, schemas)
+    assert parsed is not None
+    calls, _ = parsed
+    assert len(calls) == 1
+    assert calls[0].name == "nmap"
+    args = json.loads(calls[0].arguments)
+    assert args["target"] == "76.158.52.121"
+    assert args["ports"] == "80,443"
+
+
 # ---------------------------------------------------------------------------
 # Regression tests from tooltrace.ndjson — new structural patterns (Sept 2025)
 # ---------------------------------------------------------------------------
@@ -3121,6 +3167,44 @@ def test_dsml_param_arguments_json_missing_bracket_close():
     args = json.loads(calls[0].arguments)
     assert args["command"] == "git log --oneline -5"
     assert args["cwd"] == "/repo"
+
+
+def test_dsml_single_pipe_opener_is_repaired():
+    """tooltrace b1c6a1cc: DeepSeek emitted DSML openers with a SINGLE pipe before
+    DSML ('<|DSML||parameter ...>') while close tags kept the canonical two-pipe form.
+    The canonical _DSML_SEP never matched these openers, so the call was dropped.
+    """
+    text = (
+        "<\uff5cDSML\uff5c\uff5c calls>\n"
+        '<\uff5cDSML\uff5c\uff5c parameter name="command">'
+        "cd /home/odolen/AI/Work/SX && cargo test --workspace 2>&1 | tail -60"
+        '</\uff5c\uff5cDSML\uff5c\uff5c timeout="400"</\uff5c\uff5cDSML\uff5c\uff5c>\n'
+        "</\uff5c\uff5cDSML\uff5c\uff5c calls>"
+    )
+    schemas = {
+        "Bash": {"command": "", "timeout": 30},
+        "Read": {"path": ""},
+    }
+    parsed = parse_tool_calls(text, schemas)
+    assert parsed is not None
+    calls, _ = parsed
+    assert len(calls) == 1
+    assert calls[0].name == "Bash"
+    args = json.loads(calls[0].arguments)
+    assert args["command"] == "cd /home/odolen/AI/Work/SX && cargo test --workspace 2>&1 | tail -60"
+
+
+def test_dsml_single_pipe_repair_leaves_canonical_tags():
+    """_repair_dsml_separator must only touch the malformed single-pipe opener, not
+    the canonical two-pipe tags that other branches already parse.
+    """
+    canonical = '<\uff5c\uff5cDSML\uff5c\uff5cinvoke name="Read">'
+    assert _repair_dsml_separator(canonical) == canonical
+    # A canonical close tag must survive unchanged too.
+    assert _repair_dsml_separator("</\uff5c\uff5cDSML\uff5c\uff5c>") == "</\uff5c\uff5cDSML\uff5c\uff5c>"
+    # The single-pipe opener is expanded to two pipes on each side.
+    assert _repair_dsml_separator("<\uff5cDSML\uff5c\uff5c calls>") == "<\uff5c\uff5cDSML\uff5c\uff5c calls>"
+    assert _repair_dsml_separator("</\uff5cDSML\uff5c\uff5c>") == "</\uff5c\uff5cDSML\uff5c\uff5c>"
 
 
 def test_wrapped_key_tool_calls_with_space():

@@ -2,6 +2,32 @@
 
 ## Готово
 
+- **Парсер: `parameters` как синоним `arguments` в одиночном объекте.** DeepSeek
+  иногда отдаёт вызов как `{"tool": "nmap", "parameters": {...}}` — с ключом
+  `parameters` вместо `arguments`. `_extract_one_call`/`_extract_calls` такой
+  объект не распознавали → `unparsed:no_tool_call`. Добавлен `_nested_arguments`:
+  берёт `arguments`, а если он пуст — `parameters`; ключ `parameters` исключён из
+  `_flat_arguments`, чтобы не утечь в аргументы. Явный `arguments` по-прежнему
+  приоритетнее. Из лога починились 4 запроса (`6e02a45f`, `0771891f`, `c905e637`,
+  `89c7bf8d`). Форма `{"tool", "why", "goal"}` (без аргументов) остаётся
+  `no_tool_call` — это план-документ, не вызов (см. BACKLOG). Тесты:
+  `tests/test_tools.py` (+3).
+
+- **Парсер: DSML с одной палкой перед `DSML`.** DeepSeek иногда отдаёт открывающие
+  теги вида `<|DSML||parameter ...>` — одна палка слева, две справа, — тогда как
+  закрывающие теги канонические. `_DSML_SEP` требует по две палки с каждой стороны,
+  поэтому такие вызовы были невидимы всем DSML-веткам и терялись (`parse.result`
+  `unparsed`, `issue=None`). Добавлен `_repair_dsml_separator` (regex
+  `_DSML_SINGLE_PIPE_OPENER_RE` с negative lookahead): он нормализует только битый
+  opener до канонического вида, не трогая корректные теги. Вызывается в начале
+  `parse_tool_calls` (tooltrace `b1c6a1cc`; из 6 upstream-событий с таким
+  разделителем 5 — реальные вызовы — теперь парсятся, шестое — проза с цитатой в
+  бэктиках). Канонический `_DSML_SEP` не ослаблен. Тесты: `tests/test_tools.py`
+  (+2: разбор реального контента, сохранность канонических тегов). Playbook
+  (`docs/tooltrace-playbook.md`) дополнен новым паттерном.
+  Верификация: `ruff check` + `ruff format --check` + `pytest -q` → **1155 passed**,
+  `arch-check` OK.
+
 - **Compaction: сохранение текущего хода + суммаризация + один запрос.**
   Переход в новый чат при переполнении контекста
   (`_compact_retry`/`_compact_retry_stream`) был сделан плохо, с прямыми багами:

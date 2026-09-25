@@ -517,7 +517,19 @@ def _flat_arguments(container: dict[str, Any]) -> dict[str, Any]:
     # DeepSeek v4-pro sometimes emits tool parameters as flat keys next to
     # `name` instead of nested under `arguments`. Collect them so the call
     # still carries real arguments instead of an empty object.
-    return {key: value for key, value in container.items() if key not in ("name", "tool", "function", "arguments", "id", "type")}
+    return {key: value for key, value in container.items() if key not in ("name", "tool", "function", "arguments", "parameters", "id", "type")}
+
+
+def _nested_arguments(container: dict[str, Any]) -> Any:
+    # ``parameters`` is DeepSeek's synonym for ``arguments`` in the single-object
+    # call form (tooltrace 6e02a45f: {"tool": "nmap", "parameters": {...}}).
+    # Prefer ``arguments`` when present; otherwise fall back to ``parameters``.
+    arguments = container.get("arguments")
+    if _is_empty_arguments(arguments):
+        parameters = container.get("parameters")
+        if not _is_empty_arguments(parameters):
+            return parameters
+    return arguments
 
 
 def _extract_one_call(item: Any) -> ToolCall | None:
@@ -526,14 +538,14 @@ def _extract_one_call(item: Any) -> ToolCall | None:
     fn = item.get("function")
     if isinstance(fn, dict):
         name = fn.get("name")
-        arguments = fn.get("arguments")
+        arguments = _nested_arguments(fn)
         if _is_empty_arguments(arguments):
             flat = _flat_arguments(fn)
             if flat:
                 arguments = flat
     else:
         name = item.get("name") or item.get("tool")
-        arguments = item.get("arguments")
+        arguments = _nested_arguments(item)
         if _is_empty_arguments(arguments):
             flat = _flat_arguments(item)
             if flat:
@@ -596,7 +608,7 @@ def _extract_calls(obj: dict) -> list[ToolCall] | None:
     if calls is not None:
         return calls
     name = obj.get("name") or obj.get("tool")
-    if isinstance(name, str) and name and _is_jsonish_arguments(obj.get("arguments")):
+    if isinstance(name, str) and name and _is_jsonish_arguments(_nested_arguments(obj)):
         call = _extract_one_call(obj)
         if call is not None:
             return [call]
@@ -975,6 +987,34 @@ _DSML_PARAM_STRING_VALUE_RE = re.compile(
     rf"(?:\s*</{_DSML_SEP}DSML{_DSML_SEP}\s*parameter\s*>)?",
     re.IGNORECASE,
 )
+
+
+# Malformed DSML separator (tooltrace b1c6a1cc): DeepSeek sometimes emits the DSML
+# opening tags with a SINGLE pipe before DSML (`<|DSML||parameter ...>`) while the
+# matching close tags keep the canonical two-pipe form. _DSML_SEP requires two pipes
+# on each side, so these openers are invisible to every DSML branch. Rather than
+# loosening the canonical separator, normalise only this malformed opener to the
+# canonical form; the negative lookahead leaves canonical tags untouched.
+_DSML_SINGLE_PIPE_OPENER_RE = re.compile(
+    r"<(?P<slash>/?)\s*(?P<pipe>\||\uff5c)(?!\s*(?:\||\uff5c))\s*(?=DSML)",
+    re.IGNORECASE,
+)
+
+
+def _repair_dsml_separator(text: str) -> str:
+    """Expand a single-pipe DSML opener to the canonical two-pipe separator.
+
+    Rewrites ``<|DSML`` to ``<||DSML`` (and the ``</`` close variant); canonical
+    two-pipe tags are left unchanged because the regex rejects a second pipe. The
+    ``DSML`` word itself is only asserted via lookahead, never consumed, so the tag
+    body is left intact.
+    """
+    if not text or "DSML" not in text:
+        return text
+    return _DSML_SINGLE_PIPE_OPENER_RE.sub(
+        lambda m: f"<{m.group('slash')}{m.group('pipe')}{m.group('pipe')}",
+        text,
+    )
 
 
 def _dsml_param_value(sstring: str | None, raw: str, json_type: Any = None) -> Any:
@@ -1720,6 +1760,9 @@ def _repair_tool_calls_separator(text: str) -> str:
 def parse_tool_calls(text: str, tool_schemas: dict[str, dict[str, Any]] | None = None) -> tuple[list[ToolCall], str] | None:
     if not text or not text.strip():
         return None
+    # Normalise the malformed single-pipe DSML opener before any branch inspects
+    # the text, so the canonical-format DSML parsers can handle it unchanged.
+    text = _repair_dsml_separator(text)
     # DSML is a distinct tag format (not JSON), so parse it before the generic
     # strip/JSON path — _strip_dsml would otherwise discard the tags and their attrs.
     dsml_calls, dsml_wrapper = _parse_dsml(text, tool_schemas)
