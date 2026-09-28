@@ -7,6 +7,7 @@ the z.ai response assembly, the trace helper in the Qwen path, the trim guard
 in ContextIndex, and the rate-limit hint on the continuation path.
 """
 
+import asyncio
 import logging as stdlib_logging
 import os
 from types import SimpleNamespace
@@ -133,7 +134,7 @@ async def test_collect_non_stream_unsupported_model_is_400():
 @pytest.mark.asyncio
 async def test_collect_non_stream_timeout_is_504():
     browser = MagicMock()
-    browser.complete = AsyncMock(side_effect=TimeoutError())
+    browser.complete = AsyncMock(side_effect=asyncio.TimeoutError())  # noqa: UP041 (py3.10: distinct from builtin)
     with pytest.raises(HTTPException) as excinfo:
         await zai_api.collect_non_stream(browser=browser, prompt="hi", model="glm-5.3")
     assert excinfo.value.status_code == 504
