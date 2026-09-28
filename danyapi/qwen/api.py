@@ -81,6 +81,28 @@ QUOTA_TEXT_MARKERS = (
     "quota exceeded",
 )
 
+# Qwen also reports transient service failures as plain answer text: "there was an
+# issue connecting to Qwen3.8-Omni-Flash" and "the service is experiencing high load,
+# please try again later". Unlike a quota exhaustion these pass on their own, so the
+# request is retried instead of failing. Detection only runs when the response has no
+# images, which is exactly the failure shape, so an ordinary answer cannot match.
+TRANSIENT_TEXT_MARKERS = (
+    "issue connecting",
+    "проблема подключения",
+    "unexpected error",
+    "непредвиденная ошибка",
+    "try again later",
+    "please try again",
+    "повторите попытку",
+    "попробуйте позже",
+    "high load",
+    "высокая нагрузка",
+    "service is experiencing",
+    "сервис испытывает",
+    "temporarily unavailable",
+    "временно недоступ",
+)
+
 CONTEXT_LIMIT_MARKERS = ("context", "maxinput", "toolong", "lengthexceeded", "tokenlimit")
 
 
@@ -124,6 +146,23 @@ def _is_quota_exhausted(rec: QwenStreamReconstructor) -> str | None:
     if not rec.has_content:
         return None
     return _quota_text(rec.content)
+
+
+def _is_transient_text(rec: QwenStreamReconstructor) -> str | None:
+    """Detect a transient service failure Qwen reports as plain answer text.
+
+    "There was an issue connecting" and "the service is experiencing high load" are
+    not quota problems: they pass on their own, so the request is retried. Only a
+    response without images can be a failure — when images are present the text is a
+    caption, not an error.
+    """
+    if rec.image_urls or not rec.content:
+        return None
+    lowered = rec.content.lower()
+    for marker in TRANSIENT_TEXT_MARKERS:
+        if marker in lowered:
+            return marker
+    return None
 
 
 def _is_context_limit_code(code) -> bool:
@@ -498,6 +537,15 @@ async def collect_image(
                 if quota_reason is not None:
                     _mark_quota_exhausted(account, pool, session_key, quota_reason)
                     raise QuotaExhausted(f"image generation quota exhausted: {quota_reason}")
+                transient = _is_transient_text(rec)
+                if transient is not None and attempt < MAX_RETRIES:
+                    log.warning(
+                        "qwen image transient failure (%s), attempt %d/%d",
+                        transient,
+                        attempt + 1,
+                        MAX_RETRIES,
+                    )
+                    continue
                 if _is_retryable_error(rec) and attempt < MAX_RETRIES:
                     log.warning(
                         "qwen image retryable error (%s), attempt %d/%d",

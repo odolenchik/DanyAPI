@@ -1201,7 +1201,9 @@ def _parse_dsml_param_only(text: str, tool_schemas: dict[str, dict[str, Any]] | 
         value_end = openers[idx + 1][0].start() if idx + 1 < len(openers) else len(text)
         region = text[value_start:value_end]
         # The value ends at the first DSML tag (close or open) in the region.
-        tag_match = _dsml_tag_any_re.search(region)
+        # Any further tag in the same region is a call separator (see below).
+        region_tags = list(_dsml_tag_any_re.finditer(region))
+        tag_match = region_tags[0] if region_tags else None
         raw_value = region[: tag_match.start()] if tag_match else region
         raw_value = raw_value.strip()
         # The ``parameter="X"`` variant reuses the attribute quote around the value,
@@ -1218,6 +1220,16 @@ def _parse_dsml_param_only(text: str, tool_schemas: dict[str, dict[str, Any]] | 
             seen = set()
         current.append((pname, raw_value, m.group("sval"), attrs))
         seen.add(pname)
+        # A second DSML tag after this parameter's own close tag is a bare call
+        # separator: DeepSeek splits sibling calls in a param-only block with a
+        # standalone `` `` / `` `` line that carries no
+        # parameter word. The repeated-name split above cannot see it, because
+        # sibling calls may have disjoint argument names (a Grep then a Read, or
+        # two Greps sharing only some keys). tooltrace 0885f2d2, 8b1c632c, 0241e65f.
+        if len(region_tags) > 1:
+            groups.append(current)
+            current = []
+            seen = set()
     if current:
         groups.append(current)
 

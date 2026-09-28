@@ -42,7 +42,7 @@ async def account_lock(sem: asyncio.Semaphore, max_wait: float | None = None, ac
     else:
         try:
             await asyncio.wait_for(sem.acquire(), timeout=max_wait)
-        except TimeoutError as exc:
+        except asyncio.TimeoutError as exc:  # noqa: UP041 (py3.10: distinct from builtin)
             raise AccountPoolBusy() from exc
     try:
         yield

@@ -2,6 +2,32 @@
 
 ## Готово
 
+- **Python 3.10: `except asyncio.TimeoutError` вместо встроенного `TimeoutError`.**
+  На плате (Ubuntu 22.04) Python 3.10, где `asyncio.TimeoutError` — отдельный класс,
+  а не алиас встроенного `TimeoutError` (унификация только с 3.11). Перехват
+  встроенного потому не ловил таймауты `asyncio.wait_for` в трёх местах:
+  `accounts.py` (acquire пула с `max_wait`), `zai/api.py` (браузерный complete → 504)
+  и `zai/browser.py` (стрим-поллинг не прерывался по дедлайну). Переведено на
+  `asyncio.TimeoutError` с `# noqa: UP041` — ruff считает его алиасом, но на 3.10
+  это не так. Тесты не трогались: `ruff check` + `ruff format --check` +
+  `pytest -q` → **1186 passed**, `arch-check` OK. Те же правки вручную внесены в
+  копию на плате.
+
+- **Парсер: sibling-вызовы в param-only блоке, разделённые голым тегом.**
+  Блок DSML без `<invoke>` (только `<parameter>`) может кодировать **несколько
+  разных** вызовов, разделённых отдельной строкой ` ` / ` `
+  без слова (`parameter`/`calls`/`invoke`). Существующий сплиттер делил группы
+  только по **повтору имени** параметра, а у sibling-вызовов имена аргументов не
+  пересекаются (Grep: `-n`/`output_mode`/`pattern`; Read: `line_offset`/`n_lines`/
+  `path`), поэтому граница не распознавалась: все аргументы склеивались в одну
+  группу, ни одна схема не подходила → `unparsed:no_tool_call` (tooltrace
+  `0885f2d2`, `8b1c632c`, `0241e65f`). Теперь `_parse_dsml_param_only` считает
+  вторым DSML-тегом в регионе между соседними параметрами границу вызова. Из
+  лога `0885f2d2` даёт 3 корректных вызова (Read + Grep + Grep), `8b1c632c` и
+  `0241e65f` — по 2 (Grep + Read). Тесты: `tests/test_tools.py` (+2, реальные
+  примеры). Playbook дополнен. Верификация: `ruff check` + `ruff format --check` +
+  `pytest -q` → **1185 passed**, `arch-check` OK.
+
 - **Парсер: имя параметра в атрибуте `parameter="X"`.** DeepSeek иногда отдаёт
   opener без слова `name=` — `parameter="command"` вместо `parameter
   name="command"` — а значение несёт висячую кавычку (`sleep 120"`).

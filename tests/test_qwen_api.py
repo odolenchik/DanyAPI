@@ -47,6 +47,36 @@ QUOTA_TEXT_SSE = (
     "\n"
 )
 
+TRANSIENT_TEXT_SSE = (
+    'data: {"response.created":{"chat_id":"c1","parent_id":"p0","response_id":"r1","response_index":"0"}} \n'
+    "\n"
+    'data: {"choices": [{"delta": {"role": "assistant", "content": "There was an issue connecting to Qwen3.8-Omni-Flash.",'
+    ' "phase": "answer", "status": "typing"}}], "response_id": "r1"}\n'
+    "\n"
+    'data: {"choices": [{"delta": {"content": "", "role": "assistant", "status": "finished", "phase": "answer"}}], "response_id": "r1"}\n'
+    "\n"
+)
+
+OVERLOAD_TEXT_SSE = (
+    'data: {"response.created":{"chat_id":"c1","parent_id":"p0","response_id":"r1","response_index":"0"}} \n'
+    "\n"
+    'data: {"choices": [{"delta": {"role": "assistant", "content": "The service is experiencing high load. Please try again later.",'
+    ' "phase": "answer", "status": "typing"}}], "response_id": "r1"}\n'
+    "\n"
+    'data: {"choices": [{"delta": {"content": "", "role": "assistant", "status": "finished", "phase": "answer"}}], "response_id": "r1"}\n'
+    "\n"
+)
+
+IMAGE_OK_SSE = (
+    'data: {"response.created":{"chat_id":"c1","parent_id":"p0","response_id":"r1","response_index":"0"}} \n'
+    "\n"
+    'data: {"choices": [{"delta": {"role": "assistant", "content": "![img](https://cdn.qwenlm.ai/a.png)",'
+    ' "phase": "image", "status": "typing"}}], "response_id": "r1"}\n'
+    "\n"
+    'data: {"choices": [{"delta": {"content": "", "role": "assistant", "status": "finished", "phase": "image"}}], "response_id": "r1"}\n'
+    "\n"
+)
+
 CTX_SSE = 'data: {"error": {"code": "ContextLengthExceeded", "details": "too long"}, "response_id": "r1"}\n\n'
 
 
@@ -691,3 +721,52 @@ def test_is_quota_exhausted_variants():
     rec4.image_urls = ["https://cdn.qwenlm.ai/a.png"]
     rec4.content = "used up your daily quota"
     assert qwen_api._is_quota_exhausted(rec4) is None
+
+
+def test_is_transient_text_variants():
+    connect = QwenStreamReconstructor()
+    connect.content = "Oops! There was an issue connecting to Qwen3.8-Omni-Flash."
+    assert qwen_api._is_transient_text(connect) == "issue connecting"
+
+    overload = QwenStreamReconstructor()
+    overload.content = "Упс! Возникла проблема подключения. Попробуйте позже."
+    assert qwen_api._is_transient_text(overload) is not None
+
+    # A real answer that merely mentions a connection is not a failure.
+    answer = QwenStreamReconstructor()
+    answer.content = "Your chart shows a strong connection to Saturn."
+    assert qwen_api._is_transient_text(answer) is None
+
+    # An image response is a result, never a transient failure.
+    with_image = QwenStreamReconstructor()
+    with_image.image_urls = ["https://cdn.qwenlm.ai/a.png"]
+    with_image.content = "issue connecting"
+    assert qwen_api._is_transient_text(with_image) is None
+
+    empty = QwenStreamReconstructor()
+    assert qwen_api._is_transient_text(empty) is None
+
+
+async def test_collect_image_retries_transient_then_succeeds():
+    """Transient text failure is retried; the next attempt returns the image."""
+    acct = FakeAccount([TRANSIENT_TEXT_SSE, IMAGE_OK_SSE])
+    pool = MagicMock()
+
+    result = await qwen_api.collect_image(**_image_args(acct, pool=pool))
+
+    assert result["image_urls"] == ["https://cdn.qwenlm.ai/a.png"]
+    assert acct.client.completion.await_count == 2
+    # Transient is not a quota problem: the account stays in rotation.
+    assert not acct.broken
+
+
+async def test_collect_image_transient_does_not_mark_quota():
+    """A transient failure never takes the account out of rotation, unlike a quota."""
+    acct = FakeAccount([OVERLOAD_TEXT_SSE, IMAGE_OK_SSE])
+    pool = MagicMock()
+
+    result = await qwen_api.collect_image(**_image_args(acct, pool=pool))
+
+    assert result["image_urls"]
+    assert acct.client.completion.await_count == 2
+    assert not acct.broken

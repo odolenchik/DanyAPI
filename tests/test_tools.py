@@ -3342,6 +3342,86 @@ def test_dsml_param_eq_opener_canonical_untouched():
     assert [json.loads(c.arguments)["command"] for c in calls] == ["echo hi", "pwd"]
 
 
+def test_dsml_param_only_bare_separator_splits_sibling_calls():
+    """tooltrace 0885f2d2 / 8b1c632c / 0241e65f: a param-only block packs SEVERAL
+    sibling calls separated by a standalone bare `` `` / `` ``
+    line that carries no word. The sibling calls have disjoint argument names
+    (Grep uses -n/output_mode/pattern; Read uses line_offset/n_lines/path), so the
+    repeated-name split cannot see the boundary and the whole block collapses into
+    one group that matches no schema — the call was dropped.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f"<{S} calls>\n"
+        f'<{S} parameter name="-n" string="false">true</{S}>\n'
+        f'<{S} parameter name="output_mode" string="true">content</{S}>\n'
+        f'<{S} parameter name="pattern" string="true">day_offset</{S}>\n'
+        f"<{S}>\n"
+        f'<{S} parameter name="line_offset" string="false">125</{S}>\n'
+        f'<{S} parameter name="n_lines" string="false">30</{S}>\n'
+        f'<{S} parameter name="path" string="true">docs/ARCHITECTURE.md</{S}>\n'
+        f"</{S} calls>"
+    )
+    schemas = {
+        "Grep": {"pattern": "", "output_mode": "", "-n": "", "path": ""},
+        "Read": {"path": "", "line_offset": 1, "n_lines": 1},
+    }
+    parsed = parse_tool_calls(text, schemas)
+    assert parsed is not None
+    calls, _ = parsed
+    assert [c.name for c in calls] == ["Grep", "Read"]
+    assert json.loads(calls[0].arguments) == {
+        "-n": True,
+        "output_mode": "content",
+        "pattern": "day_offset",
+    }
+    assert json.loads(calls[1].arguments) == {
+        "line_offset": 125,
+        "n_lines": 30,
+        "path": "docs/ARCHITECTURE.md",
+    }
+
+
+def test_dsml_param_only_bare_separator_three_calls():
+    """tooltrace 0885f2d2: three sibling calls in one param-only block — Read,
+    then a path-less Grep, then a Grep with a path — separated by a bare
+    `` `` line. The middle Grep is inferred from its lone schema match.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f"<{S} calls>\n"
+        f'<{S} parameter name="line_offset" string="false">248</{S}>\n'
+        f'<{S} parameter name="n_lines" string="false">60</{S}>\n'
+        f'<{S} parameter name="path" string="true">src/jobs.py</{S}>\n'
+        f"</{S}>\n"
+        f'<{S} parameter name="output_mode" string="true">files_with_matches</{S}>\n'
+        f'<{S} parameter name="pattern" string="true">day_offset</{S}>\n'
+        f"<{S}>\n"
+        f'<{S} parameter name="output_mode" string="true">content</{S}>\n'
+        f'<{S} parameter name="-n" string="false">true</{S}>\n'
+        f'<{S} parameter name="pattern" string="true">day_offset|planned_for</{S}>\n'
+        f'<{S} parameter name="path" string="true">docs/ARCHITECTURE.md</{S}>\n'
+        f"</{S} calls>"
+    )
+    schemas = {
+        "Grep": {"pattern": "", "output_mode": "", "-n": "", "path": ""},
+        "Read": {"path": "", "line_offset": 1, "n_lines": 1},
+    }
+    parsed = parse_tool_calls(text, schemas)
+    assert parsed is not None
+    calls, _ = parsed
+    assert [c.name for c in calls] == ["Read", "Grep", "Grep"]
+    args = [json.loads(c.arguments) for c in calls]
+    assert args[0] == {"line_offset": 248, "n_lines": 60, "path": "src/jobs.py"}
+    assert args[1] == {"output_mode": "files_with_matches", "pattern": "day_offset"}
+    assert args[2] == {
+        "output_mode": "content",
+        "-n": True,
+        "pattern": "day_offset|planned_for",
+        "path": "docs/ARCHITECTURE.md",
+    }
+
+
 def test_wrapped_key_tool_calls_with_space():
     """DeepSeek emits a JSON wrapper with the key 'tool calls' (space instead of
     underscore). _WRAPPED_CALL_KEYS must include this variant.

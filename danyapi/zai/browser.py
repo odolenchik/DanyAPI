@@ -351,7 +351,7 @@ class ZaiBrowser:
                 while True:
                     try:
                         text = await asyncio.wait_for(queue.get(), timeout=STREAM_POLL_SEC)
-                    except TimeoutError:
+                    except asyncio.TimeoutError:  # noqa: UP041 (py3.10: distinct from builtin)
                         if loop.time() > deadline:
                             break  # no response within timeout -> end gracefully
                         continue

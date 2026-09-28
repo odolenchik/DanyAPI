@@ -48,7 +48,7 @@ async def collect_non_stream(
         raise HTTPException(400, str(exc)) from exc
     except ZaiBrowserError as exc:
         raise HTTPException(502, str(exc)) from exc
-    except TimeoutError as exc:
+    except asyncio.TimeoutError as exc:  # noqa: UP041 (py3.10: distinct from builtin)
         raise HTTPException(504, "z.ai browser completion timed out") from exc
 
     if acc.error:
