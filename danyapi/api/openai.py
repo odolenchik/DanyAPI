@@ -488,10 +488,89 @@ def _resolve_provider(model: str) -> str:
     raise HTTPException(404, f"Unknown model: {model}")
 
 
+_THINKING_ERROR_RE = re.compile(
+    r"traceback \(most recent call last\)|error:|\bexception\b|stack ?trace|"
+    r"segmentation fault|\bpanic:",
+    re.IGNORECASE,
+)
+
+_THINKING_DIFFICULTY_RE = re.compile(
+    r"\b(?:why|prove|explain|analy[sz]e|optimi[sz]e|refactor|algorithm|debug)\b"
+    r"|почему|объясни|докажи|проанализируй|оптимиз|архитектур|рефактор|алгоритм|отлад",
+    re.IGNORECASE,
+)
+
+
+def _thinking_text(req: ChatCompletionRequest) -> str:
+    """Flatten the last user turn into searchable text.
+
+    Content may be a plain string or a multimodal list of parts; anything else
+    contributes nothing.
+    """
+    for msg in reversed(req.messages or []):
+        if getattr(msg, "role", "") != "user":
+            continue
+        content = getattr(msg, "content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [p["text"] for p in content if isinstance(p, dict) and isinstance(p.get("text"), str)]
+            return "\n".join(parts)
+        return ""
+    return ""
+
+
+# A turn's signals add up to a "hard" score; reaching the threshold turns
+# thinking on. A long prompt or an error/difficulty cue is strong enough alone,
+# while a long history and an automatic tool round are weak hints that only
+# matter together. Weights and threshold live in settings so the balance can be
+# tuned via env (DANYAPI_THINKING_*_WEIGHT / _SCORE_THRESHOLD) without a code
+# change.
+
+
+def _tool_signal(req: ChatCompletionRequest) -> int:
+    """Score the tool dimension of the request.
+
+    A bare ``tools`` list is a static property of the request, not evidence
+    about the turn. A forced call (``tool_choice="required"`` or a named
+    function) is not a decision, and ``"none"`` forbids calls outright, so
+    neither says anything about difficulty. Only ``"auto"`` (or an unset
+    choice) with tools attached hints at a multi-step turn, and that hint is
+    weak: on its own it stays below the threshold.
+    """
+    if not getattr(req, "tools", None):
+        return 0
+    choice = getattr(req, "tool_choice", None)
+    if choice is None or choice == "auto":
+        return settings.thinking_weak_weight
+    return 0
+
+
+def _looks_hard(req: ChatCompletionRequest) -> bool:
+    """Heuristic: does the current turn warrant thinking?
+
+    Consulted only when the client sent neither ``thinking`` nor
+    ``reasoning_effort`` and ``DANYAPI_THINKING_HEURISTIC`` is on. Signals add
+    up to a score; a strong one clears the threshold alone, weak ones must
+    combine. A short, plain prompt stays off.
+    """
+    text = _thinking_text(req)
+    score = 0
+    if len(text) >= settings.thinking_min_prompt_chars:
+        score += settings.thinking_strong_weight
+    if _THINKING_ERROR_RE.search(text) or _THINKING_DIFFICULTY_RE.search(text):
+        score += settings.thinking_strong_weight
+    if len(req.messages or []) >= settings.thinking_min_messages:
+        score += settings.thinking_weak_weight
+    score += _tool_signal(req)
+    return score >= settings.thinking_score_threshold
+
+
 def _resolve_thinking(req: ChatCompletionRequest, *, default: bool) -> bool:
     """Resolve thinking flag from client request.
 
-    Priority: explicit `thinking` field > `reasoning_effort` (Kimi) > provider default.
+    Priority: explicit ``thinking`` field > ``reasoning_effort`` (Kimi) >
+    per-turn difficulty heuristic (opt-in) > provider default.
     Kimi sends reasoning_effort="low"|"medium"|"high"; any non-"off" value means enabled.
     """
     if req.thinking is not None:
@@ -499,6 +578,8 @@ def _resolve_thinking(req: ChatCompletionRequest, *, default: bool) -> bool:
     reasoning_effort = getattr(req, "reasoning_effort", None)
     if reasoning_effort is not None:
         return reasoning_effort != "off"
+    if settings.thinking_heuristic:
+        return _looks_hard(req)
     return default
 
 

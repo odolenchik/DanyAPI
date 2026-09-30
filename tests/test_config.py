@@ -168,3 +168,84 @@ def test_toolcall_retry_off_by_default(settings_for):
 @pytest.mark.parametrize("value", ["1", "true", "yes", "on", "TRUE", "On"])
 def test_toolcall_retry_enabled_variants(settings_for, value):
     assert settings_for({"DANYAPI_TOOLCALL_RETRY": value}).toolcall_retry is True
+
+
+def test_thinking_heuristic_off_by_default(settings_for):
+    assert settings_for({}).thinking_heuristic is False
+    assert settings_for({"DANYAPI_THINKING_HEURISTIC": ""}).thinking_heuristic is False
+    assert settings_for({"DANYAPI_THINKING_HEURISTIC": "0"}).thinking_heuristic is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "TRUE", "On"])
+def test_thinking_heuristic_enabled_variants(settings_for, value):
+    assert settings_for({"DANYAPI_THINKING_HEURISTIC": value}).thinking_heuristic is True
+
+
+def test_thinking_thresholds_have_defaults(settings_for):
+    s = settings_for({})
+    assert s.thinking_min_prompt_chars == 2000
+    assert s.thinking_min_messages == 8
+
+
+def test_thinking_thresholds_read_env(settings_for):
+    s = settings_for({"DANYAPI_THINKING_MIN_PROMPT_CHARS": "500", "DANYAPI_THINKING_MIN_MESSAGES": "3"})
+    assert s.thinking_min_prompt_chars == 500
+    assert s.thinking_min_messages == 3
+
+
+def test_thinking_thresholds_fall_back_on_bad_values(settings_for):
+    s = settings_for({"DANYAPI_THINKING_MIN_PROMPT_CHARS": "abc", "DANYAPI_THINKING_MIN_MESSAGES": "xyz"})
+    assert s.thinking_min_prompt_chars == 2000
+    assert s.thinking_min_messages == 8
+
+
+def test_thinking_thresholds_floor_at_one(settings_for):
+    s = settings_for({"DANYAPI_THINKING_MIN_PROMPT_CHARS": "0", "DANYAPI_THINKING_MIN_MESSAGES": "-5"})
+    assert s.thinking_min_prompt_chars == 1
+    assert s.thinking_min_messages == 1
+
+
+def test_thinking_score_defaults(settings_for):
+    s = settings_for({})
+    assert s.thinking_strong_weight == 2
+    assert s.thinking_weak_weight == 1
+    assert s.thinking_score_threshold == 2
+
+
+def test_thinking_score_read_env(settings_for):
+    s = settings_for(
+        {
+            "DANYAPI_THINKING_STRONG_WEIGHT": "5",
+            "DANYAPI_THINKING_WEAK_WEIGHT": "3",
+            "DANYAPI_THINKING_SCORE_THRESHOLD": "7",
+        }
+    )
+    assert s.thinking_strong_weight == 5
+    assert s.thinking_weak_weight == 3
+    assert s.thinking_score_threshold == 7
+
+
+def test_thinking_score_falls_back_on_bad_values(settings_for):
+    s = settings_for(
+        {
+            "DANYAPI_THINKING_STRONG_WEIGHT": "abc",
+            "DANYAPI_THINKING_WEAK_WEIGHT": "",
+            "DANYAPI_THINKING_SCORE_THRESHOLD": "1.5",
+        }
+    )
+    assert s.thinking_strong_weight == 2
+    assert s.thinking_weak_weight == 1
+    assert s.thinking_score_threshold == 2
+
+
+def test_thinking_score_floors_at_one(settings_for):
+    s = settings_for(
+        {
+            "DANYAPI_THINKING_STRONG_WEIGHT": "0",
+            "DANYAPI_THINKING_WEAK_WEIGHT": "-3",
+            "DANYAPI_THINKING_SCORE_THRESHOLD": "0",
+        }
+    )
+    assert s.thinking_strong_weight == 1
+    assert s.thinking_weak_weight == 1
+    assert s.thinking_score_threshold == 1

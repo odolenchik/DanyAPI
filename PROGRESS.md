@@ -2,6 +2,58 @@
 
 ## Готово
 
+- **Автовыбор thinking по сложности хода (тесты + верификация).** Сама эвристика
+  уже лежала в рабочей копии: `_looks_hard`/`_thinking_text`/`_resolve_thinking`
+  (`danyapi/api/openai.py:504-554`) и настройки `thinking_heuristic`,
+  `thinking_min_prompt_chars` (2000), `thinking_min_messages` (8)
+  (`danyapi/config.py:162-176`, env `DANYAPI_THINKING_HEURISTIC`,
+  `DANYAPI_THINKING_MIN_PROMPT_CHARS`, `DANYAPI_THINKING_MIN_MESSAGES`; off по
+  умолчанию). Приоритет прежний: явное `thinking` → `reasoning_effort` →
+  эвристика (если включена) → дефолт провайдера; формат
+  `/v1/chat/completions` не менялся.
+
+  **Правило переработано (сигналы складываются в счёт).** Изначально
+  `_looks_hard` был набором OR-условий, и одно из них — голый `tools` — делало
+  фичу бесполезной для агентных клиентов: Kimi Code CLI шлёт `tools` почти на
+  каждом ходу (61% трафика — шаги tool-раунда), поэтому thinking включался
+  всегда. Плюс `tool_choice` не различал режимы: `"none"` (инструменты
+  запрещены) и `"required"` (вызов принудительный, решения нет) тоже давали
+  «думать». Теперь сигналы дают очки: сильный (длинный промпт ИЛИ
+  ошибка/стектрейс/ключевое слово) = 2, слабый (длинная история, авто-tool
+  раунд) = 1, порог = 2. Голый `tools` больше не сигнал; засчитывается только
+  `tools` + `tool_choice` `auto`/не задан, и это слабый сигнал, который сам по
+  себе порога не берёт. `tool_choice` `none`/`required`/именованная функция —
+  ноль. Хелпер `_tool_signal`. Веса и порог вынесены в env (см. ниже), а не
+  зашиты константами.
+
+  **Веса и порог — через env.** `thinking_strong_weight` /
+  `thinking_weak_weight` / `thinking_score_threshold` в `Settings`
+  (`danyapi/config.py`), читаются хелпером `_int_env` (нечисловое значение →
+  дефолт, значение ниже 1 → clamp). Env: `DANYAPI_THINKING_STRONG_WEIGHT` (2),
+  `DANYAPI_THINKING_WEAK_WEIGHT` (1), `DANYAPI_THINKING_SCORE_THRESHOLD` (2).
+  `_looks_hard`/`_tool_signal` берут их из `settings`, поэтому баланс крутится
+  без правки кода. Задокументированы в `.env.example`.
+
+  Закрыта тестовая таблица из BACKLOG: новый
+  `tests/test_thinking_heuristic.py` (33 теста) — явные поля перебивают
+  эвристику в обе стороны, `reasoning_effort="off"`/`"high"`, сильные сигналы
+  поодиночке (длина, ошибка/стектрейс, англ. и рус. ключевые слова), слабые
+  поодиночке НЕ включают thinking (голый `tools`, `auto`, длинная история), все
+  режимы `tool_choice` (`none`/`required`/именованная/`auto` без `tools`),
+  комбинации слабых сигналов дают thinking, сигналы «не думать» (короткий/
+  простой промпт, пороги на единицу ниже), просматривается только последний
+  user-ход, мультимодальный/не-текстовый контент, независимость от
+  `search`-гейта, регрессия при выключенном флаге. Плюс 4 route-level E2E
+  через `_chat_completions_deepseek`
+  (стаб `_collect_non_stream`, как в `tests/test_retry.py`): простой и сложный
+  ход без `thinking` дают `thinking=False`/`True`, выключенный флаг — дефолт
+  провайдера, явное `thinking` по-прежнему главнее. `tests/test_config.py`
+  (+10: флаг off/on-варианты, дефолты порогов и весов, чтение env, фолбэк на
+  битых значениях, floor=1). Верификация: `ruff check` + `ruff format --check` +
+  `pytest -q` → **1252 passed**, `arch-check` OK; покрытие
+  `danyapi/config.py` 100%, `danyapi/api/openai.py` 99% (оставшиеся 4
+  непокрытые строки — не эта фича).
+
 - **Retry на нераспарсенный tool-call (parse-fail), DeepSeek.** Раньше при
   `parse_tool_calls → None` Dany отдавал сырой текст как обычный ответ; существующий
   `_repair_tool_calls` срабатывал только когда парсинг прошёл, а валидация упала.
@@ -568,15 +620,17 @@
 
 - Полный CI-гейт `pytest --cov-fail-under=100` падает: покрытие ~97% — дефицит
   рефакторинга в `api/streaming.py` (~102 строки), `tools/parse.py` (~52) и др.,
-  не относится к текущим фиксам (локальный `pytest -q` → 1143 passed).
+  не относится к текущим фиксам (локальный `pytest -q` → 1252 passed).
   Пять coverage-сюит (`tests/test_*_coverage.py`) подняли покрытие с 94% до 97%.
 - `ruff format --check` ранее падал на `scripts/smoke_tooltrace.py` и
   `tests/test_tooltrace.py`; оба отформатированы, сейчас формат-гейт зелёный.
 
 ## Текущий commit
 
-В работе (не закоммичено): compaction — сохранение текущего хода, суммаризация
-старого контекста, один запрос вместо двух; см. «Готово» выше.
+В работе (не закоммичено): тесты автовыбора thinking по сложности хода
+(`tests/test_thinking_heuristic.py`, +6 в `tests/test_config.py`); см. «Готово»
+выше. Рабочая копия `/home/odolen/ssd_new/DanyAPI2` — без `.git`, коммит не
+делается.
 
 Последний коммит: `test: add targeted coverage suites and a CLAUDE.md agent guide`
 (`3568633`). До него: `feat(sessions): reattach lost chats and pin one chat per image model`

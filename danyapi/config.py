@@ -159,5 +159,41 @@ class Settings:
         # enabled, only replies the classifier judged json_malformed are retried.
         self.toolcall_retry = os.environ.get("DANYAPI_TOOLCALL_RETRY", "").strip().lower() in ("1", "true", "yes", "on")
 
+        # Per-turn thinking: when the client sends neither `thinking` nor
+        # `reasoning_effort`, decide the flag from the turn itself instead of the
+        # provider default. Off by default so existing clients keep their exact
+        # behavior; opt in with DANYAPI_THINKING_HEURISTIC=1.
+        self.thinking_heuristic = os.environ.get("DANYAPI_THINKING_HEURISTIC", "").strip().lower() in ("1", "true", "yes", "on")
+        # A user turn at or above this many characters counts as hard.
+        try:
+            self.thinking_min_prompt_chars = max(1, int(os.environ.get("DANYAPI_THINKING_MIN_PROMPT_CHARS", "2000")))
+        except ValueError:
+            self.thinking_min_prompt_chars = 2000
+        # A conversation with at least this many messages counts as hard.
+        try:
+            self.thinking_min_messages = max(1, int(os.environ.get("DANYAPI_THINKING_MIN_MESSAGES", "8")))
+        except ValueError:
+            self.thinking_min_messages = 8
+        # Hard-turn signals add up to a score; reaching the threshold turns
+        # thinking on. A strong signal (long prompt, error/difficulty cue)
+        # clears it alone; weak ones (long history, automatic tool round) must
+        # combine. Tunable so the balance can be adjusted without a code change.
+        self.thinking_strong_weight = self._int_env("DANYAPI_THINKING_STRONG_WEIGHT", 2, minimum=1)
+        self.thinking_weak_weight = self._int_env("DANYAPI_THINKING_WEAK_WEIGHT", 1, minimum=1)
+        self.thinking_score_threshold = self._int_env("DANYAPI_THINKING_SCORE_THRESHOLD", 2, minimum=1)
+
+    @staticmethod
+    def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
+        """Read an integer env var, falling back to ``default`` when unset or bad.
+
+        Non-numeric input never raises: an unusable value keeps the default so
+        a typo cannot take the server down. Values below ``minimum`` are clamped.
+        """
+        try:
+            value = int(os.environ.get(name, str(default)))
+        except ValueError:
+            return default
+        return max(minimum, value)
+
 
 settings = Settings()
