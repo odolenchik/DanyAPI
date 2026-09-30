@@ -3422,6 +3422,70 @@ def test_dsml_param_only_bare_separator_three_calls():
     }
 
 
+def test_dsml_param_only_schema_split_recovers_multi_tool_block():
+    """tooltrace 9cf75302: a bare-parameter block with no <invoke>, no repeated name
+    and no separator tag glues parameters from several tools into one run — Bash
+    command/cwd/description/run_in_background/timeout/disable_timeout, then Glob/Grep
+    path/offset/head_limit/glob/type/-n/include_ignored.
+
+    No single schema accepts every key, so _infer_tool_from_params returned None and
+    the whole block was dropped as no_tool_call. The run must instead split where the
+    next name leaves no tool accepting the whole group: the leading Bash args form one
+    call, and the trailing keys (all of which Grep accepts) resolve to Grep.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f"<{S} calls>\n"
+        f'<{S} parameter name="command" string="true">cd /opt/app && ./run.sh</{S} parameter>\n'
+        f'<{S} parameter name="cwd" string="true">/opt/app</{S} parameter>\n'
+        f'<{S} parameter name="description" string="true">Start server</{S} parameter>\n'
+        f'<{S} parameter name="run_in_background" string="false">false</{S} parameter>\n'
+        f'<{S} parameter name="timeout" string="false">120</{S} parameter>\n'
+        f'<{S} parameter name="disable_timeout" string="false">false</{S} parameter>\n'
+        f'<{S} parameter name="path" string="true">/opt/app/output</{S} parameter>\n'
+        f'<{S} parameter name="offset" string="false">0</{S} parameter>\n'
+        f'<{S} parameter name="head_limit" string="false">0</{S} parameter>\n'
+        f'<{S} parameter name="glob" string="true">**/*.py</{S} parameter>\n'
+        f'<{S} parameter name="type" string="true">py</{S} parameter>\n'
+        f'<{S} parameter name="-n" string="false">true</{S} parameter>\n'
+        f'<{S} parameter name="include_ignored" string="false">false</{S} parameter>\n'
+        f"</{S} calls>"
+    )
+    schemas = {
+        "Bash": {
+            "command": "",
+            "cwd": "",
+            "description": "",
+            "run_in_background": "",
+            "timeout": 1,
+            "disable_timeout": "",
+        },
+        "Read": {"path": "", "line_offset": 1, "n_lines": 1},
+        "Grep": {
+            "pattern": "",
+            "path": "",
+            "glob": "",
+            "type": "",
+            "offset": 1,
+            "head_limit": 1,
+            "-n": "",
+            "include_ignored": "",
+        },
+    }
+    parsed = parse_tool_calls(text, schemas)
+    assert parsed is not None
+    calls, _ = parsed
+    assert [c.name for c in calls] == ["Bash", "Grep"]
+    first = json.loads(calls[0].arguments)
+    assert first["command"] == "cd /opt/app && ./run.sh"
+    assert first["timeout"] == 120
+    assert "path" not in first
+    second = json.loads(calls[1].arguments)
+    assert second["path"] == "/opt/app/output"
+    assert second["glob"] == "**/*.py"
+    assert second["-n"] is True
+
+
 def test_wrapped_key_tool_calls_with_space():
     """DeepSeek emits a JSON wrapper with the key 'tool calls' (space instead of
     underscore). _WRAPPED_CALL_KEYS must include this variant.

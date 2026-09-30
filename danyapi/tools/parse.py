@@ -1154,6 +1154,13 @@ def _dsml_close_tag_attrs(tag: str) -> dict[str, Any]:
     return attrs
 
 
+def _schema_compatible_tools(keys: set[str], tool_schemas: dict[str, dict[str, Any]] | None) -> set[str]:
+    """Tool names whose schema declares every argument name in ``keys``."""
+    if not tool_schemas or not keys:
+        return set()
+    return {name for name, params in tool_schemas.items() if isinstance(params, dict) and all(key in params for key in keys)}
+
+
 def _parse_dsml_param_only(text: str, tool_schemas: dict[str, dict[str, Any]] | None = None) -> list[ToolCall] | None:
     """Extract tool calls from DSML parameter tags that have no enclosing <invoke>.
 
@@ -1166,7 +1173,9 @@ def _parse_dsml_param_only(text: str, tool_schemas: dict[str, dict[str, Any]] | 
     One block may encode several calls: a repeated parameter name starts a new call
     (tooltrace 24b809c9, f4275506), and trailing arguments fused into a close tag
     (the ``line_offset=170 n_lines=18`` tail of a close tag) are folded into the
-    current call.
+    current call. Sibling calls whose argument names never repeat and carry no
+    separator tag are split by schema — when the next name leaves no tool that
+    accepts the whole group (tooltrace 9cf75302).
 
     Two opener spellings are accepted: the canonical ``parameter name="X"`` and the
     malformed ``parameter="X"`` where the name is the attribute itself, whose values
@@ -1218,6 +1227,18 @@ def _parse_dsml_param_only(text: str, tool_schemas: dict[str, dict[str, Any]] | 
             groups.append(current)
             current = []
             seen = set()
+        # Sibling calls may also be glued together with no repeat and no separator:
+        # DeepSeek concatenates parameters from several tools into one run (tooltrace
+        # 9cf75302 — Bash + Glob + Grep params in one block). When the next name
+        # leaves no tool that still accepts the whole group, the current group is a
+        # complete call and this name opens the next one.
+        if current and tool_schemas:
+            before_keys = {p for p, _, _, _ in current}
+            after_keys = before_keys | {pname}
+            if _schema_compatible_tools(before_keys, tool_schemas) and not _schema_compatible_tools(after_keys, tool_schemas):
+                groups.append(current)
+                current = []
+                seen = set()
         current.append((pname, raw_value, m.group("sval"), attrs))
         seen.add(pname)
         # A second DSML tag after this parameter's own close tag is a bare call
