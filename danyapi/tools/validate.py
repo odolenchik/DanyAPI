@@ -195,3 +195,23 @@ def build_repair_prompt(issues: list[ValidationIssue]) -> str:
         "Fix the listed problems, keep every already-valid argument, and add no prose, "
         "no markdown fences, and no extra keys."
     )
+
+
+def build_unparsed_repair_prompt(issue: str | None = None) -> str:
+    """A follow-up instruction asking the model to redo a call that did not parse.
+
+    Unlike ``build_repair_prompt`` this fires when nothing was extracted from the
+    reply at all — the model's call-shaped text could not be turned into tool
+    calls (e.g. a truncated or otherwise mangled payload). The model still sees
+    its own broken answer in the session, so we only say the reply was not a
+    valid call and demand the JSON shape.
+    """
+    detail = f" (diagnosis: {issue})" if issue else ""
+    return (
+        "Your previous reply looked like a tool call but could not be parsed"
+        f"{detail}.\n\n"
+        "Reply with ONLY the JSON object in the exact same format "
+        '(a single object with key "tool_calls", an array of {"name", "arguments"}). '
+        "Use the tool name and arguments you intended, include every required "
+        "argument, and add no prose, no markdown fences, no XML/DSML tags, and no extra keys."
+    )

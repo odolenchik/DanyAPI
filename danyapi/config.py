@@ -153,5 +153,11 @@ class Settings:
         except ValueError:
             self.tooltrace_backup_count = 10
 
+        # Retry a tool-mode reply whose tool call failed to parse at all. Off by
+        # default: for tool_choice="auto" an unparsed reply is usually ordinary
+        # prose, and every retry costs an upstream request (PoW + tokens). When
+        # enabled, only replies the classifier judged json_malformed are retried.
+        self.toolcall_retry = os.environ.get("DANYAPI_TOOLCALL_RETRY", "").strip().lower() in ("1", "true", "yes", "on")
+
 
 settings = Settings()

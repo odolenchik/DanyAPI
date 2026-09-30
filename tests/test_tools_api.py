@@ -401,3 +401,72 @@ async def test_valid_call_does_not_trigger_repair():
     args = dict(_deepseek_args(acct), tool_schemas=_WEATHER_SCHEMAS)
     await openai_mod._collect_non_stream(**args)
     assert acct.client.completion.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Unparsed retry: a reply that yields no tool call at all is re-asked once when
+# tool_choice forced a call (or the auto opt-in flag is set); a plain auto
+# answer is left untouched.
+# ---------------------------------------------------------------------------
+
+# Parses to nothing and classifies as json_malformed (call-shaped, truncated).
+_GARBAGE_TOOL_JSON = '{"tool_calls": [{"name": "get_weather", "arguments": '
+
+
+async def test_non_stream_repairs_unparsed_forced_choice():
+    acct = FakeAccount([_ds_tool_sse(_GARBAGE_TOOL_JSON), _ds_tool_sse(_FIXED_TOOL_JSON)])
+    args = dict(_deepseek_args(acct), tool_schemas=_WEATHER_SCHEMAS, tool_choice="required")
+    result = await openai_mod._collect_non_stream(**args)
+    call = result["choices"][0]["message"]["tool_calls"][0]
+    assert json.loads(call["function"]["arguments"]) == {"city": "Moscow"}
+    assert acct.client.completion.await_count == 2
+
+
+async def test_non_stream_unparsed_auto_no_retry_by_default():
+    # Auto choice + flag off: an unparsed reply stays a plain content answer.
+    acct = FakeAccount([_ds_tool_sse(_GARBAGE_TOOL_JSON)])
+    args = dict(_deepseek_args(acct), tool_schemas=_WEATHER_SCHEMAS, tool_choice="auto")
+    result = await openai_mod._collect_non_stream(**args)
+    message = result["choices"][0]["message"]
+    assert "tool_calls" not in message
+    assert message["content"] == _GARBAGE_TOOL_JSON
+    assert acct.client.completion.await_count == 1
+
+
+async def test_non_stream_unparsed_auto_retries_with_flag(monkeypatch):
+    from danyapi.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "toolcall_retry", True)
+    acct = FakeAccount([_ds_tool_sse(_GARBAGE_TOOL_JSON), _ds_tool_sse(_FIXED_TOOL_JSON)])
+    args = dict(_deepseek_args(acct), tool_schemas=_WEATHER_SCHEMAS, tool_choice="auto")
+    result = await openai_mod._collect_non_stream(**args)
+    call = result["choices"][0]["message"]["tool_calls"][0]
+    assert json.loads(call["function"]["arguments"]) == {"city": "Moscow"}
+    assert acct.client.completion.await_count == 2
+
+
+async def test_non_stream_unparsed_plain_prose_never_retries(monkeypatch):
+    # Even with the flag on, ordinary prose (no_tool_call) is not re-sent.
+    from danyapi.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "toolcall_retry", True)
+    acct = FakeAccount([DS_PLAIN_SSE, _ds_tool_sse(_FIXED_TOOL_JSON)])
+    args = dict(_deepseek_args(acct), tool_schemas=_WEATHER_SCHEMAS, tool_choice="auto")
+    result = await openai_mod._collect_non_stream(**args)
+    assert "22C" in result["choices"][0]["message"]["content"]
+    assert acct.client.completion.await_count == 1
+
+
+async def test_stream_repairs_unparsed_forced_choice():
+    acct = FakeAccount([_ds_tool_sse(_GARBAGE_TOOL_JSON), _ds_tool_sse(_FIXED_TOOL_JSON)])
+    args = dict(_deepseek_args(acct), tool_schemas=_WEATHER_SCHEMAS, tool_choice="required")
+    lines = await collect_stream(openai_mod._stream_openai(**args))
+    assert json.loads(_stream_arguments(lines)) == {"city": "Moscow"}
+
+
+async def test_non_stream_unparsed_keeps_text_when_retry_fails():
+    # Retry still unparsed: the original content answer is preserved, not dropped.
+    acct = FakeAccount([_ds_tool_sse(_GARBAGE_TOOL_JSON), _ds_tool_sse(_GARBAGE_TOOL_JSON)])
+    args = dict(_deepseek_args(acct), tool_schemas=_WEATHER_SCHEMAS, tool_choice="required")
+    result = await openai_mod._collect_non_stream(**args)
+    assert result["choices"][0]["message"]["content"] == _GARBAGE_TOOL_JSON

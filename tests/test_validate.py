@@ -197,3 +197,25 @@ def test_should_retry_unparsed_non_string_choice_is_auto():
     # A malformed tool_choice object without a function name is treated as auto.
     assert should_retry_unparsed({"type": "function"}, "json_malformed") is False
     assert should_retry_unparsed(123, "json_malformed", retry_auto=True) is True
+
+
+# --- build_unparsed_repair_prompt: parse-fail variant of the repair prompt ----
+
+
+def test_build_unparsed_repair_prompt_demands_json():
+    from danyapi.tools.validate import build_unparsed_repair_prompt
+
+    prompt = build_unparsed_repair_prompt("json_malformed")
+    assert "could not be parsed" in prompt
+    assert "json_malformed" in prompt
+    assert '"tool_calls"' in prompt
+    # The model's broken reply is still in the session, so no issue list is sent.
+    assert "did not pass tool-call validation" not in prompt
+
+
+def test_build_unparsed_repair_prompt_without_issue():
+    from danyapi.tools.validate import build_unparsed_repair_prompt
+
+    prompt = build_unparsed_repair_prompt(None)
+    assert "could not be parsed" in prompt
+    assert "diagnosis" not in prompt

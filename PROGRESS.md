@@ -2,6 +2,37 @@
 
 ## Готово
 
+- **Retry на нераспарсенный tool-call (parse-fail), DeepSeek.** Раньше при
+  `parse_tool_calls → None` Dany отдавал сырой текст как обычный ответ; существующий
+  `_repair_tool_calls` срабатывал только когда парсинг прошёл, а валидация упала.
+  Теперь parse-фейл тоже ретраится один раз: `_repair_unparsed`
+  (`danyapi/api/streaming.py`) под гейтом `should_retry_unparsed` — `tool_choice`
+  `required`/именованная функция ретраит всегда; `auto`/не задан — только при
+  `DANYAPI_TOOLCALL_RETRY=1` **и** вердикте классификатора `json_malformed`; обычная
+  проза (`no_tool_call`) не ретраится никогда. Промпт parse-фейла —
+  `build_unparsed_repair_prompt` (`danyapi/tools/validate.py`). Общий транспорт
+  обоих ретраев вынесен в `_retry_tool_call`; успешный parse-fail-ретрай помечается
+  `continuation`-событием в tooltrace. Проведено во все 4 сайта парсинга DeepSeek
+  (non-stream, stream, оба compact-пути). Env-флаг off по умолчанию. Тесты:
+  `tests/test_tools_api.py` (+6), `tests/test_validate.py` (+2),
+  `tests/test_config.py` (+2). Верификация: `ruff check` + `ruff format --check` +
+  `pytest -q` → **1204 passed**, `arch-check` OK.
+
+- **Парсер: sibling-вызовы без разделителя в param-only блоке (сплит по схеме).**
+  Блок DSML без `<invoke>` (только `<parameter>`) склеивал параметры **разных**
+  инструментов в один прогон, причём sibling-вызовы не разделены ничем, кроме
+  собственного close-тега каждого параметра, а имена аргументов уникальны: Bash
+  (`command`/`cwd`/`description`/`run_in_background`/`timeout`/`disable_timeout`),
+  затем Glob/Grep (`path`/`offset`/`head_limit`/`glob`/`type`/`-n`/…). Ни сплит по
+  повтору имени, ни сплит по голому тегу границу не видели; `_infer_tool_from_params`
+  требует все ключи в одной схеме → ни одна не подходит → весь блок терялся как
+  `unparsed:no_tool_call` (tooltrace `9cf75302`, `59721714`, `be51bb6e`). Теперь
+  `_parse_dsml_param_only` разбивает прогон, когда очередной параметр оставляет
+  группу без ни одной совместимой схемы (helper `_schema_compatible_tools`).
+  Из лога `9cf75302` даёт 2 вызова (Bash + Grep) вместо нуля. Тесты:
+  `tests/test_tools.py` (+1, реальный пример). Playbook дополнен. Верификация:
+  `ruff check` + `ruff format --check` + `pytest -q` → **1189 passed**, `arch-check` OK.
+
 - **Python 3.10: `except asyncio.TimeoutError` вместо встроенного `TimeoutError`.**
   На плате (Ubuntu 22.04) Python 3.10, где `asyncio.TimeoutError` — отдельный класс,
   а не алиас встроенного `TimeoutError` (унификация только с 3.11). Перехват

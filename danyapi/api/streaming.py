@@ -18,7 +18,12 @@ from ..config import settings
 from ..deepseek.stream import IncrementalSSE, MessageReconstructor
 from ..tokens import count_messages_tokens
 from ..tools.prompt import build_compact_prompt
-from ..tools.validate import build_repair_prompt, validate_calls
+from ..tools.validate import (
+    build_repair_prompt,
+    build_unparsed_repair_prompt,
+    should_retry_unparsed,
+    validate_calls,
+)
 from ..tooltrace import ToolTraceLogger
 from ..tooltrace import classify as _classify_trace
 from ..usage import record_usage
@@ -113,6 +118,70 @@ def _validate_parsed(calls: Any, tool_schemas: Any) -> list[Any]:
     return validate_calls(as_dicts, tool_schemas)
 
 
+async def _retry_tool_call(
+    account,
+    session,
+    parent_message_id,
+    model_type: str,
+    thinking: bool,
+    search: bool,
+    ref_file_ids: Any,
+    tool_schemas: Any,
+    request_id: str | None,
+    trace: ToolTraceLogger | None,
+    model: str,
+    prompt: str,
+    *,
+    require_valid: bool = True,
+    trace_repair: bool = False,
+) -> tuple[list[Any], str] | None:
+    """Re-ask the model once for a tool call, in the same upstream session.
+
+    Shared plumbing for both repair paths: the model still sees its own broken
+    answer in the session, so the prompt only has to say what went wrong. Returns
+    the ``(calls, text)`` of the retry when it parses (and, with
+    ``require_valid``, also passes schema validation); any other outcome returns
+    ``None`` so the caller keeps the original result rather than losing it.
+
+    A transport/session failure is swallowed — repair is best-effort and must
+    never abort a request that already produced something.
+    """
+    try:
+        rec = await _collect_continuation(
+            account,
+            session,
+            parent_message_id,
+            model_type,
+            thinking,
+            search,
+            ref_file_ids,
+            request_id=request_id,
+            trace=trace,
+            model=model,
+            prompt=prompt,
+        )
+    except Exception as exc:
+        log.warning("tool-call repair failed: %s", exc)
+        return None
+    if rec is None or not rec.content:
+        return None
+    parsed = toolemu.parse_tool_calls(rec.content, tool_schemas)
+    if parsed is None:
+        return None
+    calls, text = parsed
+    if require_valid and _validate_parsed(calls, tool_schemas):
+        return None
+    if trace_repair and trace is not None:
+        trace.continuation(
+            request_id,
+            session_id=session.id,
+            model=model,
+            detail="unparsed repair retry succeeded",
+            attempt=1,
+        )
+    return calls, text
+
+
 async def _repair_tool_calls(
     account,
     session,
@@ -127,41 +196,62 @@ async def _repair_tool_calls(
     trace: ToolTraceLogger | None,
     model: str,
 ) -> tuple[list[Any], str] | None:
-    """Ask the model once to redo a tool call that failed schema validation.
+    """Ask the model once to redo a tool call that failed schema validation."""
+    return await _retry_tool_call(
+        account,
+        session,
+        parent_message_id,
+        model_type,
+        thinking,
+        search,
+        ref_file_ids,
+        tool_schemas,
+        request_id,
+        trace,
+        model,
+        build_repair_prompt(issues),
+    )
 
-    Runs in the same upstream session, so the model still sees its own rejected
-    answer. Returns the corrected ``(calls, text)`` only if the retry both parses
-    and validates; any other outcome returns ``None`` so the caller keeps the
-    original (imperfect) result rather than losing it.
+
+async def _repair_unparsed(
+    account,
+    session,
+    parent_message_id,
+    model_type: str,
+    thinking: bool,
+    search: bool,
+    ref_file_ids: Any,
+    tool_schemas: Any,
+    request_id: str | None,
+    trace: ToolTraceLogger | None,
+    model: str,
+    tool_choice: Any,
+    issue: str | None,
+) -> tuple[list[Any], str] | None:
+    """Re-ask once when a tool-mode reply did not parse into any call.
+
+    Gated by ``should_retry_unparsed`` so a forced ``tool_choice`` always retries
+    while a plain ``auto`` answer only retries when ``DANYAPI_TOOLCALL_RETRY`` is
+    set and the reply looked like a mangled call. The retry must validate before
+    it is accepted — an unparsed reply has no useful original to fall back to.
     """
-    try:
-        rec = await _collect_continuation(
-            account,
-            session,
-            parent_message_id,
-            model_type,
-            thinking,
-            search,
-            ref_file_ids,
-            request_id=request_id,
-            trace=trace,
-            model=model,
-            prompt=build_repair_prompt(issues),
-        )
-    except Exception as exc:
-        # Repair is best-effort: a transport/session failure here must never
-        # abort a request that already has a (merely imperfect) tool call.
-        log.warning("tool-call repair failed: %s", exc)
+    if not should_retry_unparsed(tool_choice, issue, retry_auto=settings.toolcall_retry):
         return None
-    if rec is None or not rec.content:
-        return None
-    parsed = toolemu.parse_tool_calls(rec.content, tool_schemas)
-    if parsed is None:
-        return None
-    calls, text = parsed
-    if _validate_parsed(calls, tool_schemas):
-        return None
-    return calls, text
+    return await _retry_tool_call(
+        account,
+        session,
+        parent_message_id,
+        model_type,
+        thinking,
+        search,
+        ref_file_ids,
+        tool_schemas,
+        request_id,
+        trace,
+        model,
+        build_unparsed_repair_prompt(issue),
+        trace_repair=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +446,23 @@ async def _compact_retry(
         trace.upstream(request_id, content=rec.content, reasoning=rec.reasoning or None, session_id=new_sid, model=None)
     if tool_mode:
         parsed = toolemu.parse_tool_calls(rec.content, tool_schemas)
+        if parsed is None:
+            issue, _detail = _classify_trace(rec.content, tool_schemas)
+            parsed = await _repair_unparsed(
+                account,
+                new_session,
+                rec.id,
+                model_type,
+                thinking,
+                search,
+                ref_file_ids,
+                tool_schemas,
+                request_id,
+                trace,
+                model,
+                tool_choice,
+                issue,
+            )
         if parsed is not None:
             tool_calls, tool_text = parsed
             finish = "tool_calls"
@@ -561,6 +668,25 @@ async def _compact_retry_stream(
             trace.upstream(request_id, content=content_buf, reasoning=None, session_id=new_sid, model=model)
         if tool_mode:
             parsed = toolemu.parse_tool_calls(content_buf, tool_schemas)
+            if parsed is None:
+                issue, _detail = _classify_trace(content_buf, tool_schemas)
+                parsed = await _repair_unparsed(
+                    account,
+                    new_session,
+                    rec.id,
+                    model_type,
+                    thinking,
+                    search,
+                    ref_file_ids,
+                    tool_schemas,
+                    request_id,
+                    trace,
+                    model,
+                    tool_choice,
+                    issue,
+                )
+                if parsed is not None:
+                    content_buf = parsed[1] or content_buf
             if parsed is not None:
                 tool_calls, tool_text = parsed
                 issues = _validate_parsed(tool_calls, tool_schemas)
@@ -888,6 +1014,25 @@ async def _collect_non_stream(
             trace.upstream(request_id, content=content, reasoning=rec.reasoning or None, session_id=session_key, model=model)
         if tool_mode:
             parsed = toolemu.parse_tool_calls(content, tool_schemas)
+            if parsed is None:
+                issue, _detail = _classify_trace(content, tool_schemas)
+                parsed = await _repair_unparsed(
+                    account,
+                    session,
+                    rec.id or response_message_id,
+                    model_type,
+                    thinking,
+                    search,
+                    ref_file_ids,
+                    tool_schemas,
+                    request_id,
+                    trace,
+                    model,
+                    tool_choice,
+                    issue,
+                )
+                if parsed is not None:
+                    content = parsed[1] or content
             if parsed is not None:
                 tool_calls, tool_text = parsed
                 issues = _validate_parsed(tool_calls, tool_schemas)
@@ -1460,6 +1605,25 @@ async def _stream_openai(
             trace.upstream(request_id, content=content_buf, reasoning=None, session_id=session_key, model=model)
         if tool_mode:
             parsed = toolemu.parse_tool_calls(content_buf, tool_schemas)
+            if parsed is None:
+                issue, _detail = _classify_trace(content_buf, tool_schemas)
+                parsed = await _repair_unparsed(
+                    account,
+                    session,
+                    rec.id or response_message_id,
+                    model_type,
+                    thinking,
+                    search,
+                    ref_file_ids,
+                    tool_schemas,
+                    request_id,
+                    trace,
+                    model,
+                    tool_choice,
+                    issue,
+                )
+                if parsed is not None:
+                    content_buf = parsed[1] or content_buf
             if parsed is not None:
                 tool_calls, tool_text = parsed
                 issues = _validate_parsed(tool_calls, tool_schemas)

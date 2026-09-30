@@ -157,3 +157,14 @@ def test_cache_disabled_variants(settings_for, value):
 @pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "nope"])
 def test_cache_enabled_variants(settings_for, value):
     assert settings_for({"DANYAPI_CACHE_DISABLED": value}).cache_enabled is True
+
+
+def test_toolcall_retry_off_by_default(settings_for):
+    assert settings_for({}).toolcall_retry is False
+    assert settings_for({"DANYAPI_TOOLCALL_RETRY": ""}).toolcall_retry is False
+    assert settings_for({"DANYAPI_TOOLCALL_RETRY": "0"}).toolcall_retry is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "TRUE", "On"])
+def test_toolcall_retry_enabled_variants(settings_for, value):
+    assert settings_for({"DANYAPI_TOOLCALL_RETRY": value}).toolcall_retry is True
