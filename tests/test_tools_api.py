@@ -422,8 +422,13 @@ async def test_non_stream_repairs_unparsed_forced_choice():
     assert acct.client.completion.await_count == 2
 
 
-async def test_non_stream_unparsed_auto_no_retry_by_default():
+async def test_non_stream_unparsed_auto_no_retry_by_default(monkeypatch):
     # Auto choice + flag off: an unparsed reply stays a plain content answer.
+    # Pin the flag explicitly: it defaults off, but a developer's local .env may
+    # set DANYAPI_TOOLCALL_RETRY=1 and would otherwise flip this test's behaviour.
+    from danyapi.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "toolcall_retry", False)
     acct = FakeAccount([_ds_tool_sse(_GARBAGE_TOOL_JSON)])
     args = dict(_deepseek_args(acct), tool_schemas=_WEATHER_SCHEMAS, tool_choice="auto")
     result = await openai_mod._collect_non_stream(**args)
