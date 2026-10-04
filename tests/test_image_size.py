@@ -184,11 +184,13 @@ def test_content_fingerprint_accepts_plain_string_image_url():
         ((2048, 1152), "16:9"),
         ((1920, 1080), "16:9"),
         ((1080, 1920), "9:16"),
-        ((300, 200), "4:3"),
-        ((200, 300), "3:4"),
+        ((300, 200), "3:2"),
+        ((200, 300), "2:3"),
         ((1000, 100), "16:9"),
         ((100, 1000), "9:16"),
         ((900, 1600), "9:16"),
+        ((1024, 1536), "2:3"),
+        ((1536, 1024), "3:2"),
     ],
 )
 def test_aspect_ratio_picks_nearest(dims, expected):
@@ -197,3 +199,8 @@ def test_aspect_ratio_picks_nearest(dims, expected):
 
 def test_aspect_ratio_is_stable_for_ratio_shaped_input():
     assert _aspect_ratio(_parse_image_size("1152x2048")) == "9:16"
+
+
+def test_aspect_ratio_keeps_two_by_three_for_pin_size():
+    """A 2:3 request must stay 2:3, so the local resize does not distort it."""
+    assert _aspect_ratio(_parse_image_size("1024x1536")) == "2:3"

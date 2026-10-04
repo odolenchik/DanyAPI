@@ -214,7 +214,7 @@ MIN_IMAGE_DIM = 16
 MAX_IMAGE_DIM = 8192
 
 # Aspect ratios accepted by the Qwen image models (extra.meta.size).
-QWEN_IMAGE_RATIOS = ("1:1", "3:4", "4:3", "16:9", "9:16")
+QWEN_IMAGE_RATIOS = ("1:1", "2:3", "3:2", "3:4", "4:3", "16:9", "9:16")
 
 
 def _aspect_ratio(dims: tuple[int, int]) -> str:
