@@ -94,8 +94,22 @@ def _trace_parse(
     tool_schemas: Any,
     session_key: str | None = None,
     model: str | None = None,
+    *,
+    degenerate: bool = False,
 ) -> None:
     if trace is None:
+        return
+    if degenerate:
+        # The stream collapsed into a runaway container repeat and was aborted.
+        # Report it as its own result so it is visible in the trace summary
+        # instead of being buried under the (possibly ok) parse of the prefix.
+        trace.parse(
+            request_id,
+            result="degenerate_repeat",
+            issue=None,
+            session_id=session_key,
+            model=model,
+        )
         return
     parsed = toolemu.parse_tool_calls(content, tool_schemas)
     issue, detail = _classify_trace(content, tool_schemas)
@@ -1223,6 +1237,8 @@ async def _stream_openai(
             response_message_id = None
             got_content = False
             pending: list[str] = []
+            degenerate_aborted = False
+            degenerate_next_check = 0
             try:
                 async for chunk in resp.aiter_bytes():
                     for event in incremental.feed(chunk):
@@ -1282,6 +1298,17 @@ async def _stream_openai(
                             for line in pending:
                                 yield line
                             pending.clear()
+                        if settings.degenerate_guard and tool_mode and len(content_buf) > degenerate_next_check:
+                            degenerate_next_check = len(content_buf)
+                            if toolemu.is_degenerate_repeat(content_buf, threshold=settings.degenerate_threshold):
+                                log.warning(
+                                    "degenerate stream: runaway calls-container repeat (len=%d), aborting",
+                                    len(content_buf),
+                                )
+                                degenerate_aborted = True
+                                break
+                    if degenerate_aborted:
+                        break
             except (ssl.SSLError, ConnectionError) as exc:
                 log.warning(
                     "stream transport error (%s), attempt %d/%d",
@@ -1335,9 +1362,11 @@ async def _stream_openai(
             finally:
                 if rec.id:
                     stop_message_id = rec.id
-                if sys.exc_info()[0] is not None:
+                if degenerate_aborted or sys.exc_info()[0] is not None:
                     await _try_stop_stream(account.client, session.id, stop_message_id)
                 await resp.aclose()
+            if degenerate_aborted:
+                break
             if got_content:
                 break
             if _is_retryable_hint(rec) and attempt < MAX_RETRIES:
@@ -1677,7 +1706,7 @@ async def _stream_openai(
             finish = _finish_reason(rec.status)
 
         if tool_mode and trace is not None:
-            _trace_parse(trace, request_id, content_buf, tool_schemas, session_key, model)
+            _trace_parse(trace, request_id, content_buf, tool_schemas, session_key, model, degenerate=degenerate_aborted)
 
         final_chunk = {
             "id": chunk_id,

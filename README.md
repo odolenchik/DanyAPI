@@ -140,6 +140,23 @@ At least one valid DeepSeek or Qwen credential is required; otherwise the server
 | `DANYAPI_TOOLTRACE_MAX_BYTES` | `52428800` | Max trace file size in bytes before rotation |
 | `DANYAPI_TOOLTRACE_BACKUP_COUNT` | `10` | Number of rotated trace files to keep |
 
+### Degenerate-repeat guard
+
+On a long multi-call turn DeepSeek can occasionally lose EOS and repeat the empty DSML
+`calls` container hundreds of times until it hits the output limit. The valid call payload,
+if any, is already in the buffer, so the tail is pure waste. Dany detects the runaway run of
+adjacent empty containers and aborts the stream, stopping it upstream. This is a structural
+signal (a valid answer never has dozens of adjacent empty containers), so a legitimate
+multi-call reply is never truncated.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DANYAPI_DEGENERATE_GUARD` | `1` | Abort the stream on a runaway repeat; `0` only logs it |
+| `DANYAPI_DEGENERATE_THRESHOLD` | `20` | Adjacent empty-container repeats that declare a stream degenerate |
+
+Aborted requests are logged with `parse.result = degenerate_repeat` and surface in the
+`merge_traces.py` summary as a dedicated section.
+
 ### Launcher only
 
 `DANYAPI_AUTO_UPDATE` (`1` by default) is read by `docs/start.py`, not by the server itself. It makes the launcher check for and install the latest GitHub release before starting the server. Set it to `0` to disable auto-update.

@@ -2,6 +2,28 @@
 
 ## Готово
 
+- **Парсер DSML: три паттерна коверканья + защита от вырожденного повтора.**
+  Из разбора `tooltrace.ndjson` (DanyAPI + DanyAPI2, ~14k upstream-событий).
+  - **Вклеенный маркер в invoke-opener**: `invoke name="X"` + лишний DSML-маркер + `>`
+    вместо канонического `invoke name="X">`. `_DSML_INVOKE_RE` такое не видит → блок
+    терялся. Нормализует `_repair_dsml_glued_invoke`.
+  - **Голый `arguments="<json>"`**: вместо `parameter name=...` на каждый аргумент —
+    один тег с атрибутом `arguments` и escaped-JSON значением. Переписывает
+    `_repair_dsml_bare_arguments`, а `_unwrap_nested_arguments` разворачивает обёртку.
+  - **Голые `key="value"`-атрибуты**: аргументы схлопнуты в голые атрибуты
+    (`new_string="..."`, `parameter name="key="...`). Парсилось с пустыми аргументами →
+    `missing_required` → repair-цикл до лимита. Нормализует `_repair_dsml_bare_attributes`.
+  - **Защита от вырожденного повтора** (`degenerate_repeat`): на длинном многозаходном
+    ходу DeepSeek теряет EOS и повторяет пустой контейнер `calls>` сотни раз до лимита.
+    Детектор `is_degenerate_repeat`/`degenerate_repeat_count` (прогон подряд пустых
+    контейнеров, порог 20; свип 53/60, 0 ложных на 14k). Стрим обрывается + `stop_stream`.
+    Env: `DANYAPI_DEGENERATE_GUARD` (on), `DANYAPI_DEGENERATE_THRESHOLD` (20). Видно в
+    сводке `merge_traces.py` отдельным блоком. Ограничение: сэмплинг веб-API DeepSeek
+    не настраивается, это борьба с последствием, не с причиной.
+  - Тесты: `test_tools.py` (+9), `test_config.py` (+3), `test_retry.py` (+1). README,
+    `docs/configuration.html`, `docs/i18n.js`, `.env.example`, playbook обновлены.
+    Верификация: `ruff check` + `ruff format --check` + `arch-check` + `pytest -q` → 1318 passed.
+
 - **Qwen: причина отказа токена теперь видна.** Старт молча выкидывал отклонённый
   credential и отдавал наружу только `qwen provider is not configured`, так что
   отозванный refresh-токен выглядел как «протух за пару часов».

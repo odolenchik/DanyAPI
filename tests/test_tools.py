@@ -25,9 +25,11 @@ from danyapi.tools import (
     _tail_after_last_user,
     _tool_function,
     build_prompt,
+    degenerate_repeat_count,
     extract_last_user,
     extract_system,
     format_tool_message,
+    is_degenerate_repeat,
     is_tool_round,
     parse_tool_calls,
     render_json_mode,
@@ -3647,6 +3649,79 @@ def test_dsml_bare_arguments_unescaped_falls_back():
     assert len(calls) == 1
     args = json.loads(calls[0].arguments)
     assert args == {"path": "/a/b.py", "n": 1}
+
+
+def test_dsml_bare_attributes_recovered():
+    """Bare ``key="value"`` DSML attributes (no ``parameter name=``) are recovered.
+
+    tooltrace 7e2f6788 / 64cd8579: DeepSeek collapses each argument into a bare
+    attribute on its own tag, either bare or fused behind a name= prefix. The call
+    used to parse with EMPTY arguments, the client rejected it as missing required
+    properties, and the repair loop re-asked forever. Both spellings must decode.
+    """
+    S = "\uff5c\uff5c"  # DSML separator
+    text = (
+        f"<{S}DSML{S}calls>"
+        f'<{S}DSML{S}invoke name="Edit">'
+        f'<{S}DSML{S}new_string="NEW</{S}DSML{S}>'
+        f'<{S}DSML{S}parameter name="old_string="OLD</{S}DSML{S}>'
+        f'<{S}DSML{S}path="src/main.py"{S}DSML{S}>'
+        f"</{S}DSML{S}invoke>"
+        f"</{S}DSML{S}calls>"
+    )
+    schemas = {"Edit": {"path": "string", "old_string": "string", "new_string": "string"}}
+    parsed = parse_tool_calls(text, schemas)
+    assert parsed is not None
+    calls, _ = parsed
+    assert len(calls) == 1
+    assert calls[0].name == "Edit"
+    args = json.loads(calls[0].arguments)
+    assert args == {"new_string": "NEW", "old_string": "OLD", "path": "src/main.py"}
+
+
+def test_degenerate_repeat_normal_multi_call_not_flagged():
+    """A legitimate multi-call answer interleaves bodies; it must never trip."""
+    S = "\uff5c\uff5c"
+    text = (
+        f"<{S}DSML{S} calls>"
+        f'<{S}DSML{S} invoke name="Read">'
+        f'<{S}DSML{S} parameter name="path" string="true">/a</{S}DSML{S} parameter>'
+        f"</{S}DSML{S} invoke></{S}DSML{S} calls>"
+        f"<{S}DSML{S} calls>"
+        f'<{S}DSML{S} invoke name="Read">'
+        f'<{S}DSML{S} parameter name="path" string="true">/b</{S}DSML{S} parameter>'
+        f"</{S}DSML{S} invoke></{S}DSML{S} calls>"
+    )
+    assert degenerate_repeat_count(text) == 0
+    assert is_degenerate_repeat(text) is False
+
+
+def test_degenerate_repeat_few_empty_containers_not_flagged():
+    """A handful of empty containers is below threshold and stays valid."""
+    S = "\uff5c\uff5c"
+    text = (f"<{S}DSML{S} calls>") * 5
+    assert degenerate_repeat_count(text) == 5
+    assert is_degenerate_repeat(text) is False
+
+
+def test_degenerate_repeat_runaway_flagged():
+    """A long adjacent run of empty containers is the runaway degeneration."""
+    S = "\uff5c\uff5c"
+    text = (f"<{S}DSML{S} calls>\n") * 40
+    assert degenerate_repeat_count(text) == 40
+    assert is_degenerate_repeat(text) is True
+
+
+def test_degenerate_repeat_custom_threshold():
+    S = "\uff5c\uff5c"
+    text = (f"<{S}DSML{S} calls>\n") * 6
+    assert is_degenerate_repeat(text) is False
+    assert is_degenerate_repeat(text, threshold=5) is True
+
+
+def test_degenerate_repeat_plain_prose_zero():
+    assert degenerate_repeat_count("just a normal answer") == 0
+    assert is_degenerate_repeat("") is False
 
 
 def test_extract_system_skips_ephemeral_reminder():

@@ -1070,6 +1070,81 @@ def _repair_dsml_bare_arguments(text: str) -> str:
     return _DSML_BARE_ARGUMENTS_RE.sub(_repl, text)
 
 
+# Degenerate DSML attributes (tooltrace 7e2f6788): DeepSeek collapses each argument
+# into a bare ``key="value"`` attribute on its own DSML tag instead of a
+# ``<parameter name="key">value</parameter>`` element. Two spellings occur: a bare
+# attribute tag whose only content is ``key="value"``, and the fused
+# ``parameter name="key="value`` variant where the key is glued into a name= prefix.
+# _DSML_PARAM_RE requires the literal ``parameter name="X">`` shape, so all of these
+# are invisible; the call parses with EMPTY arguments, the client rejects it as
+# missing required properties, and the repair loop re-asks forever (the model keeps
+# emitting the same shape). Rewrite each to a canonical param element so the normal
+# DSML path decodes it. ``arguments`` is left alone (handled above).
+_DSML_BARE_ATTR_RE = re.compile(
+    rf"<{_DSML_SEP}\s*DSML\s*{_DSML_SEP}\s*"
+    rf"(?:parameter\s+name\s*=\s*)?['\"]?"
+    rf"(?P<key>[A-Za-z_][\w.-]*)\s*=\s*['\"](?P<value>.*?)"
+    rf"(?=(?:</?\s*)?{_DSML_SEP}\s*DSML)",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _repair_dsml_bare_attributes(text: str) -> str:
+    """Rewrite bare ``key="value"`` DSML attributes to canonical param elements."""
+    if "DSML" not in text:
+        return text
+
+    def _repl(m: re.Match[str]) -> str:
+        key = m.group("key")
+        if key == "arguments":
+            return m.group(0)
+        value = m.group("value")
+        # The close marker may be written with or without a preceding quote
+        # before the DSML tag; drop the structural trailing quote when present
+        # (a bare attribute carries one, a fused one does not).
+        if value.endswith(('"', "'")):
+            value = value[:-1]
+        sep = "||"
+        return f'<{sep}DSML{sep} parameter name="{key}" string="true">{value}</{sep}DSML{sep} parameter>'
+
+    return _DSML_BARE_ATTR_RE.sub(_repl, text)
+
+
+# Runaway DSML wrapper repetition (tooltrace fb6ee902, 7b3d20db): at the tail of a
+# long multi-call turn DeepSeek occasionally loses EOS and repeats the empty calls
+# container hundreds of times until it hits the output limit. The response is
+# structurally degenerate, not a real payload: the repeated openers are *adjacent*
+# (only whitespace between them) and no <invoke>/<parameter> ever follows. A valid
+# multi-call answer interleaves its containers with real bodies, so it never has a
+# long run of adjacent empty ones — the run length is a safe structural signal.
+_DEGENERATE_RUN_RE = re.compile(
+    rf"(?:<{_DSML_SEP}\s*DSML\s*{_DSML_SEP}\s*calls\s*>\s*){{2,}}",
+    re.IGNORECASE,
+)
+_DEGENERATE_MIN_REPEATS = 20
+
+
+def degenerate_repeat_count(text: str) -> int:
+    """Longest run of adjacent empty DSML ``calls`` containers in a reply.
+
+    Zero for a normal answer (its containers have bodies between them); a large
+    number means the model collapsed into repeating the bare opener.
+    """
+    if not text or "calls>" not in text:
+        return 0
+    longest = 0
+    for match in _DEGENERATE_RUN_RE.finditer(text):
+        run = match.group(0).count("calls")
+        if run > longest:
+            longest = run
+    return longest
+
+
+def is_degenerate_repeat(text: str, *, threshold: int = _DEGENERATE_MIN_REPEATS) -> bool:
+    """Whether a reply collapsed into a runaway run of empty calls containers."""
+    return degenerate_repeat_count(text) >= threshold
+
+
 def _dsml_param_value(sstring: str | None, raw: str, json_type: Any = None) -> Any:
     """Decode a DSML parameter value using its optional string="true|false" flag.
 
@@ -1939,11 +2014,13 @@ def parse_tool_calls(text: str, tool_schemas: dict[str, dict[str, Any]] | None =
     # Normalise the malformed single-pipe DSML opener before any branch inspects
     # the text, so the canonical-format DSML parsers can handle it unchanged.
     text = _repair_dsml_separator(text)
-    # Normalise two other malformed DSML spellings that every branch keys past: a
-    # glued invoke close marker and a bare ``arguments="..."`` carrier. Both rewrite
-    # to canonical DSML tags so the normal DSML path below handles them.
+    # Normalise other malformed DSML spellings that every branch keys past: a glued
+    # invoke close marker, a bare ``arguments="..."`` carrier, and bare/fused
+    # ``key="value"`` argument attributes. All rewrite to canonical DSML tags so the
+    # normal DSML path below handles them.
     text = _repair_dsml_glued_invoke(text)
     text = _repair_dsml_bare_arguments(text)
+    text = _repair_dsml_bare_attributes(text)
     # DSML is a distinct tag format (not JSON), so parse it before the generic
     # strip/JSON path — _strip_dsml would otherwise discard the tags and their attrs.
     dsml_calls, dsml_wrapper = _parse_dsml(text, tool_schemas)

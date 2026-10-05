@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -439,6 +440,41 @@ async def test_stream_full_consumption_does_not_stop_upstream():
     lines = list(await _collect(gen))
     assert any(line.startswith("data: ") for line in lines)
     acct.client.stop_stream.assert_not_awaited()
+
+
+def _degen_sse(repeats: int = 40) -> str:
+    S = "\uff5c\uff5c"
+    body = (f"<{S}DSML{S} calls>\n") * repeats
+    ready = 'data: {"request_message_id":1,"response_message_id":2,"model_type":"default"}\n\n'
+    frag = json.dumps(
+        {
+            "v": {
+                "response": {
+                    "message_id": 2,
+                    "parent_id": 1,
+                    "status": "WIP",
+                    "fragments": [{"id": 2, "type": "RESPONSE", "content": body}],
+                }
+            }
+        },
+        ensure_ascii=False,
+    )
+    finish = 'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n\n'
+    return "event: ready\n" + ready + f"data: {frag}\n\n" + finish
+
+
+async def test_stream_degenerate_repeat_aborts_and_stops_upstream():
+    """A runaway calls-container repeat must abort the stream, not run to limit."""
+    acct = FakeAccount([_degen_sse()])
+    acct.client.stop_stream = AsyncMock()
+    args = _args(acct)
+    args["tool_mode"] = True
+    args["tool_schemas"] = {}
+    gen = _stream_openai(**args)
+    lines = list(await _collect(gen))
+    assert any(line.startswith("data: ") for line in lines)
+    # The stream was cut short and the upstream stop was requested.
+    acct.client.stop_stream.assert_awaited()
 
 
 def test_model_type_mapping():

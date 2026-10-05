@@ -159,6 +159,16 @@ class Settings:
         # enabled, only replies the classifier judged json_malformed are retried.
         self.toolcall_retry = os.environ.get("DANYAPI_TOOLCALL_RETRY", "").strip().lower() in ("1", "true", "yes", "on")
 
+        # Abort a DeepSeek stream that has collapsed into runaway repetition of
+        # the empty DSML ``calls`` container (a long multi-call turn can lose EOS
+        # and repeat it hundreds of times until the output limit). The valid call
+        # payload, if any, is already in the buffer, so the tail is pure waste.
+        # On by default: the signal is structural (dozens of bare containers),
+        # not probabilistic, so a legitimate answer is never truncated. Set to 0
+        # to only log the condition without aborting.
+        self.degenerate_guard = os.environ.get("DANYAPI_DEGENERATE_GUARD", "1").strip().lower() not in ("0", "false", "no", "off")
+        self.degenerate_threshold = self._int_env("DANYAPI_DEGENERATE_THRESHOLD", 20, minimum=2)
+
         # Per-turn thinking: when the client sends neither `thinking` nor
         # `reasoning_effort`, decide the flag from the turn itself instead of the
         # provider default. Off by default so existing clients keep their exact

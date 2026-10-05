@@ -80,11 +80,14 @@ def _summary(merged: dict[str, dict]) -> None:
     parse_results: Counter[str] = Counter()
     issue_counter: Counter[str] = Counter()
     model_counter: Counter[str] = Counter()
+    degen_models: Counter[str] = Counter()
     tool_names_seen: set[str] = set()
     for r in merged.values():
         res = r.get("parse.result")
         if res:
             parse_results[res.split(":")[0]] += 1  # ok / unparsed / no_tool_call ...
+        if res == "degenerate_repeat":
+            degen_models[r.get("client.model") or r.get("dany.model") or "?"] += 1
         issue = r.get("parse.issue") or ""
         if issue and not str(issue).startswith(("no", "none")):
             # Aggregate by the leading token of each comma-separated issue entry.
@@ -115,6 +118,12 @@ def _summary(merged: dict[str, dict]) -> None:
             print(f"  {k:<28}: {n}")
     else:
         print("\nno issues recorded")
+    if degen_models:
+        total_degen = sum(degen_models.values())
+        print(f"\ndegenerate repeats (aborted runaway calls-container loops): {total_degen}")
+        for k, n in degen_models.most_common():
+            print(f"  {k:<32}: {n}")
+        print("  hint: long multi-call turns can lose EOS and repeat the empty DSML container; Dany aborts the stream (DANYAPI_DEGENERATE_GUARD).")
     if model_counter:
         print("\nmodels:")
         for k, n in model_counter.most_common():

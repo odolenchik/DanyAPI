@@ -170,6 +170,25 @@ def test_toolcall_retry_enabled_variants(settings_for, value):
     assert settings_for({"DANYAPI_TOOLCALL_RETRY": value}).toolcall_retry is True
 
 
+def test_degenerate_guard_on_by_default(settings_for):
+    assert settings_for({}).degenerate_guard is True
+    assert settings_for({"DANYAPI_DEGENERATE_GUARD": ""}).degenerate_guard is True
+    assert settings_for({"DANYAPI_DEGENERATE_GUARD": "1"}).degenerate_guard is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "OFF"])
+def test_degenerate_guard_disabled_variants(settings_for, value):
+    assert settings_for({"DANYAPI_DEGENERATE_GUARD": value}).degenerate_guard is False
+
+
+def test_degenerate_threshold_default_and_parse(settings_for):
+    assert settings_for({}).degenerate_threshold == 20
+    assert settings_for({"DANYAPI_DEGENERATE_THRESHOLD": "35"}).degenerate_threshold == 35
+    # Non-numeric falls back to the default; below-minimum is clamped to 2.
+    assert settings_for({"DANYAPI_DEGENERATE_THRESHOLD": "abc"}).degenerate_threshold == 20
+    assert settings_for({"DANYAPI_DEGENERATE_THRESHOLD": "0"}).degenerate_threshold == 2
+
+
 def test_thinking_heuristic_off_by_default(settings_for):
     assert settings_for({}).thinking_heuristic is False
     assert settings_for({"DANYAPI_THINKING_HEURISTIC": ""}).thinking_heuristic is False
