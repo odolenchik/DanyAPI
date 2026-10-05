@@ -219,8 +219,6 @@ class QwenClient:
         meta: dict = {"subChatType": chat_type}
         if image_model:
             meta["model"] = image_model
-            if image_size:
-                meta["size"] = image_size
         message = {
             "id": None,
             "fid": user_fid,
@@ -252,6 +250,11 @@ class QwenClient:
             "messages": [message],
             "timestamp": ts,
         }
+        # Qwen reads the image aspect ratio from the TOP level of the body, not
+        # from extra.meta: verified live - size at the top level makes 2:3 give
+        # 1696x2528, while the same value in meta.size is ignored (2048x2048).
+        if image_size:
+            body["size"] = image_size
         headers = {
             "Accept": "text/event-stream",
             "X-Accel-Buffering": "no",

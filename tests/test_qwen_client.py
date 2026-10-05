@@ -241,6 +241,47 @@ async def test_completion_builds_request():
     assert kwargs["json"]["model"] == "m"
 
 
+async def test_completion_puts_image_size_at_top_level():
+    """Aspect ratio goes at the TOP level of the body, not into extra.meta.
+
+    Verified live: size in extra.meta is ignored by Qwen (2048x2048 square),
+    while the same value at the top level yields the requested ratio.
+    """
+    client = QwenClient()
+    sent = SimpleNamespace(status_code=200)
+    client.http.build_request = MagicMock(return_value=object())
+    client.http.send = AsyncMock(return_value=sent)
+
+    await client.completion(
+        "chat1",
+        "hi",
+        "p1",
+        "m",
+        chat_type="t2i",
+        image_model="qwen-image-3.0-pro",
+        image_size="2:3",
+    )
+
+    _, kwargs = client.http.build_request.call_args
+    body = kwargs["json"]
+    assert body["size"] == "2:3"
+    meta = body["messages"][0]["extra"]["meta"]
+    assert "size" not in meta
+    assert meta["model"] == "qwen-image-3.0-pro"
+
+
+async def test_completion_omits_size_when_unset():
+    client = QwenClient()
+    sent = SimpleNamespace(status_code=200)
+    client.http.build_request = MagicMock(return_value=object())
+    client.http.send = AsyncMock(return_value=sent)
+
+    await client.completion("chat1", "hi", "p1", "m")
+
+    _, kwargs = client.http.build_request.call_args
+    assert "size" not in kwargs["json"]
+
+
 async def test_stop_stream():
     client = QwenClient()
     resp = SimpleNamespace(status_code=200, headers={"content-type": "application/json"})
