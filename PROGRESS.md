@@ -2,6 +2,25 @@
 
 ## Готово
 
+- **Картинки Qwen: `size` уходит на верхний уровень тела запроса.** Прежний код
+  клал соотношение в `extra.meta.size`, и Qwen его игнорировал: на `2:3`
+  возвращался квадрат 2048×2048. Проверено вживую — то же значение на верхнем
+  уровне, `body["size"]`, даёт запрошенные 1696×2528. `meta["size"]` убран.
+  Тесты: `tests/test_qwen_client.py` — `test_completion_puts_image_size_at_top_level`
+  (значение на верхнем уровне, в `meta` его нет) и
+  `test_completion_omits_size_when_unset` (поле не появляется, когда размер не
+  задан). Верификация: `ruff check` + `ruff format --check` + `pytest -q` →
+  1258 passed, `arch-check` OK. Коммит `6551b05`. Живой процесс на порту 8000 не
+  перезапускался: правка вступит в силу после рестарта.
+- **`deepseek-v4-pro` (expert) принимает изображения.** Прежде expert отклонял
+  любые вложения (`deepseek-v4-pro does not support file attachments`), теперь
+  принимает картинки — та же проверка, что у vision. Добавлен
+  `MODEL_NAME_BY_TYPE` (`danyapi/api/models.py`), имя модели в тексте ошибки
+  берётся из него, а не хардкодится. Тесты: `tests/test_retry.py` —
+  `test_pro_rejects_all_files` переименован в `test_pro_rejects_text_files`,
+  добавлен `test_pro_accepts_images`. Верификация: `ruff check` +
+  `ruff format --check` + `pytest -q` → 1258 passed, `arch-check` OK. Коммит
+  `059dfed`.
 - **Соотношения 2:3 и 3:2 для картинок Qwen (пины Pinterest).** `QWEN_IMAGE_RATIOS`
   (`danyapi/api/openai.py`) знал только `1:1`, `3:4`, `4:3`, `16:9`, `9:16`,
   поэтому запрос `size=1024x1536` (2:3) уезжал в ближайшее `3:4`: модель рисовала
@@ -639,14 +658,13 @@
 
 ## Текущий commit
 
-В работе (не закоммичено): тесты автовыбора thinking по сложности хода
-(`tests/test_thinking_heuristic.py`, +6 в `tests/test_config.py`); см. «Готово»
-выше. Рабочая копия `/home/odolen/ssd_new/DanyAPI2` — без `.git`, коммит не
-делается.
+Рабочее дерево чистое, всё закоммичено. Копии `DanyAPI2` и `DanyAPI3` — без
+`.git`, они приведены к коду `DanyAPI` (различаются только `.env`, логами и
+прочим локальным состоянием).
 
-Последний коммит: `test: add targeted coverage suites and a CLAUDE.md agent guide`
-(`3568633`). До него: `feat(sessions): reattach lost chats and pin one chat per image model`
-(`33ad32b`).
+Последний коммит: `feat(images): accept image attachments for deepseek-v4-pro (expert)`
+(`059dfed`). До него: `fix(images): send Qwen image size at the top level of the body`
+(`6551b05`), `fix(images): accept 2:3 and 3:2 aspect ratios for Qwen` (`f98dc51`).
 
 Следующее: добить покрытие до 100% для CI-гейта — начать с `api/streaming.py`
 (см. «Известные проблемы»).
