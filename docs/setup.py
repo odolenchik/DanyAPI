@@ -22,7 +22,7 @@ DS_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, li
 DS_HEADERS = {
     "x-client-bundle-id": "com.deepseek.chat",
     "x-client-platform": "web",
-    "x-client-version": "2.3.0",
+    "x-client-version": "2.5.0",
     "x-client-locale": "en-US",
     "x-client-timezone-offset": "0",
 }
@@ -34,7 +34,7 @@ QWEN_HEADERS = {
     "Origin": "https://chat.qwen.ai",
     "Referer": "https://chat.qwen.ai/",
     "source": "web",
-    "version": "0.2.83",
+    "version": "0.3.12",
     "sec-ch-ua": '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',

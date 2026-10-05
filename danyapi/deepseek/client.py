@@ -14,7 +14,7 @@ BASE_URL = "https://chat.deepseek.com"
 CLIENT_HEADERS = {
     "x-client-bundle-id": "com.deepseek.chat",
     "x-client-platform": "web",
-    "x-client-version": "2.3.0",
+    "x-client-version": "2.5.0",
     "x-client-locale": "en-US",
     "x-client-timezone-offset": "0",
 }
