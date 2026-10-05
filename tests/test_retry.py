@@ -493,7 +493,7 @@ async def test_search_gated_to_flash_and_thinking_allowed():
         openai_mod._collect_non_stream = orig
 
 
-def test_pro_rejects_all_files():
+def test_pro_rejects_text_files():
     from danyapi.api.openai import Attachment, _validate_attachments
 
     with pytest.raises(Exception) as excinfo:
@@ -501,6 +501,12 @@ def test_pro_rejects_all_files():
     exc = excinfo.value
     assert isinstance(exc, openai_mod.HTTPException)
     assert exc.status_code == 400
+
+
+def test_pro_accepts_images():
+    from danyapi.api.openai import Attachment, _validate_attachments
+
+    _validate_attachments([Attachment(b"x", "a.png", "image/png", True)], "expert")
 
 
 def test_vision_rejects_text_files():

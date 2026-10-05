@@ -7,7 +7,7 @@ from fastapi import HTTPException
 
 from ..deepseek.client import DeepSeekError
 from .deepseek import _deepseek_error_detail, _deepseek_status, _handle_account_error
-from .models import ChatCompletionRequest
+from .models import MODEL_NAME_BY_TYPE, ChatCompletionRequest
 
 MAX_FILES_PER_REQUEST = 50
 MAX_FILE_SIZE = 100 * 1024 * 1024
@@ -87,10 +87,8 @@ def _validate_attachments(attachments: list[Attachment], model_type: str) -> Non
     for att in attachments:
         if len(att.data) > MAX_FILE_SIZE:
             raise HTTPException(400, f"file {att.name} exceeds 100 MB limit")
-    if model_type == "expert":
-        raise HTTPException(400, "deepseek-v4-pro does not support file attachments")
-    if model_type == "vision" and any(not att.is_image for att in attachments):
-        raise HTTPException(400, "deepseek-v4-vision accepts images only")
+    if model_type in ("expert", "vision") and any(not att.is_image for att in attachments):
+        raise HTTPException(400, f"{MODEL_NAME_BY_TYPE[model_type]} accepts images only")
 
 
 async def _fresh_pow_upload_headers(account) -> dict:

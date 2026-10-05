@@ -13,6 +13,8 @@ MODEL_TYPE_BY_NAME = {
     "deepseek-v4-vision": "vision",
 }
 
+MODEL_NAME_BY_TYPE = {model_type: name for name, model_type in MODEL_TYPE_BY_NAME.items()}
+
 QWEN_DEFAULT_MODELS = [
     {
         "id": "qwen3.8-max",
