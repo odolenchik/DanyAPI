@@ -34,7 +34,7 @@ QWEN_HEADERS = {
     "Origin": "https://chat.qwen.ai",
     "Referer": "https://chat.qwen.ai/",
     "source": "web",
-    "version": "0.3.12",
+    "version": "0.2.83",
     "sec-ch-ua": '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
