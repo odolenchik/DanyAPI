@@ -35,12 +35,15 @@ def _page_stub() -> MagicMock:
     page.reload = AsyncMock()
     page.on = MagicMock()
     page.remove_listener = MagicMock()
+    page.keyboard = MagicMock()
+    page.keyboard.press = AsyncMock()
     waiter = MagicMock()
     waiter.wait_for = AsyncMock()
     waiter.fill = AsyncMock()
     waiter.click = AsyncMock()
     locator = MagicMock()
     locator.first = waiter
+    locator.count = AsyncMock(return_value=0)
     page.locator = MagicMock(return_value=locator)
     return page
 
@@ -110,6 +113,85 @@ def test_page_property_exposes_underlying_page():
     page = _page_stub()
     browser._page = page
     assert browser.page is page
+
+
+# ---------------------------------------------------------------------------
+# _dismiss_modals()
+# ---------------------------------------------------------------------------
+
+
+def _page_with_overlays(counts):
+    """Page stub whose ``locator(overlay).count()`` walks ``counts`` in order."""
+    page = _page_stub()
+    seq = list(counts)
+    page.locator.return_value.count = AsyncMock(side_effect=lambda: seq.pop(0) if seq else 0)
+    return page
+
+
+@pytest.mark.asyncio
+async def test_dismiss_modals_without_page_is_false():
+    browser = ZaiBrowser(token="")
+
+    assert await browser._dismiss_modals() is False
+
+
+@pytest.mark.asyncio
+async def test_dismiss_modals_no_overlay_is_false():
+    page = _page_with_overlays([0])
+    browser = _armed_browser(page)
+
+    assert await browser._dismiss_modals() is False
+    page.keyboard.press.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dismiss_modals_escape_clears_overlay():
+    page = _page_with_overlays([1, 0])
+    browser = _armed_browser(page)
+
+    assert await browser._dismiss_modals() is True
+    page.keyboard.press.assert_awaited_once_with("Escape")
+    page.evaluate.assert_not_awaited()  # Escape sufficed, no DOM surgery
+
+
+@pytest.mark.asyncio
+async def test_dismiss_modals_falls_back_to_removing_nodes():
+    page = _page_with_overlays([1, 1])
+    browser = _armed_browser(page)
+
+    assert await browser._dismiss_modals() is True
+    page.keyboard.press.assert_awaited_once_with("Escape")
+    page.evaluate.assert_awaited_once()
+    assert "modal-overlay" in page.evaluate.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_dismiss_modals_treats_count_failure_as_no_modal():
+    page = _page_stub()
+    page.locator.return_value.count = AsyncMock(side_effect=RuntimeError("gone"))
+    browser = _armed_browser(page)
+
+    assert await browser._dismiss_modals() is False
+
+
+@pytest.mark.asyncio
+async def test_dismiss_modals_survives_escape_failure():
+    page = _page_with_overlays([1])
+    page.keyboard.press = AsyncMock(side_effect=RuntimeError("no keyboard"))
+    browser = _armed_browser(page)
+
+    assert await browser._dismiss_modals() is True
+    # Escape raised -> count treated as still blocking -> DOM removal attempted.
+    page.evaluate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dismiss_modals_swallows_removal_failure():
+    page = _page_with_overlays([1, 1])
+    page.evaluate = AsyncMock(side_effect=RuntimeError("blocked"))
+    browser = _armed_browser(page)
+
+    assert await browser._dismiss_modals() is True
 
 
 # ---------------------------------------------------------------------------

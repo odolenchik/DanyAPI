@@ -43,6 +43,14 @@ STREAM_POLL_SEC = 0.5
 MODEL_BUTTON_PREFIX = "model-selector-"
 MODEL_MENU = "[role='menu']"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+# Onboarding / "model upgraded" modals ship with their own full-screen backdrop
+# that sits above the composer and swallows pointer events: while it is open a
+# submit click silently does nothing. The overlay also covers its own close
+# button, so the modal is dismissed with Escape (falling back to removing the
+# overlay node when Escape does not clear it).
+MODAL_OVERLAY = "div[data-dialog-overlay], ._modal-overlay"
+REMOVE_MODALS_JS = "() => { document.querySelectorAll('div[data-dialog-overlay], ._modal-overlay').forEach(e => e.remove()); }"
+MODAL_SETTLE_MS = 300
 
 
 class ZaiBrowserError(Exception):
@@ -197,6 +205,41 @@ class ZaiBrowser:
     def page(self) -> Page | None:
         return self._page
 
+    async def _dismiss_modals(self) -> bool:
+        """Close any onboarding / "model upgraded" modal blocking the composer.
+
+        These popups render a full-screen backdrop above the page and swallow
+        pointer events, so an open modal turns ``fill`` + ``click`` into silent
+        no-ops. The backdrop also covers the modal's own close button, hence
+        Escape first and a DOM removal as the fallback. Returns ``True`` when
+        something was dismissed.
+        """
+        page = self._page
+        if page is None:
+            return False
+        try:
+            count = await page.locator(MODAL_OVERLAY).count()
+        except Exception:
+            return False
+        if not count:
+            return False
+        log.info("zai modal detected (%d overlay(s)), dismissing", count)
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(MODAL_SETTLE_MS)
+            count = await page.locator(MODAL_OVERLAY).count()
+        except Exception:
+            # Escape failed, so nothing can be assumed about the overlay: still
+            # try the DOM removal below.
+            count = 1
+        if count:
+            try:
+                await page.evaluate(REMOVE_MODALS_JS)
+                await page.wait_for_timeout(MODAL_SETTLE_MS)
+            except Exception:
+                pass
+        return True
+
     async def _select_model(self, model_id: str) -> None:
         """Bind ``model_id`` to the browser, switching between requests.
 
@@ -219,6 +262,7 @@ class ZaiBrowser:
             spec.wire,
         )
         await page.goto("https://chat.z.ai/", wait_until="domcontentloaded")
+        await self._dismiss_modals()
         await page.locator(TEXTAREA).first.wait_for(state="visible", timeout=30_000)
         self._model_wire = spec.wire
         log.info("zai model selected: %s (wire=%s)", spec.label, spec.wire)
@@ -276,6 +320,9 @@ class ZaiBrowser:
                 await self._page.wait_for_timeout(8000)
             except Exception:
                 pass
+        # A first-run onboarding / "model upgraded" modal can cover the composer;
+        # clear it before waiting for the textarea (and before every later send).
+        await self._dismiss_modals()
         # Generous timeout: first run the user must complete OAuth login manually.
         await self._page.locator(TEXTAREA).first.wait_for(state="visible", timeout=120_000)
         self._started = True
@@ -312,6 +359,9 @@ class ZaiBrowser:
 
             self._page.on("response", on_response)
             try:
+                # The model may already be bound, in which case no navigation
+                # happened and a modal could still be covering the composer.
+                await self._dismiss_modals()
                 await self._page.locator(TEXTAREA).first.fill(prompt)
                 await self._page.locator(SUBMIT).first.click()
                 deadline = asyncio.get_event_loop().time() + self._timeout
@@ -344,6 +394,9 @@ class ZaiBrowser:
             queue: asyncio.Queue[str] = asyncio.Queue()
             self._stream_queue = queue
             try:
+                # The model may already be bound, in which case no navigation
+                # happened and a modal could still be covering the composer.
+                await self._dismiss_modals()
                 await page.locator(TEXTAREA).first.fill(prompt)
                 await page.locator(SUBMIT).first.click()
                 loop = asyncio.get_running_loop()

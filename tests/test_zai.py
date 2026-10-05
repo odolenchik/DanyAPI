@@ -232,10 +232,14 @@ def _page_stub():
     page = MagicMock()
     page.evaluate = AsyncMock()
     page.goto = AsyncMock()
+    page.wait_for_timeout = AsyncMock()
+    page.keyboard = MagicMock()
+    page.keyboard.press = AsyncMock()
     waiter = MagicMock()
     waiter.wait_for = AsyncMock()
     locator = MagicMock()
     locator.first = waiter
+    locator.count = AsyncMock(return_value=0)
     page.locator = MagicMock(return_value=locator)
     return page
 
