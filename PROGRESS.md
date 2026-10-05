@@ -2,6 +2,29 @@
 
 ## Готово
 
+- **Актуализация трёх веб-фронтов (deepseek / qwen / z.ai).** Сверено вживую
+  (curl + Playwright, включая скриншоты UI z.ai);
+  - `danyapi/deepseek/client.py` — `x-client-version` `2.3.0` → `2.5.0`
+    (текущее значение шлёт сам chat.deepseek.com).
+  - `danyapi/qwen/client.py` — `WEB_VERSION` `0.2.83` → `0.3.12` (заголовок
+    `version`; бандл `.../qwen-chat-fe/0.3.12/js/main.js` отдаётся 200).
+  - `danyapi/zai/browser.py` — новый `_dismiss_modals()`: онбординг/«model
+    upgraded» модалка z.ai рисует полноэкранный бэкдроп выше композера и
+    глотает клики (submit молча не срабатывает), при этом накрывает собственную
+    кнопку закрытия — поэтому Escape, а при неудаче удаление узла оверлея
+    (`div[data-dialog-overlay], ._modal-overlay`). Вызывается в `start()`,
+    `_select_model()` и перед каждым `fill`+`click` в `complete()` /
+    `complete_stream()` (модель может быть уже выбрана — тогда навигации нет).
+  - `docs/setup.py`, `docs/internals.html`, `docs/i18n.js` — версии приведены
+    в соответствие.
+  - z.ai: `GLM-5.2` в реестр **не** добавлялся (по решению владельца);
+    `ZAI_BROWSER_DIR` не трогался — сеанс z.ai предполагается один.
+  - Тесты: `tests/test_zai_browser_coverage.py` — 7 кейсов на `_dismiss_modals`
+    (нет страницы, нет оверлея, Escape сработал, откат к удалению узлов, сбой
+    подсчёта, сбой Escape, сбой удаления); `zai/browser.py` — 100%.
+  - Верификация: `ruff check` + `ruff format --check` + `arch-check` + `pytest -q`
+    → 1265 passed. E2E вживую: `ZaiBrowser.complete()` на копии профиля вернул
+    `pong` (usage 35), в логе `zai modal detected (1 overlay(s)), dismissing`.
 - **Картинки Qwen: `size` уходит на верхний уровень тела запроса.** Прежний код
   клал соотношение в `extra.meta.size`, и Qwen его игнорировал: на `2:3`
   возвращался квадрат 2048×2048. Проверено вживую — то же значение на верхнем
@@ -658,12 +681,12 @@
 
 ## Текущий commit
 
-Рабочее дерево чистое, всё закоммичено. Копии `DanyAPI2` и `DanyAPI3` — без
-`.git`, они приведены к коду `DanyAPI` (различаются только `.env`, логами и
-прочим локальным состоянием).
+Копии `DanyAPI2` и `DanyAPI3` — без `.git`; `DanyAPI2` намеренно оставлен как
+есть (там работает сервер на :9000, код актуализации в него не переносился).
 
-Последний коммит: `feat(images): accept image attachments for deepseek-v4-pro (expert)`
-(`059dfed`). До него: `fix(images): send Qwen image size at the top level of the body`
+Последний коммит: `chore(providers): sync live frontend versions and clear z.ai modals`
+(см. `git log -1`). До него: `feat(images): accept image attachments for deepseek-v4-pro (expert)`
+(`059dfed`), `fix(images): send Qwen image size at the top level of the body`
 (`6551b05`), `fix(images): accept 2:3 and 3:2 aspect ratios for Qwen` (`f98dc51`).
 
 Следующее: добить покрытие до 100% для CI-гейта — начать с `api/streaming.py`
