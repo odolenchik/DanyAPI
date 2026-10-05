@@ -2,15 +2,41 @@
 
 ## Готово
 
+- **Миграция Qwen на фронтенд 0.3.12 (новая схема авторизации).** Сделана как
+  отдельная фича после отката; схема разобрана вживую и проверена E2E.
+  - Суть: `0.3.12` больше не принимает статичный токен как bearer. Рабочий
+    `access_token` (~15 мин) получают обменом credential'а через
+    `GET https://auth.qwen.ai/api/v2/auths/refresh`. Отдельный auth-хост,
+    пути без `/api/v1`.
+  - `danyapi/qwen/client.py` — `WEB_VERSION` → `0.3.12`; добавлены
+    `AUTH_URL`, `jwt_claims()`, `token_is_expired()`, `new_auth_client()`,
+    `refresh_access_token()`, `ensure_access_token()`. Credential уходит
+    cookie с именем по типу токена (`refresh_token` для refresh-токена,
+    `token` для legacy) — `_source_cookie_name`. Обязательные заголовки
+    `timezone` (иначе `Invalid request header`) и
+    `x-request-origin` (иначе `Missing origin`). `_post`/`_get` идут через
+    новый `_send`: refresh по `exp` с запасом 60 с и ретрай один раз на 401;
+    `completion()` (стрим) делает то же для `build_request`.
+  - `login()` переведён на `auth.qwen.ai` и принимает
+    `refresh_token`/`access_token`/`token`.
+  - `docs/setup.py`, `docs/internals.html`, `docs/i18n.js` — версия и описание
+    auth-потока обновлены.
+  - Тесты: `tests/test_qwen_client.py` переписан под новую схему (+33 кейса) —
+    refresh, имя cookie по типу, обязательные заголовки, ретрай на 401,
+    single-flight по лок-ре-чеку; `qwen/client.py` — 100%.
+  - Верификация: `ruff check` + `ruff format --check` + `arch-check` +
+    `pytest -q` → 1290 passed. E2E вживую с refresh-токеном: chat создан,
+    `POST /api/v2/chat/completions` → 200, `pong` получен.
+  - **Внимание по credential'ам:** legacy-токены из `.env` дают 200 на
+    `0.2.83`, но как источник refresh на `0.3.12` отвечают
+    `Token is revoked`. Нужен именно `refresh_token`. Подробности — в
+    «Провал при актуализации» ниже.
 - **Актуализация трёх веб-фронтов (deepseek / qwen / z.ai).** Сверено вживую
   (curl + Playwright, включая скриншоты UI z.ai);
   - `danyapi/deepseek/client.py` — `x-client-version` `2.3.0` → `2.5.0`
     (текущее значение шлёт сам chat.deepseek.com).
-  - `danyapi/qwen/client.py` — `WEB_VERSION` **оставлен `0.2.83`**. Подъём до
-    `0.3.12` откачен: с ним Qwen отдаёт 401 на живых токенах (граница между
-    `0.2.99` и `0.3.0`), потому что `0.3.12` перешёл на новую схему авторизации
-    (`auth.qwen.ai`, типизированные access/refresh-токены). Вынесено отдельной
-    задачей в `BACKLOG.md`. См. также «Провал при актуализации» ниже.
+  - `danyapi/qwen/client.py` — `WEB_VERSION` был поднят до `0.3.12` без
+    проверки токенов и откачен, затем переведён по-настоящему (см. выше).
   - `danyapi/zai/browser.py` — новый `_dismiss_modals()`: онбординг/«model
     upgraded» модалка z.ai рисует полноэкранный бэкдроп выше композера и
     глотает клики (submit молча не срабатывает), при этом накрывает собственную
@@ -689,8 +715,15 @@
 Живые токены (legacy 209 б, refresh 297 б) на `0.3.12` дают 401 оба. Дело не в
 токенах — `0.3.12` требует новой схемы авторизации.
 
-**Исправлено:** `WEB_VERSION` возвращён на `0.2.83` (в коде и в docs).
-DeepSeek `2.5.0` оставлен — проверено, что работает и с `2.3.0`, и с `2.5.0`.
+**Как исправлено:** сначала `WEB_VERSION` возвращён на `0.2.83`, затем сделана
+настоящая миграция на `0.3.12` (см. «Готово» выше) — с разбором новой схемы
+и E2E-проверкой. DeepSeek `2.5.0` оставлен — проверено, что работает и с
+`2.3.0`, и с `2.5.0`.
+
+**Что важно знать про credential'ы.** Legacy-токены из `.env` на `0.2.83`
+дают `200`, но как источник refresh на `0.3.12` отвечают `Token is revoked`.
+Рабочий источник — `refresh_token` (cookie `refresh_token`, ~30 дней).
+Его и нужно класть в `QWEN_TOKENS`.
 
 **Урок:** подстановка значения, подсмотренного у живого фронта, — это гипотеза,
 а не факт. Критерий «фронт так делает» недостаточен; нужна проверка «наш токен
@@ -707,11 +740,12 @@ DeepSeek `2.5.0` оставлен — проверено, что работае�
 
 ## Текущий commit
 
-Копии `DanyAPI2` и `DanyAPI3` — без `.git`; `DanyAPI2` намеренно оставлен как
-есть (там работает сервер на :9000, код актуализации в него не переносился).
+Копии `DanyAPI2` и `DanyAPI3` — без `.git`; при синхронизации кода их надо
+приводить к `DanyAPI` вручную (`.env` у каждого свой и не трогается).
 
-Последний коммит: `chore(providers): sync live frontend versions and clear z.ai modals`
-(см. `git log -1`). До него: `feat(images): accept image attachments for deepseek-v4-pro (expert)`
+Последний коммит: см. `git log -1`. До него: `fix(qwen): revert WEB_VERSION to 0.2.83`
+и `chore(providers): sync web client versions with the live frontends`;
+ранее `feat(images): accept image attachments for deepseek-v4-pro (expert)`
 (`059dfed`), `fix(images): send Qwen image size at the top level of the body`
 (`6551b05`), `fix(images): accept 2:3 and 3:2 aspect ratios for Qwen` (`f98dc51`).
 
