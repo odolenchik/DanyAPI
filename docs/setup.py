@@ -1,3 +1,4 @@
+import base64
 import datetime
 import getpass
 import hashlib
@@ -28,13 +29,16 @@ DS_HEADERS = {
 }
 
 QWEN_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+# Frontend 0.3.12 authenticates against its own host, outside /api/v1.
+QWEN_AUTH_HOST = "https://auth.qwen.ai"
 QWEN_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://chat.qwen.ai",
     "Referer": "https://chat.qwen.ai/",
     "source": "web",
-    "version": "0.2.83",
+    "version": "0.3.12",
+    "x-request-origin": "https://chat.qwen.ai",
     "sec-ch-ua": '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
@@ -261,22 +265,46 @@ def check_deepseek_login(email, password):
         return False, f"unexpected response: {body[:200]}"
 
 
+def _qwen_cookie_name(credential):
+    """Cookie the refresh endpoint expects: refresh_token for a refresh token,
+    token for a legacy session token (verified live: mixing them is rejected)."""
+    parts = credential.split(".")
+    if len(parts) == 3:
+        try:
+            payload = parts[1] + "=" * (-len(parts[1]) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            if isinstance(claims, dict) and claims.get("type") == "refresh_token":
+                return "refresh_token"
+        except (ValueError, TypeError):
+            pass
+    return "token"
+
+
 def check_qwen_token(token):
-    status, body = _request("https://chat.qwen.ai/api/v1/auths/", _qwen_headers(token))
-    if status != 200:
-        return False, f"http {status}: {body[:200]}"
+    """Validate a credential by exchanging it for an access token.
+
+    With frontend 0.3.12 the stored value is a refresh source, not a bearer
+    token, so the only meaningful check is that ``auth.qwen.ai`` accepts it.
+    """
+    headers = _qwen_headers()
+    headers["Cookie"] = f"{_qwen_cookie_name(token)}={token}"
+    status, body = _request(f"{QWEN_AUTH_HOST}/api/v2/auths/refresh", headers)
+    if status is None:
+        return False, f"network error: {body}"
     try:
         payload = json.loads(body)
-        if payload.get("success") is True:
-            return True, ""
-        return False, "server rejected the token"
     except ValueError:
         return False, f"unexpected response: {body[:200]}"
+    if payload.get("success") is True and (payload.get("data") or {}).get("access_token"):
+        return True, ""
+    data = payload.get("data")
+    detail = (data or {}).get("details") or (data or {}).get("code") or "server rejected the token"
+    return False, str(detail)
 
 
 def check_qwen_login(email, password):
     payload = {"email": email, "password": hashlib.sha256(password.encode("utf-8")).hexdigest()}
-    status, body = _request("https://chat.qwen.ai/api/v2/auths/signin", _qwen_headers(), payload)
+    status, body = _request(f"{QWEN_AUTH_HOST}/api/v2/auths/signin", _qwen_headers(), payload)
     if status is None:
         return False, f"network error: {body}"
     try:
@@ -287,7 +315,7 @@ def check_qwen_login(email, password):
                 return False, f"code {data.get('code')}: {data.get('details') or data.get('message') or ''}"
             return False, "login failed"
         biz = resp.get("data") or {}
-        token = biz.get("token") or (biz.get("user") or {}).get("token")
+        token = biz.get("refresh_token") or biz.get("access_token") or biz.get("token") or (biz.get("user") or {}).get("token")
         return bool(token), "login failed: no token in response"
     except ValueError:
         return False, f"unexpected response: {body[:200]}"

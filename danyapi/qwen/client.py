@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import datetime
 import hashlib
+import json
 import logging
 import time
 import uuid
@@ -12,8 +15,15 @@ import httpx
 log = logging.getLogger("danyapi.qwen")
 
 BASE_URL = "https://chat.qwen.ai"
+# Frontend 0.3.12 moved authentication off chat.qwen.ai onto its own host, and
+# its endpoints live outside /api/v1 (the bundle calls this ``nonV1APi``).
+AUTH_URL = "https://auth.qwen.ai"
 
-WEB_VERSION = "0.2.83"
+WEB_VERSION = "0.3.12"
+
+# Refresh the access token this many seconds before it actually expires, so a
+# request that is about to start never races the deadline.
+REFRESH_MARGIN_SEC = 60.0
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
 
@@ -44,6 +54,43 @@ def timezone_header() -> str:
     return f"{now.strftime('%a %b %d %Y %H:%M:%S')} GMT{offset}"
 
 
+def jwt_claims(token: str | None) -> dict:
+    """Decode a JWT payload without verifying the signature.
+
+    Used only to read ``type``/``exp`` metadata for the refresh flow, never for
+    trust decisions. Returns ``{}`` for anything that is not a decodable JWT.
+    """
+    if not token:
+        return {}
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {}
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def token_is_expired(token: str | None, margin: float = 0.0) -> bool:
+    """True when the token's ``exp`` is in the past (or within ``margin``)."""
+    exp = jwt_claims(token).get("exp")
+    if not isinstance(exp, (int, float)):
+        return False
+    return time.time() >= float(exp) - margin
+
+
+def new_auth_client(timeout: float) -> httpx.AsyncClient:
+    """Build the client used against ``auth.qwen.ai``.
+
+    Auth lives on its own host and must not inherit the chat client's base_url,
+    cookies or Authorization header, so it gets a fresh client. Kept as a
+    module-level factory so tests can substitute a fake.
+    """
+    return httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+
+
 @dataclass
 class QwenSession:
     id: str
@@ -70,24 +117,90 @@ class QwenClient:
         token: str | None = None,
         timeout: float = 60.0,
     ) -> None:
+        # ``token`` is the credential from the environment. With frontend
+        # 0.3.12 it may be either a ``refresh_token`` (preferred) or a legacy
+        # session token; both are exchanged for a short-lived access token via
+        # ``auth.qwen.ai``. The raw value is kept because the refresh flow needs
+        # it on every call.
         self.token = token
+        self._access_token: str | None = None
+        self._refresh_lock = asyncio.Lock()
         headers = {
             "User-Agent": USER_AGENT,
             **COMMON_HEADERS,
         }
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
         self.http = httpx.AsyncClient(
             base_url=BASE_URL,
             headers=headers,
             timeout=httpx.Timeout(timeout),
             follow_redirects=True,
         )
-        if token:
-            self.http.cookies.set("token", token, domain="chat.qwen.ai", path="/")
 
     async def aclose(self) -> None:
         await self.http.aclose()
+
+    @property
+    def _source_cookie_name(self) -> str:
+        """Cookie the refresh endpoint expects for the configured credential.
+
+        A ``refresh_token`` must be sent as the ``refresh_token`` cookie; a
+        legacy session token only works as ``token``. Verified live: mixing the
+        two names is rejected.
+        """
+        if jwt_claims(self.token).get("type") == "refresh_token":
+            return "refresh_token"
+        return "token"
+
+    def _apply_access_token(self, access_token: str) -> None:
+        self._access_token = access_token
+        self.http.headers["Authorization"] = f"Bearer {access_token}"
+        self.http.cookies.set("token", access_token, domain="chat.qwen.ai", path="/")
+
+    async def refresh_access_token(self) -> str:
+        """Exchange the configured credential for a fresh access token.
+
+        Calls ``GET https://auth.qwen.ai/api/v2/auths/refresh``. The ``timezone``
+        header is mandatory there (its absence yields ``Invalid request header``)
+        and the request must look like it comes from chat.qwen.ai, hence
+        ``x-request-origin``.
+        """
+        if not self.token:
+            raise QwenError(-1, "no qwen credential configured")
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": BASE_URL + "/",
+            "source": "web",
+            "version": WEB_VERSION,
+            "x-request-origin": BASE_URL,
+            "Timezone": timezone_header(),
+            "X-Request-Id": new_uuid(),
+        }
+        cookies = {self._source_cookie_name: self.token}
+        async with new_auth_client(self.http.timeout) as client:
+            resp = await client.get(f"{AUTH_URL}/api/v2/auths/refresh", headers=headers, cookies=cookies)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise QwenError(-1, f"invalid JSON from auth refresh: {resp.text[:200]}") from exc
+        biz = self._biz(payload)
+        access_token = biz.get("access_token")
+        if not access_token:
+            raise QwenError(-1, "auth refresh returned no access_token")
+        self._apply_access_token(access_token)
+        log.info("qwen access token refreshed (expires in %ss)", jwt_claims(access_token).get("exp", 0) - int(time.time()))
+        return access_token
+
+    async def ensure_access_token(self) -> str:
+        """Return a usable access token, refreshing when missing or near expiry."""
+        if self._access_token and not token_is_expired(self._access_token, REFRESH_MARGIN_SEC):
+            return self._access_token
+        async with self._refresh_lock:
+            # Another coroutine may have refreshed while we waited for the lock.
+            if self._access_token and not token_is_expired(self._access_token, REFRESH_MARGIN_SEC):
+                return self._access_token
+            return await self.refresh_access_token()
 
     @staticmethod
     def _request_headers(headers: dict | None = None) -> dict:
@@ -119,16 +232,44 @@ class QwenClient:
             raise QwenError(-1, f"invalid JSON from {path}") from exc
         return self._biz(payload)
 
+    async def _send(
+        self,
+        method: str,
+        path: str,
+        json_body: dict | None = None,
+        params: dict | None = None,
+        headers: dict | None = None,
+    ) -> httpx.Response:
+        """Send a JSON API request with a valid access token.
+
+        Refreshes proactively when the token is missing or near expiry, and once
+        reactively on 401: a token can be revoked server-side well before its
+        ``exp``, so expiry alone is not a reliable signal.
+        """
+        await self.ensure_access_token()
+        resp = await self.http.request(method, path, json=json_body, params=params, headers=self._request_headers(headers))
+        if resp.status_code == 401:
+            await self.refresh_access_token()
+            resp = await self.http.request(method, path, json=json_body, params=params, headers=self._request_headers(headers))
+        return resp
+
     async def _post(self, path: str, json_body: dict | None = None, params: dict | None = None, headers: dict | None = None) -> dict:
-        resp = await self.http.post(path, json=json_body, params=params, headers=self._request_headers(headers))
+        resp = await self._send("POST", path, json_body=json_body, params=params, headers=headers)
         return self._parse_json(resp, path)
 
     async def _get(self, path: str, params: dict | None = None, headers: dict | None = None) -> dict:
-        resp = await self.http.get(path, params=params, headers=self._request_headers(headers))
+        resp = await self._send("GET", path, params=params, headers=headers)
         return self._parse_json(resp, path)
 
     async def check_auth(self) -> bool:
+        """Report whether the configured credential still yields a session.
+
+        With 0.3.12 the credential is a refresh source, so this proves it is
+        usable by actually minting an access token from it; a stored access
+        token is never taken at face value.
+        """
         try:
+            await self.ensure_access_token()
             resp = await self.http.get("/api/v1/auths/", headers=self._request_headers())
             if resp.status_code != 200:
                 return False
@@ -141,23 +282,47 @@ class QwenClient:
             if isinstance(nested, dict) and nested.get("id"):
                 return True
             return bool(payload.get("id"))
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError, QwenError):
             return False
 
     async def login(self, email: str, password: str) -> str:
-        resp = await self.http.post(
-            "/api/v2/auths/signin",
-            json={"email": email, "password": sha256_hex(password)},
-            headers=self._request_headers(),
-        )
-        biz = self._parse_json(resp, "/api/v2/auths/signin")
-        token = biz.get("token") or (biz.get("user") or {}).get("token")
-        if not token:
+        """Sign in with credentials and adopt the returned session credential.
+
+        Note: the sign-in response shape for the 0.3.12 auth host could not be
+        verified live (no throwaway account), so both the access and refresh
+        fields are accepted and the credential is then exercised through the
+        normal refresh path before anything relies on it.
+        """
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": BASE_URL + "/",
+            "source": "web",
+            "version": WEB_VERSION,
+            "x-request-origin": BASE_URL,
+            "Timezone": timezone_header(),
+            "X-Request-Id": new_uuid(),
+        }
+        async with new_auth_client(self.http.timeout) as client:
+            resp = await client.post(
+                f"{AUTH_URL}/api/v2/auths/signin",
+                json={"email": email, "password": sha256_hex(password)},
+                headers=headers,
+            )
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise QwenError(-1, f"invalid JSON from signin: {resp.text[:200]}") from exc
+        biz = self._biz(payload)
+        credential = biz.get("refresh_token") or biz.get("access_token") or biz.get("token") or (biz.get("user") or {}).get("token")
+        if not credential:
             raise QwenError(-1, "login failed: no token in response")
-        self.token = token
-        self.http.headers["Authorization"] = f"Bearer {token}"
-        self.http.cookies.set("token", token, domain="chat.qwen.ai", path="/")
-        return token
+        self.token = credential
+        self._access_token = biz.get("access_token") or None
+        if self._access_token:
+            self._apply_access_token(self._access_token)
+        return credential
 
     async def fetch_models(self) -> list[dict]:
         biz = await self._get("/api/v2/models/")
@@ -260,6 +425,7 @@ class QwenClient:
             "X-Accel-Buffering": "no",
             "Referer": f"{BASE_URL}/c/{chat_session_id}",
         }
+        await self.ensure_access_token()
         req = self.http.build_request(
             "POST",
             "/api/v2/chat/completions",
@@ -267,7 +433,21 @@ class QwenClient:
             json=body,
             headers=self._request_headers(headers),
         )
-        return await self.http.send(req, stream=True)
+        resp = await self.http.send(req, stream=True)
+        if resp.status_code == 401:
+            # A revoked-but-not-yet-expired token only shows up here; refresh and
+            # retry once so the caller sees a normal stream instead of a 401.
+            await resp.aclose()
+            await self.refresh_access_token()
+            req = self.http.build_request(
+                "POST",
+                "/api/v2/chat/completions",
+                params={"chat_id": chat_session_id},
+                json=body,
+                headers=self._request_headers(headers),
+            )
+            resp = await self.http.send(req, stream=True)
+        return resp
 
     async def stop_stream(self, chat_session_id: str, response_id: str | None) -> None:
         await self._post(
