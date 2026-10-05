@@ -7,6 +7,7 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from danyapi.qwen.client import (
@@ -585,3 +586,93 @@ async def test_ensure_access_token_rechecks_after_waiting_for_lock(monkeypatch):
 
     assert await task == "refreshed-elsewhere"
     fake.get.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# last_auth_error
+# ---------------------------------------------------------------------------
+
+
+async def test_refresh_records_auth_error(monkeypatch):
+    fake = _FakeAuthClient(get_response=_json_resp({"success": False, "data": {"code": "Unauthorized", "details": "Token is revoked, please login again."}}))
+    _patch_auth(monkeypatch, fake)
+    client = QwenClient(token="cred")
+    with pytest.raises(QwenError):
+        await client.refresh_access_token()
+    assert client.last_auth_error
+    assert "Token is revoked" in client.last_auth_error
+    await client.aclose()
+
+
+async def test_refresh_records_transport_error(monkeypatch):
+    fake = _FakeAuthClient()
+    fake.get = AsyncMock(side_effect=httpx.ConnectError("boom"))
+    _patch_auth(monkeypatch, fake)
+    client = QwenClient(token="cred")
+    with pytest.raises(httpx.HTTPError):
+        await client.refresh_access_token()
+    assert client.last_auth_error
+    assert "transport error" in client.last_auth_error
+    await client.aclose()
+
+
+async def test_refresh_clears_auth_error_on_success(monkeypatch):
+    fake = _FakeAuthClient(get_response=_json_resp({"success": True, "data": {"access_token": "fresh"}}))
+    _patch_auth(monkeypatch, fake)
+    client = QwenClient(token="cred")
+    client._last_error = "stale"
+    assert await client.refresh_access_token() == "fresh"
+    assert client.last_auth_error is None
+    await client.aclose()
+
+
+async def test_check_auth_records_status_reason():
+    client = _client()
+    resp = SimpleNamespace(status_code=403)
+    resp.json = MagicMock(return_value={"success": False})
+    client.http.get = AsyncMock(return_value=resp)
+    assert not await client.check_auth()
+    assert client.last_auth_error
+    assert "403" in client.last_auth_error
+    await client.aclose()
+
+
+async def test_check_auth_records_missing_identity_reason():
+    client = _client()
+    resp = SimpleNamespace(status_code=200)
+    resp.json = MagicMock(return_value={"detail": "not signed in"})
+    client.http.get = AsyncMock(return_value=resp)
+    assert not await client.check_auth()
+    assert client.last_auth_error
+    await client.aclose()
+
+
+async def test_check_auth_records_transport_error():
+    client = _client()
+    client.http.get = AsyncMock(side_effect=httpx.ConnectError("boom"))
+    assert not await client.check_auth()
+    assert client.last_auth_error
+    assert "ConnectError" in client.last_auth_error
+    await client.aclose()
+
+
+async def test_check_auth_records_json_error():
+    client = _client()
+    resp = SimpleNamespace(status_code=200)
+    resp.json = MagicMock(side_effect=ValueError("bad json"))
+    client.http.get = AsyncMock(return_value=resp)
+    assert not await client.check_auth()
+    assert client.last_auth_error
+    assert "ValueError" in client.last_auth_error
+    await client.aclose()
+
+
+async def test_check_auth_clears_reason_on_success():
+    client = _client()
+    resp = SimpleNamespace(status_code=200)
+    resp.json = MagicMock(return_value={"success": True})
+    client.http.get = AsyncMock(return_value=resp)
+    client._last_error = "old"
+    assert await client.check_auth()
+    assert client.last_auth_error is None
+    await client.aclose()

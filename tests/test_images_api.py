@@ -49,12 +49,15 @@ def clean_state():
     saved = (
         getattr(app.state, "qwen_pool", None),
         getattr(app.state, "http_client", None),
+        getattr(app.state, "qwen_disabled_reason", None),
     )
     app.state.qwen_pool = None
+    app.state.qwen_disabled_reason = ""
     if hasattr(app.state, "http_client"):
         delattr(app.state, "http_client")
     yield
     app.state.qwen_pool = saved[0]
+    app.state.qwen_disabled_reason = saved[2]
     if saved[1] is None:
         if hasattr(app.state, "http_client"):
             delattr(app.state, "http_client")
@@ -67,6 +70,16 @@ def test_generations_without_pool_returns_503():
     resp = client.post("/v1/images/generations", json={"model": "qwen-image-gen", "prompt": "a cat"})
     client.close()
     assert resp.status_code == 503
+
+
+def test_generations_without_pool_reports_reason():
+    app.state.qwen_pool = None
+    app.state.qwen_disabled_reason = "all 1 configured token(s) rejected: Unauthorized: Token is revoked, please login again."
+    client = TestClient(app)
+    resp = client.post("/v1/images/generations", json={"model": "qwen-image-gen", "prompt": "a cat"})
+    client.close()
+    assert resp.status_code == 503
+    assert "Token is revoked" in resp.json()["detail"]
 
 
 def test_edits_without_pool_returns_503():

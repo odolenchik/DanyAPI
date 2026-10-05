@@ -2,6 +2,16 @@
 
 ## Готово
 
+- **Qwen: причина отказа токена теперь видна.** Старт молча выкидывал отклонённый
+  credential и отдавал наружу только `qwen provider is not configured`, так что
+  отозванный refresh-токен выглядел как «протух за пару часов».
+  - `danyapi/qwen/client.py` — `QwenClient` запоминает причину последнего сбоя
+    (`_last_error`, property `last_auth_error`); успех её очищает.
+  - `danyapi/api/openai.py` — лог отказа токена содержит причину, при отказе всех
+    токенов пишется `log.error` и `app.state.qwen_disabled_reason`; 503 для chat и
+    images добавляет причину к тексту.
+  - Тесты: `tests/test_qwen_client.py` (+8), `tests/test_api_helpers.py`,
+    `tests/test_images_api.py`.
 - **Миграция Qwen на фронтенд 0.3.12 (новая схема авторизации).** Сделана как
   отдельная фича после отката; схема разобрана вживую и проверена E2E.
   - Суть: `0.3.12` больше не принимает статичный токен как bearer. Рабочий

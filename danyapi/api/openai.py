@@ -64,6 +64,7 @@ async def lifespan(app: FastAPI):
     qwen_affinity_store = JsonStore("qwen-affinities", "default" if cache_enabled else None)
     qwen_sticky_store = JsonStore("qwen-sticky", "default" if cache_enabled else None)
     try:
+        qwen_disabled_reason = ""
         if settings.deepseek_tokens:
             for i, token in enumerate(settings.deepseek_tokens):
                 client = DeepSeekClient(token=token, timeout=settings.timeout)
@@ -94,10 +95,13 @@ async def lifespan(app: FastAPI):
             accounts.append(DeepSeekAccount(0, client))
             log.info("deepseek login ok, device_id=%s", client.device_id)
         if settings.qwen_tokens:
+            rejected: list[str] = []
             for i, token in enumerate(settings.qwen_tokens):
                 client = QwenClient(token=token, timeout=settings.timeout)
                 if not await client.check_auth():
-                    log.warning("qwen token #%d invalid/expired, skipping", i)
+                    reason = client.last_auth_error or "invalid/expired"
+                    rejected.append(reason)
+                    log.warning("qwen token #%d rejected: %s", i, reason)
                     await client.aclose()
                     continue
                 qwen_accounts.append(
@@ -110,6 +114,9 @@ async def lifespan(app: FastAPI):
                         sticky_store=qwen_sticky_store,
                     )
                 )
+            if rejected and not qwen_accounts:
+                qwen_disabled_reason = f"all {len(rejected)} configured token(s) rejected: {rejected[0]}"
+                log.error("qwen provider disabled: %s", qwen_disabled_reason)
             log.info("qwen accounts ready: %d", len(qwen_accounts))
         elif settings.qwen_email:
             client = QwenClient(timeout=settings.timeout)
@@ -139,9 +146,11 @@ async def lifespan(app: FastAPI):
                 affinity_store=qwen_affinity_store,
             )
             app.state.qwen_models = await _fetch_qwen_models(qwen_accounts[0].client)
+            app.state.qwen_disabled_reason = ""
         else:
             app.state.qwen_pool = None
             app.state.qwen_models = []
+            app.state.qwen_disabled_reason = qwen_disabled_reason
         if settings.zai_enabled:
             zai_browser = ZaiBrowser(
                 token=settings.zai_tokens[0] if settings.zai_tokens else "",
@@ -304,10 +313,20 @@ def _image_edit_req(prompt: str, image_md: str, mask_md: str | None) -> str:
     return "\n".join(parts)
 
 
+def _qwen_disabled_suffix() -> str:
+    """Reason the qwen pool is missing, appended to the 503 detail.
+
+    Startup records why every configured qwen credential was dropped, so a
+    "not configured" response can name the actual cause (e.g. a revoked token).
+    """
+    reason = getattr(app.state, "qwen_disabled_reason", "") or ""
+    return f": {reason}" if reason else ""
+
+
 async def _image_pool(request: Request) -> AccountPool:
     pool: AccountPool | None = getattr(app.state, "qwen_pool", None)
     if pool is None:
-        raise HTTPException(503, "qwen provider is not configured (required for image generation)")
+        raise HTTPException(503, "qwen provider is not configured (required for image generation)" + _qwen_disabled_suffix())
     return pool
 
 
@@ -780,7 +799,7 @@ async def _chat_completions_deepseek(req: ChatCompletionRequest) -> Any:
 async def _chat_completions_qwen(req: ChatCompletionRequest) -> Any:
     pool: AccountPool = app.state.qwen_pool
     if pool is None:
-        raise HTTPException(503, "qwen provider is not configured")
+        raise HTTPException(503, "qwen provider is not configured" + _qwen_disabled_suffix())
 
     request_id = uuid.uuid4().hex
     trace = _trace_client_event(req, request_id)

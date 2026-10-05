@@ -124,6 +124,9 @@ class QwenClient:
         # it on every call.
         self.token = token
         self._access_token: str | None = None
+        # Reason the most recent auth attempt failed (None after a success), so
+        # startup can report *why* a credential was skipped.
+        self._last_error: str | None = None
         self._refresh_lock = asyncio.Lock()
         headers = {
             "User-Agent": USER_AGENT,
@@ -156,6 +159,16 @@ class QwenClient:
         self.http.headers["Authorization"] = f"Bearer {access_token}"
         self.http.cookies.set("token", access_token, domain="chat.qwen.ai", path="/")
 
+    @property
+    def last_auth_error(self) -> str | None:
+        """Human-readable reason the last auth attempt failed (None on success).
+
+        ``refresh_access_token`` and ``check_auth`` record the failure here so
+        startup can say why a credential was rejected instead of a bare
+        "invalid/expired".
+        """
+        return self._last_error
+
     async def refresh_access_token(self) -> str:
         """Exchange the configured credential for a fresh access token.
 
@@ -165,6 +178,7 @@ class QwenClient:
         ``x-request-origin``.
         """
         if not self.token:
+            self._last_error = "no qwen credential configured"
             raise QwenError(-1, "no qwen credential configured")
         headers = {
             "User-Agent": USER_AGENT,
@@ -178,17 +192,25 @@ class QwenClient:
             "X-Request-Id": new_uuid(),
         }
         cookies = {self._source_cookie_name: self.token}
-        async with new_auth_client(self.http.timeout) as client:
-            resp = await client.get(f"{AUTH_URL}/api/v2/auths/refresh", headers=headers, cookies=cookies)
         try:
-            payload = resp.json()
-        except ValueError as exc:
-            raise QwenError(-1, f"invalid JSON from auth refresh: {resp.text[:200]}") from exc
-        biz = self._biz(payload)
-        access_token = biz.get("access_token")
-        if not access_token:
-            raise QwenError(-1, "auth refresh returned no access_token")
+            async with new_auth_client(self.http.timeout) as client:
+                resp = await client.get(f"{AUTH_URL}/api/v2/auths/refresh", headers=headers, cookies=cookies)
+            try:
+                payload = resp.json()
+            except ValueError as exc:
+                raise QwenError(-1, f"invalid JSON from auth refresh: {resp.text[:200]}") from exc
+            biz = self._biz(payload)
+            access_token = biz.get("access_token")
+            if not access_token:
+                raise QwenError(-1, "auth refresh returned no access_token")
+        except QwenError as exc:
+            self._last_error = f"{exc.code}: {exc.message}"
+            raise
+        except httpx.HTTPError as exc:
+            self._last_error = f"transport error: {exc}"
+            raise
         self._apply_access_token(access_token)
+        self._last_error = None
         log.info("qwen access token refreshed (expires in %ss)", jwt_claims(access_token).get("exp", 0) - int(time.time()))
         return access_token
 
@@ -266,23 +288,30 @@ class QwenClient:
 
         With 0.3.12 the credential is a refresh source, so this proves it is
         usable by actually minting an access token from it; a stored access
-        token is never taken at face value.
+        token is never taken at face value. On failure the reason is recorded in
+        ``last_auth_error`` so startup can report it.
         """
         try:
             await self.ensure_access_token()
             resp = await self.http.get("/api/v1/auths/", headers=self._request_headers())
             if resp.status_code != 200:
+                self._last_error = f"/api/v1/auths/ returned {resp.status_code}"
                 return False
             payload = resp.json()
             if not isinstance(payload, dict):
+                self._last_error = "/api/v1/auths/ returned a non-object payload"
                 return False
-            if payload.get("success") is True:
-                return True
             nested = payload.get("data")
-            if isinstance(nested, dict) and nested.get("id"):
+            if payload.get("success") is True or (isinstance(nested, dict) and nested.get("id")) or payload.get("id"):
+                self._last_error = None
                 return True
-            return bool(payload.get("id"))
-        except (httpx.HTTPError, ValueError, QwenError):
+            self._last_error = "auth profile carries no identity"
+            return False
+        except QwenError as exc:
+            self._last_error = f"{exc.code}: {exc.message}"
+            return False
+        except (httpx.HTTPError, ValueError) as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
             return False
 
     async def login(self, email: str, password: str) -> str:

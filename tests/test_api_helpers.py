@@ -44,12 +44,18 @@ CTX_SSE = (
 
 @pytest.fixture(autouse=True)
 def clean_state():
-    saved = (getattr(app.state, "pool", None), getattr(app.state, "qwen_pool", None), getattr(app.state, "qwen_models", None))
+    saved = (
+        getattr(app.state, "pool", None),
+        getattr(app.state, "qwen_pool", None),
+        getattr(app.state, "qwen_models", None),
+        getattr(app.state, "qwen_disabled_reason", None),
+    )
     app.state.pool = None
     app.state.qwen_pool = None
     app.state.qwen_models = []
+    app.state.qwen_disabled_reason = ""
     yield
-    app.state.pool, app.state.qwen_pool, app.state.qwen_models = saved
+    app.state.pool, app.state.qwen_pool, app.state.qwen_models, app.state.qwen_disabled_reason = saved
 
 
 @pytest.fixture
@@ -58,6 +64,7 @@ def reset_app_state():
     app.state.pool = None
     app.state.qwen_pool = None
     app.state.qwen_models = []
+    app.state.qwen_disabled_reason = ""
 
 
 class FakeSession:
@@ -702,6 +709,19 @@ def test_chat_qwen_not_configured():
     resp = client.post("/v1/chat/completions", json={"model": "qwen3.8-max", "messages": [{"role": "user", "content": "hi"}]})
     client.close()
     assert resp.status_code == 503
+
+
+def test_qwen_unconfigured_reports_reason():
+    app.state.qwen_pool = None
+    app.state.qwen_disabled_reason = "all 1 configured token(s) rejected: Unauthorized: Token is revoked, please login again."
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen3.8-max", "messages": [{"role": "user", "content": "hi"}], "stream": False},
+    )
+    client.close()
+    assert resp.status_code == 503
+    assert "Token is revoked" in resp.json()["detail"]
 
 
 def test_chat_deepseek_non_stream():
