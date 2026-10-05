@@ -1017,6 +1017,59 @@ def _repair_dsml_separator(text: str) -> str:
     )
 
 
+# Glued DSML invoke opener (tooltrace 797cd20e, fa460fef, c24d8828): DeepSeek closes
+# the invoke name with a DSML marker before the ``>`` (the opener reads
+# "invoke name=X" immediately followed by another DSML marker and then ">") instead
+# of the canonical "invoke name=X>". _DSML_INVOKE_RE wants whitespace or ``>`` directly
+# after the quoted name, so the marker in between makes the opener invisible to every
+# DSML branch and the whole block lands as unparsed. Normalise it to the canonical
+# opener; the extra marker carries no information (the name is already in the tag).
+_DSML_GLUED_INVOKE_RE = re.compile(
+    rf"(<{_DSML_SEP}\s*DSML\s*{_DSML_SEP}\s*invoke\s+name=(?P<q>['\"])[^'\">]+(?P=q))"
+    rf"\s*{_DSML_SEP}\s*DSML\s*{_DSML_SEP}\s*>",
+    re.IGNORECASE,
+)
+
+
+def _repair_dsml_glued_invoke(text: str) -> str:
+    """Drop the stray DSML marker glued between an invoke name and its ``>``."""
+    if "invoke" not in text:
+        return text
+    return _DSML_GLUED_INVOKE_RE.sub(lambda m: m.group(1) + ">", text)
+
+
+# Bare arguments carrier (tooltrace 797cd20e, fa460fef, 86931c23): instead of one
+# ``<parameter name="...">`` per argument, DeepSeek emits a single tag whose name is
+# the ``arguments`` attribute (not ``parameter name=``) and whose quoted value is the
+# escaped JSON object of the real arguments. Every DSML branch keys on the
+# ``parameter name=`` spelling, so an ``arguments=`` attribute is invisible and the call
+# is dropped. Rewrite it to the canonical parameter form; the existing DSML param path
+# decodes it and _unwrap_nested_arguments later flattens the "arguments" wrapper into
+# real keys.
+_DSML_BARE_ARGUMENTS_RE = re.compile(
+    rf"<{_DSML_SEP}\s*DSML\s*{_DSML_SEP}\s*arguments\s*=\s*(?P<q>['\"])(?P<val>(?:\\.|(?!\1).)*?)(?P=q)"
+    rf"[^>]*?{_DSML_SEP}\s*DSML\s*{_DSML_SEP}\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _repair_dsml_bare_arguments(text: str) -> str:
+    """Rewrite a bare ``arguments="<escaped json>"`` DSML tag to a canonical param tag."""
+    if "arguments" not in text:
+        return text
+
+    def _repl(m: re.Match[str]) -> str:
+        raw = m.group("val")
+        try:
+            value = json.loads('"' + raw + '"')
+        except (ValueError, TypeError):
+            value = raw.replace('\\"', '"')
+        sep = "||"
+        return f'<{sep}DSML{sep} parameter name="arguments" string="true">{value}</{sep}DSML{sep} parameter>'
+
+    return _DSML_BARE_ARGUMENTS_RE.sub(_repl, text)
+
+
 def _dsml_param_value(sstring: str | None, raw: str, json_type: Any = None) -> Any:
     """Decode a DSML parameter value using its optional string="true|false" flag.
 
@@ -1886,6 +1939,11 @@ def parse_tool_calls(text: str, tool_schemas: dict[str, dict[str, Any]] | None =
     # Normalise the malformed single-pipe DSML opener before any branch inspects
     # the text, so the canonical-format DSML parsers can handle it unchanged.
     text = _repair_dsml_separator(text)
+    # Normalise two other malformed DSML spellings that every branch keys past: a
+    # glued invoke close marker and a bare ``arguments="..."`` carrier. Both rewrite
+    # to canonical DSML tags so the normal DSML path below handles them.
+    text = _repair_dsml_glued_invoke(text)
+    text = _repair_dsml_bare_arguments(text)
     # DSML is a distinct tag format (not JSON), so parse it before the generic
     # strip/JSON path — _strip_dsml would otherwise discard the tags and their attrs.
     dsml_calls, dsml_wrapper = _parse_dsml(text, tool_schemas)

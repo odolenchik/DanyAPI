@@ -3574,6 +3574,81 @@ def test_dsml_shared_close_three_fused_params():
     assert isinstance(args["head_limit"], int) and not isinstance(args["head_limit"], bool)
 
 
+def test_dsml_glued_invoke_marker_before_gt_is_repaired():
+    """An invoke opener whose name is followed by a stray DSML marker before '>'.
+
+    tooltrace 797cd20e / fa460fef / c24d8828: DeepSeek closes the opener with an
+    extra marker (``...name="X" <marker> >``) instead of a bare ``>``, hiding the
+    whole block from every DSML branch. The call must still be recovered.
+    """
+    S = "\uff5c\uff5c"  # DSML separator
+    text = (
+        f'<{S}DSML{S}invoke name="TodoList"{S}DSML{S}>'
+        f'<{S}DSML{S}parameter name="todos" string="false">'
+        '[{"title": "t", "status": "done"}]'
+        f"</{S}DSML{S}parameter>"
+        f"</{S}DSML{S}invoke>"
+    )
+    parsed = parse_tool_calls(text, {"TodoList": {"todos": "array"}})
+    assert parsed is not None
+    calls, _ = parsed
+    assert len(calls) == 1
+    assert calls[0].name == "TodoList"
+    args = json.loads(calls[0].arguments)
+    assert args["todos"] == [{"title": "t", "status": "done"}]
+
+
+def test_dsml_bare_arguments_attribute_is_repaired():
+    """A bare ``arguments="<escaped json>"`` DSML tag must be decoded into real args.
+
+    tooltrace 797cd20e / f9f81609 / 86931c23: instead of one ``<parameter>`` per
+    argument, DeepSeek emits a single tag named ``arguments`` whose quoted value is
+    the escaped JSON object. The wrapper is flattened into the real parameters.
+    """
+    S = "\uff5c\uff5c"  # DSML separator
+    inner = '{\\"active_only\\": false, \\"limit\\": 10}'
+    text = f'<{S}DSML{S}invoke name="TaskList"{S}DSML{S}><{S}DSML{S}arguments="{inner}"{S}DSML{S}></{S}DSML{S}calls>'
+    parsed = parse_tool_calls(text, {"TaskList": {"active_only": "boolean", "limit": "integer"}})
+    assert parsed is not None
+    calls, _ = parsed
+    assert len(calls) == 1
+    assert calls[0].name == "TaskList"
+    args = json.loads(calls[0].arguments)
+    assert args == {"active_only": False, "limit": 10}
+
+
+def test_dsml_bare_arguments_single_line_real_trace():
+    """Full shape from the log: glued opener + bare arguments + </calls>."""
+    S = "\uff5c\uff5c"  # DSML separator
+    inner = '{\\"path\\": \\"/tmp/x.py\\", \\"line_offset\\": 135, \\"n_lines\\": 70}'
+    text = f'<{S}DSML{S}calls><{S}DSML{S}invoke name="Read"{S}DSML{S}><{S}DSML{S}arguments="{inner}"{S}DSML{S}></{S}DSML{S}calls>'
+    parsed = parse_tool_calls(text, {"Read": {"path": "string", "line_offset": "integer", "n_lines": "integer"}})
+    assert parsed is not None
+    calls, _ = parsed
+    assert len(calls) == 1
+    assert calls[0].name == "Read"
+    args = json.loads(calls[0].arguments)
+    assert args == {"path": "/tmp/x.py", "line_offset": 135, "n_lines": 70}
+
+
+def test_dsml_bare_arguments_unescaped_falls_back():
+    """A bare arguments value that is not valid JSON-escaped still decodes.
+
+    When the quoted attribute cannot be wrapped as a JSON string (embedded
+    unescaped quotes), _repair_dsml_bare_arguments falls back to a plain
+    backslash-unescape instead of dropping the call.
+    """
+    S = "\uff5c\uff5c"  # DSML separator
+    inner = '{"path": "/a/b.py", "n": 1}'
+    text = f"<{S}DSML{S}invoke name=\"Read\"{S}DSML{S}><{S}DSML{S}arguments='{inner}'{S}DSML{S}></{S}DSML{S}invoke>"
+    parsed = parse_tool_calls(text, {"Read": {"path": "string", "n": "integer"}})
+    assert parsed is not None
+    calls, _ = parsed
+    assert len(calls) == 1
+    args = json.loads(calls[0].arguments)
+    assert args == {"path": "/a/b.py", "n": 1}
+
+
 def test_extract_system_skips_ephemeral_reminder():
     """A client-injected <system-reminder> must not become the system prompt."""
     messages = [

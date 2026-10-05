@@ -119,6 +119,17 @@ PY
      (`sleep 120"`). `_DSML_PARAM_OPENER_RE` требует `parameter name=`, поэтому
      такие теги невидимы. Матчит `_DSML_PARAM_EQ_OPENER_RE`; висячая кавычка
      срезается (`_parse_dsml_param_only`, tooltrace `32629734`).
+   - **Маркер, вклеенный в invoke-opener перед `>`**: имя закрывается лишним DSML-маркером —
+     `invoke name="X"` + маркер + `>` вместо канонического `invoke name="X">`.
+     `_DSML_INVOKE_RE` ждёт пробел или `>` сразу после имени, поэтому весь блок
+     невидим всем DSML-веткам. Нормализует `_repair_dsml_glued_invoke` (tooltrace
+     `797cd20e`, `fa460fef`, `c24d8828`).
+   - **Голый `arguments="<json>"`**: вместо `parameter name=...` на каждый аргумент
+     DeepSeek шлёт один тег с атрибутом `arguments`, чьё значение — escaped-JSON объект
+     реальных аргументов. Все DSML-ветки ключуются на `parameter name=`, поэтому тег
+     невидим. Переписывает в канонический param-тег `_repair_dsml_bare_arguments`, а
+     `_unwrap_nested_arguments` затем разворачивает обёртку в реальные ключи (tooltrace
+     `797cd20e`, `f9f81609`, `86931c23`, `fa460fef`).
    - **Порча валидных `\\`-пар**: старый `_fix_invalid_escapes` матчил второй бэкслеш в `\\|`/`\\(`
      и делал `Invalid \escape` → переписан на посимвольный проход (см. `parse.py`).
 
