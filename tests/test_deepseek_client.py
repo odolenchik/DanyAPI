@@ -7,6 +7,7 @@ import pytest
 
 from danyapi.deepseek.client import (
     CLIENT_HEADERS,
+    AuthCheck,
     DeepSeekClient,
     DeepSeekError,
     DeepSeekSession,
@@ -121,22 +122,32 @@ async def test_check_auth_ok():
     resp = make_resp({"code": 0})
     client.http.get = AsyncMock(return_value=resp)
 
-    assert await client.check_auth()
+    assert await client.check_auth() is AuthCheck.OK
 
 
-async def test_check_auth_bad_code():
+async def test_check_auth_rejected_on_bad_code():
     client = make_client()
     resp = make_resp({"code": 500})
     client.http.get = AsyncMock(return_value=resp)
 
-    assert not await client.check_auth()
+    assert await client.check_auth() is AuthCheck.REJECTED
 
 
-async def test_check_auth_exception():
+async def test_check_auth_unreachable_on_transport_error():
     client = make_client()
     client.http.get = AsyncMock(side_effect=httpx.ConnectError("boom"))
 
-    assert not await client.check_auth()
+    assert await client.check_auth() is AuthCheck.UNREACHABLE
+
+
+async def test_check_auth_unreachable_on_bad_json():
+    # A non-JSON body means no usable answer, not a refused token.
+    client = make_client()
+    resp = make_resp(status=200)
+    resp.json = MagicMock(side_effect=ValueError("bad"))
+    client.http.get = AsyncMock(return_value=resp)
+
+    assert await client.check_auth() is AuthCheck.UNREACHABLE
 
 
 async def test_login_sets_token():

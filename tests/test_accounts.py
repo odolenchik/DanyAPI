@@ -438,6 +438,45 @@ def test_mark_broken_idempotent():
     assert a0.label == "acct#0"
 
 
+def test_mark_broken_stamps_time_once():
+    a0 = make_acct(0)
+    assert a0.broken_at is None
+    a0.mark_broken()
+    first = a0.broken_at
+    assert first is not None
+    # Idempotent: a second mark must not move the timestamp.
+    a0.mark_broken()
+    assert a0.broken_at == first
+
+
+def test_revive_returns_account_to_rotation():
+    a0 = make_acct(0)
+    a0.mark_broken()
+    assert not a0.is_available()
+    a0.revive()
+    assert a0.is_available()
+    assert a0.broken_at is None
+    assert a0.last_revive_at is None
+
+
+def test_revive_is_noop_on_healthy_account():
+    a0 = make_acct(0)
+    a0.revive()
+    assert a0.is_available()
+    assert a0.broken_at is None
+
+
+async def test_revived_account_serves_again():
+    a0 = make_acct(0)
+    pool = AccountPool([a0])
+    a0.mark_broken()
+    with pytest.raises(RuntimeError):
+        await pool.acquire(None)
+    a0.revive()
+    acct, _ = await pool.acquire(None)
+    assert acct is a0
+
+
 def test_resolve_routes_to_owner():
     a0, a1 = make_acct(0), make_acct(1)
     pool = AccountPool([a0, a1])

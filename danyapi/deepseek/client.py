@@ -4,6 +4,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
+from enum import Enum
 
 import httpx
 
@@ -35,6 +36,19 @@ class DeepSeekSession:
     accounted_tokens: int = 0
     reattached: bool = False
     extra: dict = field(default_factory=dict)
+
+
+class AuthCheck(Enum):
+    """Outcome of a credential probe.
+
+    A transport failure must never be mistaken for a rejected token: the
+    account would be dropped for the rest of the process lifetime even though
+    the credential is fine and only the network was down.
+    """
+
+    OK = "ok"  # token accepted
+    REJECTED = "rejected"  # DeepSeek answered and refused the token
+    UNREACHABLE = "unreachable"  # no usable answer: network, timeout, bad JSON
 
 
 class DeepSeekError(Exception):
@@ -93,15 +107,19 @@ class DeepSeekClient:
             raise DeepSeekError(data["biz_code"], data.get("biz_msg", ""))
         return data.get("biz_data") or {}
 
-    async def check_auth(self) -> bool:
+    async def check_auth(self) -> AuthCheck:
         try:
             resp = await self.http.get(
                 "/api/v0/client/settings",
                 params={"did": self.device_id, "scope": "main"},
             )
-            return resp.json().get("code") == 0
-        except (httpx.HTTPError, ValueError):
-            return False
+        except httpx.HTTPError:
+            return AuthCheck.UNREACHABLE
+        try:
+            payload = resp.json()
+        except ValueError:
+            return AuthCheck.UNREACHABLE
+        return AuthCheck.OK if payload.get("code") == 0 else AuthCheck.REJECTED
 
     async def login(
         self,

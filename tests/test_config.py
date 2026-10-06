@@ -268,3 +268,49 @@ def test_thinking_score_floors_at_one(settings_for):
     assert s.thinking_strong_weight == 1
     assert s.thinking_weak_weight == 1
     assert s.thinking_score_threshold == 1
+
+
+def test_deepseek_revive_defaults(settings_for):
+    s = settings_for({})
+    assert s.deepseek_revive_interval == 900.0
+    assert s.deepseek_revive_slow_interval == 1800.0
+    assert s.deepseek_revive_slow_after == 7200.0
+
+
+def test_deepseek_revive_read_env(settings_for):
+    s = settings_for(
+        {
+            "DANYAPI_DEEPSEEK_REVIVE_INTERVAL": "300",
+            "DANYAPI_DEEPSEEK_REVIVE_SLOW_INTERVAL": "600",
+            "DANYAPI_DEEPSEEK_REVIVE_SLOW_AFTER": "1200",
+        }
+    )
+    assert s.deepseek_revive_interval == 300.0
+    assert s.deepseek_revive_slow_interval == 600.0
+    assert s.deepseek_revive_slow_after == 1200.0
+
+
+def test_deepseek_revive_bad_values_fall_back(settings_for):
+    s = settings_for(
+        {
+            "DANYAPI_DEEPSEEK_REVIVE_INTERVAL": "abc",
+            "DANYAPI_DEEPSEEK_REVIVE_SLOW_INTERVAL": "",
+            "DANYAPI_DEEPSEEK_REVIVE_SLOW_AFTER": "1.5.2",
+        }
+    )
+    assert s.deepseek_revive_interval == 900.0
+    assert s.deepseek_revive_slow_interval == 1800.0
+    assert s.deepseek_revive_slow_after == 7200.0
+
+
+def test_deepseek_revive_clamps_to_minimum(settings_for):
+    s = settings_for(
+        {
+            "DANYAPI_DEEPSEEK_REVIVE_INTERVAL": "0",
+            "DANYAPI_DEEPSEEK_REVIVE_SLOW_INTERVAL": "-5",
+            "DANYAPI_DEEPSEEK_REVIVE_SLOW_AFTER": "1",
+        }
+    )
+    assert s.deepseek_revive_interval == 60.0
+    assert s.deepseek_revive_slow_interval == 60.0
+    assert s.deepseek_revive_slow_after == 60.0

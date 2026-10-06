@@ -8,6 +8,19 @@ def _noop_load_dotenv(*args, **kwargs) -> bool:
     return False
 
 
+def _float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
+    """Read a float env var, falling back to ``default`` when unset or bad.
+
+    Non-numeric input never raises: an unusable value keeps the default so a
+    typo cannot take the server down. Values below ``minimum`` are clamped.
+    """
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
 try:
     from dotenv import load_dotenv
 except ImportError:
@@ -191,6 +204,16 @@ class Settings:
         self.thinking_strong_weight = self._int_env("DANYAPI_THINKING_STRONG_WEIGHT", 2, minimum=1)
         self.thinking_weak_weight = self._int_env("DANYAPI_THINKING_WEAK_WEIGHT", 1, minimum=1)
         self.thinking_score_threshold = self._int_env("DANYAPI_THINKING_SCORE_THRESHOLD", 2, minimum=1)
+
+        # Reviving DeepSeek accounts marked broken. A token is marked broken when
+        # an auth probe fails, but that can mean only the network was down. A
+        # background loop re-checks broken accounts: normally every
+        # DANYAPI_DEEPSEEK_REVIVE_INTERVAL seconds; an account broken for longer
+        # than DANYAPI_DEEPSEEK_REVIVE_SLOW_AFTER is re-checked at the slower
+        # DANYAPI_DEEPSEEK_REVIVE_SLOW_INTERVAL cadence.
+        self.deepseek_revive_interval = _float_env("DANYAPI_DEEPSEEK_REVIVE_INTERVAL", 900.0, minimum=60.0)
+        self.deepseek_revive_slow_interval = _float_env("DANYAPI_DEEPSEEK_REVIVE_SLOW_INTERVAL", 1800.0, minimum=60.0)
+        self.deepseek_revive_slow_after = _float_env("DANYAPI_DEEPSEEK_REVIVE_SLOW_AFTER", 7200.0, minimum=60.0)
 
     @staticmethod
     def _int_env(name: str, default: int, *, minimum: int = 0) -> int:

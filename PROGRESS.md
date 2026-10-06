@@ -2,6 +2,38 @@
 
 ## Готово
 
+- **DeepSeek: гонка сети на старте + оживление отвалившихся токенов.**
+  Симптом: при ребуте платы eth0 поднимается на ~4 с позже старта юнита,
+  `check_auth()` уходил в сеть, получал транспортную ошибку и токен
+  отбрасывался как «мёртвый» → `deepseek accounts ready: 0` до ручного
+  перезапуска. Причина была двойная.
+  - **Транспортная ошибка выглядела как мёртвый токен.**
+    `danyapi/deepseek/client.py`: `check_auth()` возвращал bool, ловя
+    `httpx.HTTPError` → `False`. Теперь возвращает enum `AuthCheck`
+    (`OK` / `REJECTED` / `UNREACHABLE`); битый JSON тоже `UNREACHABLE`.
+  - **Auth-ошибка убивала аккаунт навсегда.** `danyapi/accounts.py`:
+    `mark_broken()` был необратим. Добавлены `broken_at`/`last_revive_at`,
+    новый `revive()`; `is_available()` по-прежнему `not broken`, но флаг
+    снимается после успешной перепроверки.
+  - **Старт** (`danyapi/api/openai.py`): `REJECTED` больше не выбрасывается —
+    аккаунт остаётся в пуле как broken; `UNREACHABLE` даёт рабочий аккаунт
+    (оптимистично) — это и чинит гонку. Следствие: если все токены отвергнуты,
+    сервер СТАРТУЕТ, а не падает с «no valid credentials».
+  - **Фоновый цикл** `_revive_sweep`/`_revive_broken_accounts`: broken-аккаунт
+    перепроверяется каждые `DANYAPI_DEEPSEEK_REVIVE_INTERVAL` (900 с); лежащий
+    дольше `DANYAPI_DEEPSEEK_REVIVE_SLOW_AFTER` (7200 с) — раз в
+    `DANYAPI_DEEPSEEK_REVIVE_SLOW_INTERVAL` (1800 с). Минимум 60, мусор → дефолт.
+    Запускается в lifespan, отменяется в finally.
+  - **Плата:** drop-in `deploy/systemd/danyapi3.service.d/override.conf` с
+    `ExecStartPre` — ждёт реального DNS до 60 с (`exit 0` в любом случае).
+    Установлен в `/etc/systemd/system/danyapi3.service.d/`.
+  - Тесты: `test_deepseek_client.py` (enum, 4 случая), `test_accounts.py`
+    (+5), `test_config.py` (+4), новый `test_revive.py` (8), `test_api_helpers.py`
+    (`_patch_creds` мокает `AuthCheck.OK`; REJECTED/UNREACHABLE-старт).
+    Верификация: `ruff check` + `ruff format --check` + `make check` + `pytest -q`
+    → 1336 passed (во всех трёх репозиториях), py3.10 AST OK.
+    На плате 6660: `accounts ready: 1`, живой запрос 200; 8000 — живой запрос 200.
+
 - **Парсер DSML: три паттерна коверканья + защита от вырожденного повтора.**
   Из разбора `tooltrace.ndjson` (DanyAPI + DanyAPI2, ~14k upstream-событий).
   - **Вклеенный маркер в invoke-opener**: `invoke name="X"` + лишний DSML-маркер + `>`

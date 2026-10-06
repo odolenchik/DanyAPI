@@ -7,7 +7,7 @@ import math
 import re
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Any
 
 import httpx
@@ -17,7 +17,7 @@ from fastapi.responses import StreamingResponse
 from .. import tools as toolemu
 from ..accounts import AccountPool, AccountPoolBusy, DeepSeekAccount
 from ..config import settings
-from ..deepseek.client import DeepSeekClient
+from ..deepseek.client import AuthCheck, DeepSeekClient
 from ..qwen import api as qwen_api
 from ..qwen.accounts import QwenAccount
 from ..qwen.client import QwenClient, QwenError
@@ -55,6 +55,7 @@ async def lifespan(app: FastAPI):
     accounts: list[DeepSeekAccount] = []
     qwen_accounts: list[QwenAccount] = []
     zai_browser: ZaiBrowser | None = None
+    revive_task: asyncio.Task | None = None
     cache_enabled = settings.cache_enabled
     deepseek_session_store = JsonStore("deepseek-sessions", "default" if cache_enabled else None)
     qwen_session_store = JsonStore("qwen-sessions", "default" if cache_enabled else None)
@@ -68,10 +69,33 @@ async def lifespan(app: FastAPI):
         if settings.deepseek_tokens:
             for i, token in enumerate(settings.deepseek_tokens):
                 client = DeepSeekClient(token=token, timeout=settings.timeout)
-                if not await client.check_auth():
-                    log.warning("deepseek token #%d invalid/expired, skipping", i)
-                    await client.aclose()
+                status = await client.check_auth()
+                if status is AuthCheck.REJECTED:
+                    # The token was answered for and refused. Keep it in the pool
+                    # as broken rather than dropping it: the revive loop re-checks
+                    # it, and a token can be rejected transiently during an
+                    # upstream incident.
+                    log.warning("deepseek token #%d rejected, keeping as broken", i)
+                    account = DeepSeekAccount(
+                        len(accounts),
+                        client,
+                        session_cache_size=settings.session_cache_size,
+                        ttl=settings.session_ttl,
+                        store=deepseek_session_store,
+                        min_interval=settings.min_request_interval,
+                        burst=settings.request_burst,
+                        min_start_gap=settings.min_start_gap,
+                        min_end_gap=settings.min_end_gap,
+                    )
+                    account.mark_broken()
+                    accounts.append(account)
                     continue
+                # OK and UNREACHABLE both produce a working account. UNREACHABLE
+                # is optimistic on purpose: at startup the network may not be up
+                # yet (a 4 s eth0 delay is enough), and dropping the token here
+                # would leave the process with no accounts until a manual restart.
+                if status is AuthCheck.UNREACHABLE:
+                    log.warning("deepseek token #%d not reachable at startup, using anyway", i)
                 accounts.append(
                     DeepSeekAccount(
                         len(accounts),
@@ -136,6 +160,15 @@ async def lifespan(app: FastAPI):
             )
         else:
             app.state.pool = None
+        if app.state.pool is not None:
+            revive_task = asyncio.create_task(
+                _revive_broken_accounts(
+                    app.state.pool,
+                    settings.deepseek_revive_interval,
+                    settings.deepseek_revive_slow_interval,
+                    settings.deepseek_revive_slow_after,
+                )
+            )
         if qwen_accounts:
             app.state.qwen_pool = AccountPool(
                 qwen_accounts,
@@ -170,6 +203,10 @@ async def lifespan(app: FastAPI):
             app.state.usage = None
         yield
     finally:
+        if revive_task is not None:
+            revive_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await revive_task
         for acct in accounts:
             await acct.client.aclose()
         for acct in qwen_accounts:
@@ -179,6 +216,52 @@ async def lifespan(app: FastAPI):
             await http_client.aclose()
         if zai_browser is not None:
             await zai_browser.aclose()
+
+
+async def _revive_sweep(pool: AccountPool, fast: float, slow: float, slow_after: float, now: float | None = None) -> None:
+    """Probe every broken account in the pool once, reviving the ones that work.
+
+    Split out of the loop so the cadence and the per-account decision can be
+    exercised directly, without waiting on real time.
+    """
+    current = time.monotonic() if now is None else now
+    for acct in pool.accounts:
+        if acct.is_available():
+            continue
+        broken_at = getattr(acct, "broken_at", None) or current
+        last = getattr(acct, "last_revive_at", None) or 0.0
+        due = slow if (current - broken_at) > slow_after else fast
+        if current - last < due:
+            continue
+        acct.last_revive_at = current
+        try:
+            status = await acct.client.check_auth()
+        except Exception:
+            log.debug("revive probe failed for %s", acct.label, exc_info=True)
+            continue
+        if status is AuthCheck.OK:
+            acct.revive()
+
+
+async def _revive_broken_accounts(pool: AccountPool, fast: float, slow: float, slow_after: float) -> None:
+    """Re-check broken DeepSeek accounts and return working ones to rotation.
+
+    A token is marked broken on an auth error, but that error can be purely a
+    network failure. This loop probes each broken account and clears the flag
+    once ``check_auth`` reports OK, so a transient outage does not retire an
+    account until the process restarts.
+
+    Accounts are normally re-checked every ``fast`` seconds; one broken for
+    longer than ``slow_after`` is checked at the slower ``slow`` cadence, so a
+    genuinely dead token stops costing a probe every tick.
+    """
+    while True:
+        await asyncio.sleep(fast)
+        await _revive_sweep(pool, fast, slow, slow_after)
+        # Guaranteed yield point: callers (and the test suite's sleep stub) may
+        # collapse the timed sleep above, and a loop with no real await would
+        # starve the event loop.
+        await asyncio.sleep(0)
 
 
 async def _fetch_qwen_models(client: QwenClient) -> list[dict]:

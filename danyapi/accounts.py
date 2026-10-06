@@ -222,8 +222,10 @@ class DeepSeekAccount:
         "_since_gap",
         "_starts",
         "broken",
+        "broken_at",
         "client",
         "index",
+        "last_revive_at",
         "pow",
         "pow_upload",
         "sem",
@@ -249,6 +251,8 @@ class DeepSeekAccount:
         self.sem = asyncio.Semaphore(1)
         self.sessions = DeepSeekSessionRegistry(client, session_cache_size, ttl, store=store, key_prefix=f"{index}:")
         self.broken = False
+        self.broken_at: float | None = None
+        self.last_revive_at: float | None = None
         self._starts: deque[float] = deque()
         self._min_interval = max(0.0, min_interval)
         self._burst = max(1, burst)
@@ -262,10 +266,29 @@ class DeepSeekAccount:
     def mark_broken(self) -> None:
         if not self.broken:
             self.broken = True
+            self.broken_at = time.monotonic()
             log.warning("account #%d marked broken (invalid/expired token)", self.index)
 
+    def revive(self) -> None:
+        """Return a broken account to rotation after its token checked out again.
+
+        A token can be marked broken because an auth probe failed during an
+        upstream outage; the background revive loop calls this once
+        ``check_auth`` reports OK so the account is not out until restart.
+        """
+        if self.broken:
+            self.broken = False
+            self.broken_at = None
+            self.last_revive_at = None
+            log.info("account #%d revived", self.index)
+
     def is_available(self) -> bool:
-        """DeepSeek accounts are either healthy or broken forever (auth errors)."""
+        """An account is usable unless it is currently marked broken.
+
+        A broken account can come back: the revive loop clears the flag once the
+        credential verifies again, so a transient auth failure during an
+        upstream outage no longer removes the account for good.
+        """
         return not self.broken
 
     @property

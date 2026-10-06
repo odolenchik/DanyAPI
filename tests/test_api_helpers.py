@@ -819,6 +819,7 @@ def test_chat_deepseek_attachment_via_endpoint():
 def _patch_creds(ds_tokens=None, ds_email="", qwen_tokens=None, qwen_email="", cache=True):
     from contextlib import ExitStack
 
+    from danyapi.deepseek.client import AuthCheck
     from danyapi.deepseek.client import DeepSeekClient as DSC
     from danyapi.qwen.client import QwenClient as QC
 
@@ -831,7 +832,7 @@ def _patch_creds(ds_tokens=None, ds_email="", qwen_tokens=None, qwen_email="", c
         patch.object(settings, "deepseek_password", "pw"),
         patch.object(settings, "qwen_password", "pw"),
         patch.object(settings, "cache_enabled", cache),
-        patch.object(DSC, "check_auth", new=AsyncMock(return_value=True)),
+        patch.object(DSC, "check_auth", new=AsyncMock(return_value=AuthCheck.OK)),
         patch.object(QC, "check_auth", new=AsyncMock(return_value=True)),
         patch.object(QC, "fetch_models", new=AsyncMock(return_value=[{"id": "m1", "info": {"meta": {"chat_type": ["t2t"]}}}])),
         patch.object(DSC, "aclose", new=AsyncMock()),
@@ -852,7 +853,10 @@ def test_deepseek_tokens_ok():
 
 
 @pytest.mark.usefixtures("reset_app_state")
-def test_deepseek_invalid_skipped():
+def test_deepseek_rejected_kept_broken():
+    """A rejected token no longer kills the server: the pool starts with one
+    broken account, and the revive loop can bring it back."""
+    from danyapi.deepseek.client import AuthCheck
     from danyapi.deepseek.client import DeepSeekClient as DSC
 
     with (
@@ -860,14 +864,37 @@ def test_deepseek_invalid_skipped():
         patch.object(settings, "qwen_tokens", []),
         patch.object(settings, "deepseek_email", ""),
         patch.object(settings, "qwen_email", ""),
-        # z.ai is a valid credential source; disable it so this stays a
-        # "no usable credentials" test regardless of the local .env.
         patch.object(settings, "zai_enabled", False),
-        patch.object(DSC, "check_auth", new=AsyncMock(return_value=False)),
+        patch.object(DSC, "check_auth", new=AsyncMock(return_value=AuthCheck.REJECTED)),
     ):
-        with pytest.raises(RuntimeError):
-            with TestClient(app):
-                pass
+        with TestClient(app):
+            pool = app.state.pool
+            assert pool is not None
+            assert len(pool.accounts) == 1
+            assert pool.accounts[0].broken is True
+            assert pool.healthy == []
+
+
+@pytest.mark.usefixtures("reset_app_state")
+def test_deepseek_unreachable_used_optimistically():
+    """A transport failure at startup must not drop the token: the network may
+    simply not be up yet (the original startup race)."""
+    from danyapi.deepseek.client import AuthCheck
+    from danyapi.deepseek.client import DeepSeekClient as DSC
+
+    with (
+        patch.object(settings, "deepseek_tokens", ["tok"]),
+        patch.object(settings, "qwen_tokens", []),
+        patch.object(settings, "deepseek_email", ""),
+        patch.object(settings, "qwen_email", ""),
+        patch.object(DSC, "check_auth", new=AsyncMock(return_value=AuthCheck.UNREACHABLE)),
+    ):
+        with TestClient(app):
+            pool = app.state.pool
+            assert pool is not None
+            assert len(pool.accounts) == 1
+            assert pool.accounts[0].broken is False
+            assert len(pool.healthy) == 1
 
 
 @pytest.mark.usefixtures("reset_app_state")
