@@ -2,6 +2,23 @@
 
 ## Готово
 
+- **DSML: parameter-opener с вклеенным маркером перед `>` + ложный bare-attr.**
+  Инцидент tooltrace `4e3abd5c` (Kimi-код, Edit: `must NOT have additional property
+  'parameter'`). Два наложившихся бага в `danyapi/tools/parse.py`:
+  - DeepSeek закрыл кавычку имени параметра лишним DSML-маркером перед `>`
+    (`parameter="path"` + маркер + `>` вместо `parameter="path">`). Оба opener-регекса
+    (`_DSML_PARAM_OPENER_RE`, `_DSML_PARAM_EQ_OPENER_RE`) ждут `>` сразу после имени,
+    поэтому блок был невидим всем DSML-веткам → `unparsed:no_tool_call`. Новый
+    `_repair_dsml_glued_param` (по образцу `_repair_dsml_glued_invoke`) срезает маркер.
+  - `_repair_dsml_bare_attributes` принимал легитимный `parameter="X"` за голый
+    атрибут с ключом `parameter` и переписывал тег в `parameter name="parameter"...`,
+    стирая имя аргумента. Теперь ключ `parameter` пропускается, как `arguments`.
+  - Репро на живом логе: `parse_tool_calls` давал NONE; после фикса — 2 вызова `Edit`
+    с чистыми `path`/`old_string`/`new_string`.
+  - Тест: `tests/test_tools.py::test_dsml_param_eq_opener_glued_marker_before_gt`.
+  - Верификация: `ruff check` + `ruff format --check` + `make check` (arch-check OK)
+    + `pytest -q` → **1351 passed**. Плейбук обновлён (`docs/tooltrace-playbook.md`).
+
 - **DeepSeek: гонка сети на старте + оживление отвалившихся токенов.**
   Симптом: при ребуте платы eth0 поднимается на ~4 с позже старта юнита,
   `check_auth()` уходил в сеть, получал транспортную ошибку и токен

@@ -1038,6 +1038,28 @@ def _repair_dsml_glued_invoke(text: str) -> str:
     return _DSML_GLUED_INVOKE_RE.sub(lambda m: m.group(1) + ">", text)
 
 
+# Glued DSML parameter opener (tooltrace 4e3abd5c): the same stray marker that can
+# glue to an invoke opener also glues to a parameter opener — DeepSeek closes the
+# name quote and then emits another DSML marker before ``>``
+# (``parameter="path"  >``) instead of the canonical ``parameter="path">``.
+# Both _DSML_PARAM_OPENER_RE and _DSML_PARAM_EQ_OPENER_RE require ``>`` directly
+# after the name, so the opener is invisible to every DSML branch and the whole
+# block is dropped as unparsed. Normalise it to the canonical opener; the marker
+# carries no information (the name is already in the attribute).
+_DSML_GLUED_PARAM_RE = re.compile(
+    rf"(<{_DSML_SEP}\s*DSML\s*{_DSML_SEP}\s*parameter(?:\s*=\s*|\s+name\s*=\s*)(?P<q>['\"])[^'\">]+(?P=q))"
+    rf"\s*{_DSML_SEP}\s*DSML\s*{_DSML_SEP}\s*>",
+    re.IGNORECASE,
+)
+
+
+def _repair_dsml_glued_param(text: str) -> str:
+    """Drop the stray DSML marker glued between a parameter name and its ``>``."""
+    if "parameter" not in text:
+        return text
+    return _DSML_GLUED_PARAM_RE.sub(lambda m: m.group(1) + ">", text)
+
+
 # Bare arguments carrier (tooltrace 797cd20e, fa460fef, 86931c23): instead of one
 # ``<parameter name="...">`` per argument, DeepSeek emits a single tag whose name is
 # the ``arguments`` attribute (not ``parameter name=``) and whose quoted value is the
@@ -1096,7 +1118,11 @@ def _repair_dsml_bare_attributes(text: str) -> str:
 
     def _repl(m: re.Match[str]) -> str:
         key = m.group("key")
-        if key == "arguments":
+        # ``arguments`` and ``parameter`` are structural carriers, not argument
+        # names: ``parameter="X"`` is the malformed opener form owned by
+        # _DSML_PARAM_EQ_OPENER_RE (tooltrace 4e3abd5c). Rewriting it here would
+        # rename the argument to ``parameter`` and erase the real name.
+        if key in ("arguments", "parameter"):
             return m.group(0)
         value = m.group("value")
         # The close marker may be written with or without a preceding quote
@@ -2015,10 +2041,13 @@ def parse_tool_calls(text: str, tool_schemas: dict[str, dict[str, Any]] | None =
     # the text, so the canonical-format DSML parsers can handle it unchanged.
     text = _repair_dsml_separator(text)
     # Normalise other malformed DSML spellings that every branch keys past: a glued
-    # invoke close marker, a bare ``arguments="..."`` carrier, and bare/fused
-    # ``key="value"`` argument attributes. All rewrite to canonical DSML tags so the
-    # normal DSML path below handles them.
+    # invoke close marker, a glued parameter opener, a bare ``arguments="..."``
+    # carrier, and bare/fused ``key="value"`` argument attributes. All rewrite to
+    # canonical DSML tags so the normal DSML path below handles them. The glued-param
+    # repair runs before the bare-attribute repair so a canonical opener never reaches
+    # the latter (tooltrace 4e3abd5c).
     text = _repair_dsml_glued_invoke(text)
+    text = _repair_dsml_glued_param(text)
     text = _repair_dsml_bare_arguments(text)
     text = _repair_dsml_bare_attributes(text)
     # DSML is a distinct tag format (not JSON), so parse it before the generic

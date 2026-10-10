@@ -3344,6 +3344,49 @@ def test_dsml_param_eq_opener_canonical_untouched():
     assert [json.loads(c.arguments)["command"] for c in calls] == ["echo hi", "pwd"]
 
 
+def test_dsml_param_eq_opener_glued_marker_before_gt():
+    """tooltrace 4e3abd5c: the ``parameter="X"`` opener carries a stray DSML marker
+    glued between the name quote and the closing ``>`` (``parameter="path"`` + marker +
+    ``>``) instead of the canonical ``parameter="path">``. Both opener regexes require
+    ``>`` right after the quote, so the whole block used to vanish as
+    unparsed:no_tool_call. The repair must drop the marker and recover BOTH sibling
+    Edit calls with clean argument values (no leading ``>``, no renamed ``parameter``
+    argument from the bare-attribute repair).
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f"<{S} calls>\n"
+        f'<{S} parameter="path"{S} >/tmp/test_alert_points.py{S} >\n'
+        f'<{S} parameter="old_string"{S} >\nasync def old() -> None:\n'
+        f'<{S} parameter="new_string"{S} >\nasync def new() -> None:\n'
+        f"<{S} /{S} >\n"
+        f'<{S} parameter="path"{S} >/tmp/test_alert_points.py{S} >\n'
+        f'<{S} parameter="old_string"{S} >\nfrom a import B\n'
+        f'<{S} parameter="new_string"{S} >\nfrom a import B, C\n'
+        f"<{S} /{S} >\n"
+        f"</{S} calls>"
+    )
+    schemas = {
+        "Edit": {
+            "path": "string",
+            "old_string": "string",
+            "new_string": "string",
+            "__required__": {"path", "old_string", "new_string"},
+        }
+    }
+    parsed = parse_tool_calls(text, schemas)
+    assert parsed is not None
+    calls, _ = parsed
+    assert len(calls) == 2
+    for call in calls:
+        assert call.name == "Edit"
+        args = json.loads(call.arguments)
+        assert args["path"] == "/tmp/test_alert_points.py"
+        assert "parameter" not in args
+    assert json.loads(calls[0].arguments)["old_string"].startswith("async def old")
+    assert json.loads(calls[1].arguments)["new_string"] == "from a import B, C"
+
+
 def test_dsml_param_only_bare_separator_splits_sibling_calls():
     """tooltrace 0885f2d2 / 8b1c632c / 0241e65f: a param-only block packs SEVERAL
     sibling calls separated by a standalone bare `` `` / `` ``

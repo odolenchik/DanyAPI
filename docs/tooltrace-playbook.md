@@ -124,6 +124,16 @@ PY
      `_DSML_INVOKE_RE` ждёт пробел или `>` сразу после имени, поэтому весь блок
      невидим всем DSML-веткам. Нормализует `_repair_dsml_glued_invoke` (tooltrace
      `797cd20e`, `fa460fef`, `c24d8828`).
+   - **Маркер, вклеенный в parameter-opener перед `>`**: тот же лишний маркер
+     вклеивается и в открывающий тег параметра — `parameter="path"` + маркер + `>`
+     вместо канонического `parameter="path">`. И `_DSML_PARAM_OPENER_RE`, и
+     `_DSML_PARAM_EQ_OPENER_RE` ждут `>` сразу после кавычки имени, поэтому тег
+     невидим всем веткам, а блок падает в `unparsed:no_tool_call`. Нормализует
+     `_repair_dsml_glued_param` (tooltrace `4e3abd5c`). Дополнительно
+     `_repair_dsml_bare_attributes` раньше принимал легитимный `parameter="X"` за
+     голый атрибут с ключом `parameter` и переписывал тег в
+     `parameter name="parameter"...`, стирая имя аргумента; теперь ключ `parameter`
+     пропускается (tooltrace `4e3abd5c`).
    - **Голый `arguments="<json>"`**: вместо `parameter name=...` на каждый аргумент
      DeepSeek шлёт один тег с атрибутом `arguments`, чьё значение — escaped-JSON объект
      реальных аргументов. Все DSML-ветки ключуются на `parameter name=`, поэтому тег
