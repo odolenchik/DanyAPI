@@ -1038,26 +1038,40 @@ def _repair_dsml_glued_invoke(text: str) -> str:
     return _DSML_GLUED_INVOKE_RE.sub(lambda m: m.group(1) + ">", text)
 
 
-# Glued DSML parameter opener (tooltrace 4e3abd5c): the same stray marker that can
-# glue to an invoke opener also glues to a parameter opener — DeepSeek closes the
-# name quote and then emits another DSML marker before ``>``
+# Glued DSML parameter opener (tooltrace 4e3abd5c, 7b1bb070): the same stray marker
+# that can glue to an invoke opener also glues to a parameter opener — DeepSeek closes
+# the name quote and then emits another DSML marker before ``>``
 # (``parameter="path"  >``) instead of the canonical ``parameter="path">``.
 # Both _DSML_PARAM_OPENER_RE and _DSML_PARAM_EQ_OPENER_RE require ``>`` directly
 # after the name, so the opener is invisible to every DSML branch and the whole
-# block is dropped as unparsed. Normalise it to the canonical opener; the marker
+# block is dropped as unparsed. Within one run DeepSeek mixes three opener
+# spellings — leading ``<``, leading ``</`` and no leading bracket at all
+# (``  parameter="path"  >``) — so the leading bracket is optional
+# here. Normalise each to the canonical ``parameter name="X">`` opener; the marker
 # carries no information (the name is already in the attribute).
 _DSML_GLUED_PARAM_RE = re.compile(
-    rf"(<{_DSML_SEP}\s*DSML\s*{_DSML_SEP}\s*parameter(?:\s*=\s*|\s+name\s*=\s*)(?P<q>['\"])[^'\">]+(?P=q))"
+    rf"(?:</?)?\s*{_DSML_SEP}\s*DSML\s*{_DSML_SEP}\s*"
+    rf"parameter\s*(?:=\s*|\s+name\s*=\s*)(?P<q>['\"])(?P<pname>[^'\">]+)(?P=q)"
+    rf"(?:\s+string=(?P<sq>['\"])(?P<sval>true|false)(?P=sq))?"
     rf"\s*{_DSML_SEP}\s*DSML\s*{_DSML_SEP}\s*>",
     re.IGNORECASE,
 )
 
 
 def _repair_dsml_glued_param(text: str) -> str:
-    """Drop the stray DSML marker glued between a parameter name and its ``>``."""
+    """Drop the stray DSML marker glued between a parameter name and its ``>``.
+
+    Rewrites any bracket/attribute spelling of a glued opener to the canonical
+    ``<||DSML|| parameter name="X">`` form so the normal DSML param path decodes it.
+    """
     if "parameter" not in text:
         return text
-    return _DSML_GLUED_PARAM_RE.sub(lambda m: m.group(1) + ">", text)
+
+    def _repl(m: re.Match[str]) -> str:
+        string = f' string="{m.group("sval")}"' if m.group("sval") else ""
+        return f'<||DSML|| parameter name="{m.group("pname")}"{string}>'
+
+    return _DSML_GLUED_PARAM_RE.sub(_repl, text)
 
 
 # Bare arguments carrier (tooltrace 797cd20e, fa460fef, 86931c23): instead of one

@@ -3387,6 +3387,36 @@ def test_dsml_param_eq_opener_glued_marker_before_gt():
     assert json.loads(calls[1].arguments)["new_string"] == "from a import B, C"
 
 
+def test_dsml_param_glued_marker_mixed_brackets_one_run():
+    """tooltrace 7b1bb070: within one param-only run DeepSeek mixes THREE glued-opener
+    spellings for three different arguments — leading ``<`` (line_offset), leading
+    ``</`` (n_lines), and no leading bracket at all (path) — each with a stray DSML
+    marker glued before ``>``. None matched a canonical opener, so the whole Read
+    call was dropped as unparsed:no_tool_call. The repair must normalise all three
+    and recover one Read with the right integer/string argument values.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = f'<{S} calls>\n<{S} parameter="line_offset"{S} >117</{S} parameter="n_lines"{S} >10{S} parameter="path"{S} >/tmp/f.py{S} >\n</{S} </{S} calls>'
+    schemas = {
+        "Read": {
+            "path": "string",
+            "line_offset": "integer",
+            "n_lines": "integer",
+            "__required__": {"path"},
+        }
+    }
+    parsed = parse_tool_calls(text, schemas)
+    assert parsed is not None
+    calls, _ = parsed
+    assert len(calls) == 1
+    assert calls[0].name == "Read"
+    assert json.loads(calls[0].arguments) == {
+        "line_offset": 117,
+        "n_lines": 10,
+        "path": "/tmp/f.py",
+    }
+
+
 def test_dsml_param_only_bare_separator_splits_sibling_calls():
     """tooltrace 0885f2d2 / 8b1c632c / 0241e65f: a param-only block packs SEVERAL
     sibling calls separated by a standalone bare `` `` / `` ``

@@ -15,9 +15,15 @@
     стирая имя аргумента. Теперь ключ `parameter` пропускается, как `arguments`.
   - Репро на живом логе: `parse_tool_calls` давал NONE; после фикса — 2 вызова `Edit`
     с чистыми `path`/`old_string`/`new_string`.
-  - Тест: `tests/test_tools.py::test_dsml_param_eq_opener_glued_marker_before_gt`.
+  - Тот же маркер встречается и в трёх разных написаниях opener'а в одном прогоне
+    (с ведущим `<`, с ведущим `</`, вообще без скобки) — tooltrace `7b1bb070`,
+    Read на 3 аргумента. `_repair_dsml_glued_param` расширен: ведущая скобка
+    опциональна, все три нормализуются в канонический opener.
+  - Тесты: `tests/test_tools.py::test_dsml_param_eq_opener_glued_marker_before_gt`
+    и `::test_dsml_param_glued_marker_mixed_brackets_one_run`.
   - Верификация: `ruff check` + `ruff format --check` + `make check` (arch-check OK)
-    + `pytest -q` → **1351 passed**. Плейбук обновлён (`docs/tooltrace-playbook.md`).
+    + `pytest -q` → **1352 passed**. Плейбук обновлён (`docs/tooltrace-playbook.md`).
+
 
 - **DeepSeek: гонка сети на старте + оживление отвалившихся токенов.**
   Симптом: при ребуте платы eth0 поднимается на ~4 с позже старта юнита,
