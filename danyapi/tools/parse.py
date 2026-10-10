@@ -989,32 +989,57 @@ _DSML_PARAM_STRING_VALUE_RE = re.compile(
 )
 
 
-# Malformed DSML separator (tooltrace b1c6a1cc): DeepSeek sometimes emits the DSML
-# opening tags with a SINGLE pipe before DSML (`<|DSML||parameter ...>`) while the
-# matching close tags keep the canonical two-pipe form. _DSML_SEP requires two pipes
-# on each side, so these openers are invisible to every DSML branch. Rather than
-# loosening the canonical separator, normalise only this malformed opener to the
-# canonical form; the negative lookahead leaves canonical tags untouched.
-_DSML_SINGLE_PIPE_OPENER_RE = re.compile(
-    r"<(?P<slash>/?)\s*(?P<pipe>\||\uff5c)(?!\s*(?:\||\uff5c))\s*(?=DSML)",
+# Malformed DSML separator (tooltrace b1c6a1cc, 2a0ddca7): DeepSeek sometimes emits
+# the DSML tags with a SINGLE pipe on one or both sides of DSML (e.g.
+# `<|DSML|| parameter ...>`, `<||DSML| ...>`, or `<|DSML|> ...>`).
+# _DSML_SEP requires two pipes on each side, so these tags are invisible to every
+# DSML branch and the whole block is dropped. Rather than loosening the canonical
+# separator, normalise every 1-or-2-pipe spelling on each side to exactly two pipes;
+# canonical tags stay unchanged because the rewrite is idempotent. The first pipe of
+# each side is duplicated, so an ASCII pipe stays ASCII and a fullwidth pipe stays
+# fullwidth. The earlier version only handled the single-LEFT-pipe opener, so the
+# right-single and both-single forms still slipped through (tooltrace 2a0ddca7).
+_DSML_SEP_TAG_RE = re.compile(
+    r"<(?P<slash>/?)\s*(?P<l>[|\uff5c])[|\uff5c]?\s*DSML\s*(?P<r>[|\uff5c])[|\uff5c]?",
     re.IGNORECASE,
 )
 
 
 def _repair_dsml_separator(text: str) -> str:
-    """Expand a single-pipe DSML opener to the canonical two-pipe separator.
+    """Normalise a 1-or-2-pipe DSML separator to the canonical two-pipe form.
 
-    Rewrites ``<|DSML`` to ``<||DSML`` (and the ``</`` close variant); canonical
-    two-pipe tags are left unchanged because the regex rejects a second pipe. The
-    ``DSML`` word itself is only asserted via lookahead, never consumed, so the tag
-    body is left intact.
+    Rewrites the malformed 1/2-pipe opener and close tags to the canonical
+    ``<||DSML||`` spelling so every DSML branch sees a two-pipe separator on
+    both sides. The ``DSML`` word and the tag body are left intact; the pipe
+    character of each side is preserved, so a fullwidth separator is not silently
+    converted to ASCII.
     """
     if not text or "DSML" not in text:
         return text
-    return _DSML_SINGLE_PIPE_OPENER_RE.sub(
-        lambda m: f"<{m.group('slash')}{m.group('pipe')}{m.group('pipe')}",
+    return _DSML_SEP_TAG_RE.sub(
+        lambda m: f"<{m.group('slash')}{m.group('l')}{m.group('l')}DSML{m.group('r')}{m.group('r')}",
         text,
     )
+
+
+# Self-closed DSML marker (tooltrace 2a0ddca7): the same block also emits the marker
+# as a self-closed tag — `<||DSML||> calls>` instead of the canonical
+# `<||DSML|| calls>` — for the container, invoke and parameter openers alike.
+# The canonical DSML regexes want the tag word right after the marker, so the stray
+# `>` hides every opener. Drop it, but only when a tag word follows: a bare close
+# `</||DSML||>` is a legitimate parameter terminator (see _DSML_PARAM_RE) and
+# must be left alone.
+_DSML_MARKER_GT_RE = re.compile(
+    rf"(<(?P<slash>/?)\s*{_DSML_SEP}\s*DSML\s*{_DSML_SEP})\s*>\s*(?=(?:tool_calls|function_calls|calls|invoke|parameter)\b)",
+    re.IGNORECASE,
+)
+
+
+def _repair_dsml_marker_gt(text: str) -> str:
+    """Drop a `>` glued to a DSML marker when a tag word follows the marker."""
+    if not text or "DSML" not in text:
+        return text
+    return _DSML_MARKER_GT_RE.sub(lambda m: m.group(1) + " ", text)
 
 
 # Glued DSML invoke opener (tooltrace 797cd20e, fa460fef, c24d8828): DeepSeek closes
@@ -2084,6 +2109,10 @@ def parse_tool_calls(text: str, tool_schemas: dict[str, dict[str, Any]] | None =
     # Normalise the malformed single-pipe DSML opener before any branch inspects
     # the text, so the canonical-format DSML parsers can handle it unchanged.
     text = _repair_dsml_separator(text)
+    # A self-closed marker (`  calls>`) hides the tag word from every DSML
+    # regex; drop the stray `>` when a tag word follows (tooltrace 2a0ddca7). Runs
+    # after the separator repair so the marker is already canonical.
+    text = _repair_dsml_marker_gt(text)
     # Normalise other malformed DSML spellings that every branch keys past: a glued
     # invoke close marker, a glued parameter opener, a bare ``arguments="..."``
     # carrier, and bare/fused ``key="value"`` argument attributes. All rewrite to

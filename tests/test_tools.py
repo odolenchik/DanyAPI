@@ -3196,17 +3196,54 @@ def test_dsml_single_pipe_opener_is_repaired():
     assert args["command"] == "cd /home/odolen/AI/Work/SX && cargo test --workspace 2>&1 | tail -60"
 
 
+def test_dsml_selfclosed_marker_and_double_single_pipe_is_repaired():
+    """tooltrace 2a0ddca7: the block combines TWO malformations the earlier
+    single-LEFT-pipe fix did not cover -- a both-single separator (right side also
+    one pipe) and a self-closed marker (`marker >` instead of `marker`). The
+    canonical _DSML_SEP never matched, so the whole browser_snapshot call was
+    dropped.
+    """
+    text = (
+        "<|DSML|> calls>\n"
+        '<|DSML|> invoke name="browser_snapshot">\n'
+        '<|DSML|> parameter name="url">https://75.189.221.120</|DSML|> parameter>\n'
+        '<|DSML|> parameter name="stealth">true</|DSML|> parameter>\n'
+        '<|DSML|> parameter name="wait">10000</|DSML|> parameter>\n'
+        "</|DSML|> invoke>\n"
+        "</|DSML|> calls>"
+    )
+    schemas = {
+        "browser_snapshot": {"url": "string", "stealth": "boolean", "wait": "integer"},
+    }
+    parsed = parse_tool_calls(text, schemas)
+    assert parsed is not None
+    calls, _ = parsed
+    assert len(calls) == 1
+    assert calls[0].name == "browser_snapshot"
+    assert json.loads(calls[0].arguments) == {
+        "url": "https://75.189.221.120",
+        "stealth": True,
+        "wait": 10000,
+    }
+
+
 def test_dsml_single_pipe_repair_leaves_canonical_tags():
-    """_repair_dsml_separator must only touch the malformed single-pipe opener, not
-    the canonical two-pipe tags that other branches already parse.
+    """_repair_dsml_separator must expand every 1-or-2-pipe spelling to the canonical
+    two pipes per side while leaving canonical tags (and the pipe character) untouched.
     """
     canonical = '<\uff5c\uff5cDSML\uff5c\uff5cinvoke name="Read">'
     assert _repair_dsml_separator(canonical) == canonical
     # A canonical close tag must survive unchanged too.
     assert _repair_dsml_separator("</\uff5c\uff5cDSML\uff5c\uff5c>") == "</\uff5c\uff5cDSML\uff5c\uff5c>"
-    # The single-pipe opener is expanded to two pipes on each side.
+    # 1|2 (left-single, b1c6a1cc), 2|1 (right-single) and 1|1 (both-single, 2a0ddca7)
+    # all expand to the canonical 2|2 form.
     assert _repair_dsml_separator("<\uff5cDSML\uff5c\uff5c calls>") == "<\uff5c\uff5cDSML\uff5c\uff5c calls>"
     assert _repair_dsml_separator("</\uff5cDSML\uff5c\uff5c>") == "</\uff5c\uff5cDSML\uff5c\uff5c>"
+    assert _repair_dsml_separator("<\uff5c\uff5cDSML\uff5c calls>") == "<\uff5c\uff5cDSML\uff5c\uff5c calls>"
+    assert _repair_dsml_separator("<\uff5cDSML\uff5c calls>") == "<\uff5c\uff5cDSML\uff5c\uff5c calls>"
+    # ASCII and fullwidth separators are kept as-is (not silently converted).
+    assert _repair_dsml_separator("<||DSML| calls>") == "<||DSML|| calls>"
+    assert _repair_dsml_separator("<\uff5c\uff5cDSML\uff5c calls>") == "<\uff5c\uff5cDSML\uff5c\uff5c calls>"
 
 
 def test_dsml_param_only_repeated_name_splits_calls():

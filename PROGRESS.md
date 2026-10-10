@@ -17,9 +17,18 @@
     сохраняет строгий контракт (тест `..._ambiguous_schemas_skips` не тронут).
   - Репро на живом логе с полным набором Kimi: `533f7fa6` → 2 Read,
     `fd031971` → Read+Read+Bash, `7b1bb070` и `4e3abd5c` тоже зелёные.
-  - Тест: `tests/test_tools.py::test_dsml_param_only_ambiguous_path_resolves_by_declaration_order`.
+  - Расширение: разделитель DSML чинится не только слева. `_DSML_SEP` требует
+    две палки с каждой стороны, а DeepSeek шлёт и право-однопалочные, и
+    двусторонние. `_repair_dsml_separator` теперь нормализует любую сторону
+    (1→2), сохраняя символ палки. Второй паттерн из того же инцидента —
+    самозакрытый маркер: лишний `>` перед словом тега прячет opener, его срезает
+    `_repair_dsml_marker_gt` (голый закрывающий маркер не трогает). Инцидент
+    tooltrace `2a0ddca7` — `browser_snapshot` на 5 аргументов — парсится.
+  - Тесты: `test_dsml_param_only_ambiguous_path_resolves_by_declaration_order`,
+    `test_dsml_selfclosed_marker_and_double_single_pipe_is_repaired`, обновлён
+    `test_dsml_single_pipe_repair_leaves_canonical_tags`.
   - Верификация: `ruff check` + `ruff format --check` + `make check` (arch-check OK)
-    + `pytest -q` → **1353 passed**. Плейбук обновлён.
+    + `pytest -q` → **1354 passed**. Плейбук обновлён.
 
 - **DSML: parameter-opener с вклеенным маркером перед `>` + ложный bare-attr.**
   Инцидент tooltrace `4e3abd5c` (Kimi-код, Edit: `must NOT have additional property
