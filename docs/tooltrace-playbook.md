@@ -137,6 +137,16 @@ PY
      голый атрибут с ключом `parameter` и переписывал тег в
      `parameter name="parameter"...`, стирая имя аргумента; теперь ключ `parameter`
      пропускается (tooltrace `4e3abd5c`, `7b1bb070`).
+   - **Одинокий `{path}` в двух вызовах (неразличимый Read/ReadMediaFile)**:
+     блок без `<invoke>` из двух `parameter="path"` (больше аргументов нет).
+     `{path}` подходит и `Read`, и `ReadMediaFile` (у обоих required = ровно
+     `path`), поэтому `_infer_tool_from_params` возвращает `None` и весь блок
+     падает в `unparsed:no_tool_call`. В DSML param-only пути такие вызовы
+     резолвит `_resolve_tool_by_order` — побеждает инструмент, объявленный
+     клиентом раньше (у Kimi `Read` идёт перед `ReadMediaFile`); схемы с
+     невыполненным `__required__` (`Edit`/`Write`) пропускаются. Глобальный
+     `_infer_tool_from_params` сохраняет строгий контракт «неоднозначность →
+     None» (tooltrace `533f7fa6`).
    - **Голый `arguments="<json>"`**: вместо `parameter name=...` на каждый аргумент
      DeepSeek шлёт один тег с атрибутом `arguments`, чьё значение — escaped-JSON объект
      реальных аргументов. Все DSML-ветки ключуются на `parameter name=`, поэтому тег

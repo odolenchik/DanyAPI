@@ -3417,6 +3417,39 @@ def test_dsml_param_glued_marker_mixed_brackets_one_run():
     }
 
 
+def test_dsml_param_only_ambiguous_path_resolves_by_declaration_order():
+    """tooltrace 533f7fa6: a bare-parameter block with two ``parameter="path"`` (no
+    <invoke>, no other argument) is structurally ambiguous — both Read and
+    ReadMediaFile accept exactly ``path`` — so _infer_tool_from_params returns None
+    and both calls were dropped as unparsed:no_tool_call. With the real 26-tool
+    Kimi schema the block must resolve to Read (declared before ReadMediaFile) while
+    Edit/Write (declared earlier than Read, but with unsatisfied required keys) are
+    skipped. Regression for the client-order priority rule.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = f'<{S} calls>\n<{S} parameter="path"{S} >/a/AGENTS.md{S} >\n<{S} parameter="path"{S} >/a/test_x.py{S} >\n</{S} calls>'
+    schemas = {
+        "Bash": {"command": "string", "__required__": {"command"}},
+        "Edit": {
+            "path": "string",
+            "old_string": "string",
+            "new_string": "string",
+            "__required__": {"path", "old_string", "new_string"},
+        },
+        "Read": {"path": "string", "line_offset": "integer", "n_lines": "integer", "__required__": {"path"}},
+        "ReadMediaFile": {"path": "string", "__required__": {"path"}},
+        "Write": {"path": "string", "content": "string", "__required__": {"path", "content"}},
+    }
+    parsed = parse_tool_calls(text, schemas)
+    assert parsed is not None
+    calls, _ = parsed
+    assert [c.name for c in calls] == ["Read", "Read"]
+    assert [json.loads(c.arguments) for c in calls] == [
+        {"path": "/a/AGENTS.md"},
+        {"path": "/a/test_x.py"},
+    ]
+
+
 def test_dsml_param_only_bare_separator_splits_sibling_calls():
     """tooltrace 0885f2d2 / 8b1c632c / 0241e65f: a param-only block packs SEVERAL
     sibling calls separated by a standalone bare `` `` / `` ``

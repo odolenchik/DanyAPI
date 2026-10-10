@@ -1329,6 +1329,36 @@ def _schema_compatible_tools(keys: set[str], tool_schemas: dict[str, dict[str, A
     return {name for name, params in tool_schemas.items() if isinstance(params, dict) and all(key in params for key in keys)}
 
 
+def _resolve_tool_by_order(args: dict[str, Any], tool_schemas: dict[str, dict[str, Any]] | None) -> str | None:
+    """Resolve an ambiguous bare-parameter call to the earliest-declared tool.
+
+    Some DSML blocks carry a lone ``{path}`` (two ``parameter="path"`` with no
+    ``<invoke>`` and no other argument), which is structurally ambiguous: both
+    ``Read`` and ``ReadMediaFile`` accept exactly ``path``, so
+    :func:`_infer_tool_from_params` returns ``None`` and every call in the block
+    is dropped as ``no_tool_call`` (tooltrace 533f7fa6). Resolve it by client
+    declaration order instead: the client lists its tools in priority order, so
+    the first schema that accepts the call's keys *and whose required set is
+    satisfied* wins (``Read`` precedes ``ReadMediaFile``, and ``Edit``/``Write``
+    are skipped because ``{path}`` alone does not satisfy their required keys).
+
+    Only called from the DSML param-only path; :func:`_infer_tool_from_params`
+    keeps its strict single-candidate contract elsewhere.
+    """
+    if not tool_schemas or not args:
+        return None
+    for name, params in tool_schemas.items():
+        if not isinstance(params, dict):
+            continue
+        if not all(key in params for key in args):
+            continue
+        required = params.get("__required__")
+        if isinstance(required, set) and not required.issubset(args):
+            continue
+        return name
+    return None
+
+
 def _parse_dsml_param_only(text: str, tool_schemas: dict[str, dict[str, Any]] | None = None) -> list[ToolCall] | None:
     """Extract tool calls from DSML parameter tags that have no enclosing <invoke>.
 
@@ -1455,7 +1485,7 @@ def _parse_dsml_param_only(text: str, tool_schemas: dict[str, dict[str, Any]] | 
         if isinstance(name_value, str) and name_value:
             resolved.append(name_value)
         else:
-            resolved.append(_infer_tool_from_params(args, tool_schemas))
+            resolved.append(_resolve_tool_by_order(args, tool_schemas))
     unique_names = {name for name in resolved if name}
     fallback = next(iter(unique_names)) if len(unique_names) == 1 else None
 

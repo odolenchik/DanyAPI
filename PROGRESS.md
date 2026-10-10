@@ -2,6 +2,25 @@
 
 ## Готово
 
+- **DSML: неоднозначный одинокий `{path}` резолвится по порядку объявления.**
+  Инцидент tooltrace `533f7fa6` (Kimi-код: два `Read` подряд, обе ошибки
+  «no_tool_call»). Блок без `<invoke>` из двух `parameter="path"` — `{path}`
+  подходит и `Read`, и `ReadMediaFile` (required у обоих = ровно `path`),
+  поэтому `_infer_tool_from_params` честно отдавал `None` и весь блок падал в
+  `unparsed:no_tool_call`. Важно: прошлый вывод «уже парсится» был артефактом
+  проверки с урезанной схемой (только `Read`+`Bash`); с реальным набором
+  Kimi (26 инструментов) инцидент воспроизводился на живом процессе.
+  - Новый `_resolve_tool_by_order` (`danyapi/tools/parse.py`): в DSML param-only
+    пути выигрывает инструмент, объявленный клиентом раньше; схемы с
+    невыполненным `__required__` (`Edit`/`Write`) пропускаются, поэтому
+    `{path}` → `Read`, а не `Edit`. Глобальный `_infer_tool_from_params`
+    сохраняет строгий контракт (тест `..._ambiguous_schemas_skips` не тронут).
+  - Репро на живом логе с полным набором Kimi: `533f7fa6` → 2 Read,
+    `fd031971` → Read+Read+Bash, `7b1bb070` и `4e3abd5c` тоже зелёные.
+  - Тест: `tests/test_tools.py::test_dsml_param_only_ambiguous_path_resolves_by_declaration_order`.
+  - Верификация: `ruff check` + `ruff format --check` + `make check` (arch-check OK)
+    + `pytest -q` → **1353 passed**. Плейбук обновлён.
+
 - **DSML: parameter-opener с вклеенным маркером перед `>` + ложный bare-attr.**
   Инцидент tooltrace `4e3abd5c` (Kimi-код, Edit: `must NOT have additional property
   'parameter'`). Два наложившихся бага в `danyapi/tools/parse.py`:
