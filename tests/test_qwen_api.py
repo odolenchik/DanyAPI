@@ -6,7 +6,9 @@ import httpx
 import pytest
 
 import danyapi.qwen.api as qwen_api
-from danyapi.qwen.client import QwenError, QwenSession
+from danyapi.accounts import AccountPool
+from danyapi.qwen.accounts import QwenAccount
+from danyapi.qwen.client import QwenClient, QwenError, QwenSession
 from danyapi.qwen.stream import QwenStreamReconstructor
 
 OK_SSE = (
@@ -169,8 +171,10 @@ def _args(acct, pool=None, existing_sid: str | None = "s1", tool_mode=False):
 async def _send(resp):
     client = MagicMock()
     client.completion = AsyncMock(return_value=resp)
+    account = MagicMock()
+    account.client = client
     session = FakeSession()
-    return await qwen_api._send_completion(client, session, "p", "m", False, False)
+    return await qwen_api._send_completion(account, session, "p", "m", False, False)
 
 
 async def _collect(agen):
@@ -470,6 +474,24 @@ def test_handle_account_error_other():
     acct.mark_broken.assert_not_called()
 
 
+def _real_qwen_account(index):
+    return QwenAccount(index, QwenClient(token=f"tok{index}", timeout=1))
+
+
+def test_qwen_stats_separates_quota_from_auth():
+    quota = _real_qwen_account(0)
+    quota.mark_quota_exhausted(3600)
+    auth = _real_qwen_account(1)
+    auth.mark_broken()
+    pool = AccountPool([quota, auth, _real_qwen_account(2)], label="qwen")
+    stats = pool.stats()
+    assert stats["healthy"] == 1
+    assert stats["broken"] == 2
+    assert stats["broken_quota"] == 1
+    assert stats["broken_auth"] == 1
+    assert 0 < stats["quota_resets_in"] <= 3600
+
+
 async def test_try_stop_stream():
     client = MagicMock()
     client.stop_stream = AsyncMock()
@@ -565,16 +587,20 @@ async def test_waf_html():
 async def test_http_status_error():
     client = MagicMock()
     client.completion = AsyncMock(side_effect=httpx.HTTPStatusError("500", request=MagicMock(), response=MagicMock(status_code=500)))
+    account = MagicMock()
+    account.client = client
     with pytest.raises(Exception) as excinfo:
-        await qwen_api._send_completion(client, FakeSession(), "p", "m", False, False)
+        await qwen_api._send_completion(account, FakeSession(), "p", "m", False, False)
     assert excinfo.value.status_code == 500
 
 
 async def test_http_error():
     client = MagicMock()
     client.completion = AsyncMock(side_effect=httpx.ConnectError("boom"))
+    account = MagicMock()
+    account.client = client
     with pytest.raises(Exception) as excinfo:
-        await qwen_api._send_completion(client, FakeSession(), "p", "m", False, False)
+        await qwen_api._send_completion(account, FakeSession(), "p", "m", False, False)
     assert excinfo.value.status_code == 502
 
 
@@ -769,4 +795,27 @@ async def test_collect_image_transient_does_not_mark_quota():
 
     assert result["image_urls"]
     assert acct.client.completion.await_count == 2
+    assert not acct.broken
+
+
+async def test_send_completion_marks_account_broken_on_qwen_error():
+    """A refused refresh (QwenError) must mark the account broken and return 401.
+
+    Without the QwenError branch the exception escaped as a bare 500 and /health
+    kept reporting the account healthy while every request failed.
+    """
+    acct = FakeAccount([])
+    acct.client.completion = AsyncMock(side_effect=QwenError("Unauthorized", "Token is revoked, please login again."))
+    with pytest.raises(qwen_api.HTTPException) as excinfo:
+        await qwen_api._send_completion(acct, FakeSession(), "p", "m", False, False)
+    assert excinfo.value.status_code == 401
+    assert acct.broken
+
+
+async def test_send_completion_qwen_error_not_auth_is_502():
+    acct = FakeAccount([])
+    acct.client.completion = AsyncMock(side_effect=QwenError(-1, "auth refresh returned no access_token"))
+    with pytest.raises(qwen_api.HTTPException) as excinfo:
+        await qwen_api._send_completion(acct, FakeSession(), "p", "m", False, False)
+    assert excinfo.value.status_code == 502
     assert not acct.broken

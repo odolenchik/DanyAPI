@@ -407,6 +407,19 @@ class DeepSeekAccount:
         return total
 
 
+def _account_state(account) -> str:
+    """Classify one pool account as 'ok', 'quota' or 'auth'.
+
+    'quota' is a temporary cooldown (``quota_until`` set): the account comes
+    back on its own. 'auth' is an auth failure with no deadline, so it stays
+    out until the process restarts. Used by ``AccountPool.stats`` so callers
+    can tell a dead token from an exhausted daily quota.
+    """
+    if account.is_available():
+        return "ok"
+    return "quota" if getattr(account, "quota_until", 0.0) else "auth"
+
+
 class AccountPool:
     def __init__(
         self,
@@ -524,11 +537,20 @@ class AccountPool:
         return acct
 
     def stats(self) -> dict:
+        now = time.monotonic()
+        states = [_account_state(a) for a in self.accounts]
+        healthy = states.count("ok")
+        broken_quota = states.count("quota")
+        broken_auth = states.count("auth")
+        resets_in = [a.quota_until - now for a in self.accounts if _account_state(a) == "quota"]
         return {
             "label": self.label,
             "accounts": len(self.accounts),
-            "healthy": len(self.healthy),
-            "broken": len(self.accounts) - len(self.healthy),
+            "healthy": healthy,
+            "broken": len(self.accounts) - healthy,
+            "broken_quota": broken_quota,
+            "broken_auth": broken_auth,
+            "quota_resets_in": max(0.0, min(resets_in)) if resets_in else 0.0,
             "session_affinities": len(self._by_session),
             "context_entries": len(self._contexts._seqs),
             "context_hits": self._contexts.hits,

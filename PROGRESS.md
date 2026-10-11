@@ -2,6 +2,33 @@
 
 ## Готово
 
+- **Qwen: кулдаун по квоте больше не выглядит мёртвым токеном.**
+  Симптом: бот присылал тревожное 🔴 «Qwen: все аккаунты отвалились», хотя
+  на деле один аккаунт был на суточном кулдауне по квоте и должен вернуться
+  сам. Причина: `/health` отдавал только `healthy`/`broken`, а `broken`
+  смешивал auth-ошибку (токен мёртв) и временный кулдаун (`quota_until`).
+  - **`danyapi/accounts.py`:** классификатор `_account_state()` — 'ok' /
+    'quota' (есть `quota_until`) / 'auth'. `AccountPool.stats()` теперь
+    считает за один проход и отдаёт новые ключи `broken_quota`, `broken_auth`,
+    `quota_resets_in` (секунды до ближайшего возврата). Старые `healthy`/`broken`
+    не изменили смысл — обратная совместимость сохранена. Для DeepSeek
+    (нет `quota_until`) всё остаётся auth, как раньше.
+  - **Бот** (`/opt/orangepi-bot/bot.py`, вне этого репозитория):
+    `provider_status` возвращает `(severity, текст)`, `fmt_duration()` даёт
+    «~23 ч». Кулдаун → 🟡 «на кулдауне по квоте, вернётся через ~N» (повтор
+    только на переходе, без спама), auth → 🔴 «отвалился (auth N из total)».
+    Для старого инстанса без новых ключей сохраняется прежнее поведение.
+  - Тесты: `test_accounts.py` (+3: разбивка quota/auth, выбор ближайшего
+    кулдауна), `test_qwen_api.py` (+1: реальный `QwenAccount` после
+    `mark_quota_exhausted`/`mark_broken`). Верификация: `make check`
+    (ruff + arch-check) зелёный, `pytest -q` по затронутым файлам 149 passed,
+    py3.10 AST OK.
+  - На плате 6660: `/health` отдаёт `broken_quota=1, broken_auth=0,
+    quota_resets_in≈86400`; `/tokens` → «🟡 Qwen: 1 из 2 на кулдауне по
+    квоте, вернётся через ~23 ч»; живой запрос `qwen3.8-max` → 200.
+    Ограничение: `quota_until` — монотонное время, после рестарта процесса
+    кулдаун сбрасывается (Qwen-учётки создаются заново здоровыми).
+
 - **DSML: неоднозначный одинокий `{path}` резолвится по порядку объявления.**
   Инцидент tooltrace `533f7fa6` (Kimi-код: два `Read` подряд, обе ошибки
   «no_tool_call»). Блок без `<invoke>` из двух `parameter="path"` — `{path}`
@@ -52,6 +79,49 @@
   - Верификация: `ruff check` + `ruff format --check` + `make check` (arch-check OK)
     + `pytest -q` → **1352 passed**. Плейбук обновлён (`docs/tooltrace-playbook.md`).
 
+- **Qwen: ротация refresh-токена теперь сохраняется + здоровье аккаунта видно.**
+  Диагноз подтверждён по логу: refresh-токены Qwen «протухают» за ~5.5 ч вместо
+  30 дней, потому что сервер **изредка ротирует** refresh-токен при обмене, а
+  DanyAPI читал из ответа только `access_token` — новый `refresh_token` терялся.
+  Старый работал ещё в grace-окне, затем Qwen отвечал `Token is revoked`.
+  - **Железное доказательство** (лог `danyapi3`, 2026-10-07 15:21:02):
+    `qwen refresh_token was ROTATED by the server (old=... jti=9e938906
+    new=... jti=83c115de ...); the configured value is now stale`.
+    Через 39 мин (16:00) старый `9e938906` отозван — `Token is revoked`.
+    Это был частичный патч в `DanyAPI3`, который ротацию только **логировал**.
+  - **Ротация редкая, не на каждый вызов.** 6 обменов подряд свежим токеном
+    вернули **тот же** `jti` побайтово — так что воспроизводить её «в лоб»
+    бесполезно; триггер, вероятно, окно/возраст токена. Живой прогон нового
+    кода: `POST /v1/chat/completions` qwen3.8-max → HTTP 200, `pong` за 7.3 с;
+    стор `qwen-credentials` пуст (ротации в этом прогоне не случилось — норма).
+  - `danyapi/qwen/client.py` — `refresh_access_token` вызывает новый
+    `_adopt_refresh_token(biz.get("refresh_token"))`: при смене значения логирует
+    `ROTATED (old=... new=...)` через `_token_fingerprint` (type+jti+exp, без
+    секрета) и зовёт колбэк `token_persist`. Логи успеха/отказа приведены к
+    единому формату; отказ читает `x-actual-status-code` (auth-хост отвечает 200
+    даже при отказе).
+  - `danyapi/qwen/accounts.py` — `load_effective_token` / `persist_rotated_token`
+    поверх `JsonStore("qwen-credentials")`, привязка к SHA-256 исходного
+    `.env`-токена (правка `.env` перекрывает сохранённый).
+  - `danyapi/api/openai.py` — читает эффективный токен при старте и передаёт
+    `token_persist` в `QwenClient`; создан `qwen-credentials` стор.
+  - `danyapi/qwen/api.py` — `_send_completion` теперь принимает `account` и ловит
+    `QwenError` → `_handle_account_error` + 401. Раньше исключение летело наружу
+    как голый 500, `mark_broken()` не звался, и `/health` показывал
+    `healthy: 1` при мёртвом токене (мониторинг-бот был слеп).
+  - Тесты: `test_qwen_client.py` (+4 ротация), `test_qwen_credentials.py` (новый,
+    +9), `test_qwen_api.py` (+2 QwenError→mark_broken/502, обновлены `_send` и
+    http-error тесты под новую сигнатуру).
+  - Верификация: `ruff check` + `ruff format --check` + `arch-check` +
+    `pytest -q` → **1350 passed** (`qwen/client.py` — 100%).
+  - Деплой: 4 файла + тесты синхронизированы в `DanyAPI3` и на плату
+    (бэкапы `.qwen-rotation-bak-*`), кэши старого аккаунта убраны, сервис
+    перезапущен (PID 92778). Лог подтверждает новый формат:
+    `qwen refresh refused (Unauthorized): credential=type=refresh_token
+    jti=9e938906 ... actual=401`, `/health` честно отдаёт `qwen: False`.
+  - **Осталось:** вставить свежий refresh-токен и убедиться, что при следующей
+    ротации новый `jti` реально сохраняется в `qwen-credentials` и переживает
+    рестарт.
 
 - **DeepSeek: гонка сети на старте + оживление отвалившихся токенов.**
   Симптом: при ребуте платы eth0 поднимается на ~4 с позже старта юнита,

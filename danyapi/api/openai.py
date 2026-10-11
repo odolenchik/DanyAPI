@@ -19,7 +19,7 @@ from ..accounts import AccountPool, AccountPoolBusy, DeepSeekAccount
 from ..config import settings
 from ..deepseek.client import AuthCheck, DeepSeekClient
 from ..qwen import api as qwen_api
-from ..qwen.accounts import QwenAccount
+from ..qwen.accounts import QwenAccount, load_effective_token, persist_rotated_token
 from ..qwen.client import QwenClient, QwenError
 from ..store import JsonStore
 from ..tooltrace import ToolTraceLogger
@@ -64,6 +64,7 @@ async def lifespan(app: FastAPI):
     deepseek_affinity_store = JsonStore("deepseek-affinities", "default" if cache_enabled else None)
     qwen_affinity_store = JsonStore("qwen-affinities", "default" if cache_enabled else None)
     qwen_sticky_store = JsonStore("qwen-sticky", "default" if cache_enabled else None)
+    qwen_credentials_store = JsonStore("qwen-credentials", "default" if cache_enabled else None)
     try:
         qwen_disabled_reason = ""
         if settings.deepseek_tokens:
@@ -120,8 +121,13 @@ async def lifespan(app: FastAPI):
             log.info("deepseek login ok, device_id=%s", client.device_id)
         if settings.qwen_tokens:
             rejected: list[str] = []
-            for i, token in enumerate(settings.qwen_tokens):
-                client = QwenClient(token=token, timeout=settings.timeout)
+            for i, configured in enumerate(settings.qwen_tokens):
+                token = load_effective_token(configured, qwen_credentials_store)
+                client = QwenClient(
+                    token=token,
+                    timeout=settings.timeout,
+                    token_persist=lambda new_token, src=configured: persist_rotated_token(src, qwen_credentials_store, new_token),
+                )
                 if not await client.check_auth():
                     reason = client.last_auth_error or "invalid/expired"
                     rejected.append(reason)

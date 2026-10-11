@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from typing import Any
@@ -10,6 +11,39 @@ from ..store import JsonStore
 from .client import QwenClient, QwenError, QwenSession
 
 log = logging.getLogger("danyapi.qwen")
+
+
+def _token_fingerprint(token: str) -> str:
+    """Stable id for a credential, used to bind a rotation store to its source."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+def load_effective_token(configured: str, store: JsonStore | None) -> str:
+    """Return the credential to use, preferring a rotated one from ``store``.
+
+    Qwen rotates the refresh token server-side, so the value in ``.env`` goes
+    stale while a freshly rotated one lives in the store. The stored token is
+    honoured only while the configured value still matches the one it was
+    derived from, so editing ``.env`` deliberately replaces it.
+    """
+    if store is None:
+        return configured
+    if store.get("source") != _token_fingerprint(configured):
+        return configured
+    stored = store.get("token")
+    if isinstance(stored, str) and stored:
+        if stored != configured:
+            log.info("qwen using rotated refresh token from credential store")
+        return stored
+    return configured
+
+
+def persist_rotated_token(configured: str, store: JsonStore | None, new_token: str) -> None:
+    """Persist a rotated refresh token so it survives a restart."""
+    if store is None:
+        return
+    store.set("source", _token_fingerprint(configured))
+    store.set("token", new_token)
 
 
 class QwenSessionRegistry(SessionRegistry):

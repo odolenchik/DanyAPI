@@ -414,6 +414,39 @@ def test_stats():
     assert stats["context_cache_size"] == 128
 
 
+def test_stats_all_healthy():
+    stats = AccountPool([make_acct(0), make_acct(1)]).stats()
+    assert stats["healthy"] == 2
+    assert stats["broken"] == 0
+    assert stats["broken_quota"] == 0
+    assert stats["broken_auth"] == 0
+    assert stats["quota_resets_in"] == 0.0
+
+
+def test_stats_splits_quota_from_auth():
+    quota = _QuotaAccount(0, available=False)
+    quota.quota_until = time.monotonic() + 3600
+    auth = _QuotaAccount(1, available=False)
+    auth.quota_until = 0.0
+    pool = AccountPool([quota, auth, _QuotaAccount(2)])
+    stats = pool.stats()
+    assert stats["accounts"] == 3
+    assert stats["healthy"] == 1
+    assert stats["broken"] == 2
+    assert stats["broken_quota"] == 1
+    assert stats["broken_auth"] == 1
+    assert 0 < stats["quota_resets_in"] <= 3600
+
+
+def test_stats_quota_resets_in_picks_nearest():
+    far = _QuotaAccount(0, available=False)
+    far.quota_until = time.monotonic() + 7200
+    near = _QuotaAccount(1, available=False)
+    near.quota_until = time.monotonic() + 600
+    pool = AccountPool([far, near])
+    assert 0 < pool.stats()["quota_resets_in"] <= 600
+
+
 def test_context_forget():
     pool = AccountPool([make_acct(0)])
     pool.index_context("s1", ("a",))

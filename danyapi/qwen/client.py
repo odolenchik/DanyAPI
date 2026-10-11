@@ -8,6 +8,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import httpx
@@ -81,6 +82,21 @@ def token_is_expired(token: str | None, margin: float = 0.0) -> bool:
     return time.time() >= float(exp) - margin
 
 
+def _token_fingerprint(token: str | None) -> str:
+    """Short, non-secret label for a credential (type + jti + expiry).
+
+    Lets a rotated or revoked token be told apart in logs without printing the
+    secret itself: the ``jti`` changes when the server hands out a replacement,
+    while ``exp`` only moves when the lifetime itself changes.
+    """
+    claims = jwt_claims(token)
+    jti = claims.get("jti")
+    kind = claims.get("type") or "?"
+    short_jti = str(jti)[:8] if jti else "-"
+    exp = claims.get("exp") or "-"
+    return f"type={kind} jti={short_jti} exp={exp}"
+
+
 def new_auth_client(timeout: float) -> httpx.AsyncClient:
     """Build the client used against ``auth.qwen.ai``.
 
@@ -116,6 +132,7 @@ class QwenClient:
         self,
         token: str | None = None,
         timeout: float = 60.0,
+        token_persist: Callable[[str], None] | None = None,
     ) -> None:
         # ``token`` is the credential from the environment. With frontend
         # 0.3.12 it may be either a ``refresh_token`` (preferred) or a legacy
@@ -123,6 +140,10 @@ class QwenClient:
         # ``auth.qwen.ai``. The raw value is kept because the refresh flow needs
         # it on every call.
         self.token = token
+        # Called when the refresh endpoint hands back a *new* refresh token
+        # (server-side rotation). Without persisting it the rotated credential is
+        # lost on the next restart and the old one is eventually revoked.
+        self._token_persist = token_persist
         self._access_token: str | None = None
         # Reason the most recent auth attempt failed (None after a success), so
         # startup can report *why* a credential was skipped.
@@ -192,6 +213,8 @@ class QwenClient:
             "X-Request-Id": new_uuid(),
         }
         cookies = {self._source_cookie_name: self.token}
+        before = _token_fingerprint(self.token)
+        resp: httpx.Response | None = None
         try:
             async with new_auth_client(self.http.timeout) as client:
                 resp = await client.get(f"{AUTH_URL}/api/v2/auths/refresh", headers=headers, cookies=cookies)
@@ -204,15 +227,60 @@ class QwenClient:
             if not access_token:
                 raise QwenError(-1, "auth refresh returned no access_token")
         except QwenError as exc:
+            # The auth host answers HTTP 200 even for a refusal and carries the
+            # real outcome in ``x-actual-status-code``; log both so a rejected
+            # credential can be told from a transport failure at a glance.
+            status = getattr(resp, "status_code", "?")
+            resp_headers = getattr(resp, "headers", None) or {}
+            actual_status = resp_headers.get("x-actual-status-code", "?")
             self._last_error = f"{exc.code}: {exc.message}"
+            log.warning(
+                "qwen refresh refused (%s): credential=%s http=%s actual=%s detail=%s",
+                exc.code,
+                before,
+                status,
+                actual_status,
+                exc.message,
+            )
             raise
         except httpx.HTTPError as exc:
             self._last_error = f"transport error: {exc}"
+            log.warning("qwen refresh transport error: credential=%s error=%s", before, exc)
             raise
+        self._adopt_refresh_token(biz.get("refresh_token"))
         self._apply_access_token(access_token)
         self._last_error = None
-        log.info("qwen access token refreshed (expires in %ss)", jwt_claims(access_token).get("exp", 0) - int(time.time()))
+        log.info(
+            "qwen access token refreshed (expires in %ss) credential=%s",
+            jwt_claims(access_token).get("exp", 0) - int(time.time()),
+            before,
+        )
         return access_token
+
+    def _adopt_refresh_token(self, new_token: object) -> None:
+        """Adopt a rotated refresh token handed back by the refresh endpoint.
+
+        Qwen rotates the ``refresh_token`` server-side: every successful refresh
+        may return a *new* credential while the one we sent keeps working only
+        for a grace window. Keeping the old value in memory and on disk means the
+        rotated one is dropped, and once the grace window closes every further
+        refresh is refused with ``Token is revoked`` — which is exactly the
+        ~5 h token lifetime seen in production. Persisting the new value (via the
+        callback) is what makes the credential outlive a restart.
+        """
+        if not isinstance(new_token, str) or not new_token or new_token == self.token:
+            return
+        log.warning(
+            "qwen refresh_token was ROTATED by the server (old=%s new=%s); adopting the new value",
+            _token_fingerprint(self.token),
+            _token_fingerprint(new_token),
+        )
+        self.token = new_token
+        if self._token_persist is not None:
+            try:
+                self._token_persist(new_token)
+            except Exception as exc:  # persistence must never break the refresh
+                log.warning("qwen refresh token persist failed: %s", exc)
 
     async def ensure_access_token(self) -> str:
         """Return a usable access token, refreshing when missing or near expiry."""

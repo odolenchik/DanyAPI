@@ -27,7 +27,7 @@ from ..retry import (
 )
 from ..tooltrace import ToolTraceLogger
 from ..tooltrace import classify as _classify_trace
-from .client import QwenClient, QwenError
+from .client import QwenError
 from .stream import QwenStreamReconstructor, error_code
 
 log = logging.getLogger("danyapi.qwen.api")
@@ -223,7 +223,7 @@ async def _prepare_session(account, pool, existing_sid: str | None, model_id: st
 
 
 async def _send_completion(
-    client: QwenClient,
+    account,
     session,
     prompt: str,
     model_id: str,
@@ -234,7 +234,7 @@ async def _send_completion(
     image_size: str | None = None,
 ):
     try:
-        resp = await client.completion(
+        resp = await account.client.completion(
             chat_session_id=session.id,
             prompt=prompt,
             parent_message_id=session.last_response_id,
@@ -245,6 +245,13 @@ async def _send_completion(
             image_model=image_model,
             image_size=image_size,
         )
+    except QwenError as exc:
+        # A refresh refused by the auth host arrives as QwenError, not httpx, so
+        # without this branch a revoked credential would surface as a bare 500
+        # and the account would stay "healthy" in /health while every request
+        # fails. Mark it broken so the pool and the monitor see the real state.
+        _handle_account_error(account, exc)
+        raise HTTPException(_error_status(exc.code), f"Qwen error: {exc}") from exc
     except httpx.HTTPStatusError as exc:
         raise HTTPException(exc.response.status_code, exc.response.text[:500]) from exc
     except httpx.HTTPError as exc:
@@ -382,7 +389,7 @@ async def collect_non_stream(
                 if attempt:
                     await asyncio.sleep(min(RETRY_BACKOFF_SEC * (2 ** (attempt - 1)), RETRY_BACKOFF_MAX_SEC))
                 try:
-                    resp = await _send_completion(account.client, session, prompt, model_id, thinking, search)
+                    resp = await _send_completion(account, session, prompt, model_id, thinking, search)
                 except ContextLimitError:
                     _drop_session(pool, account, session_key)
                     raise HTTPException(400, "context length exceeded: conversation too long, start a new conversation") from None
@@ -498,7 +505,7 @@ async def collect_image(
                     await asyncio.sleep(min(RETRY_BACKOFF_SEC * (2 ** (attempt - 1)), RETRY_BACKOFF_MAX_SEC))
                 try:
                     resp = await _send_completion(
-                        account.client,
+                        account,
                         session,
                         prompt,
                         IMAGE_CHAT_MODEL,
@@ -636,7 +643,7 @@ async def stream_openai(
             if attempt:
                 await asyncio.sleep(min(RETRY_BACKOFF_SEC * (2 ** (attempt - 1)), RETRY_BACKOFF_MAX_SEC))
             try:
-                resp = await _send_completion(account.client, session, prompt, model_id, thinking, search)
+                resp = await _send_completion(account, session, prompt, model_id, thinking, search)
             except ContextLimitError:
                 _drop_session(pool, account, session_key)
                 yield sse(

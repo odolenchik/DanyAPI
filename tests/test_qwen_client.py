@@ -676,3 +676,62 @@ async def test_check_auth_clears_reason_on_success():
     assert await client.check_auth()
     assert client.last_auth_error is None
     await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# refresh token rotation
+# ---------------------------------------------------------------------------
+
+
+async def test_refresh_adopts_rotated_refresh_token(monkeypatch):
+    access = "a." + base64.urlsafe_b64encode(json.dumps({"exp": int(time.time()) + 900}).encode()).decode().rstrip("=") + ".c"
+    fake = _FakeAuthClient(get_response=_json_resp({"success": True, "data": {"access_token": access, "refresh_token": "rotated-cred"}}))
+    _patch_auth(monkeypatch, fake)
+    persisted: list[str] = []
+    client = QwenClient(token="old-cred", token_persist=persisted.append)
+
+    await client.refresh_access_token()
+
+    assert client.token == "rotated-cred"
+    assert persisted == ["rotated-cred"]
+    await client.aclose()
+
+
+async def test_refresh_ignores_unchanged_refresh_token(monkeypatch):
+    access = "a." + base64.urlsafe_b64encode(json.dumps({"exp": int(time.time()) + 900}).encode()).decode().rstrip("=") + ".c"
+    fake = _FakeAuthClient(get_response=_json_resp({"success": True, "data": {"access_token": access, "refresh_token": "old-cred"}}))
+    _patch_auth(monkeypatch, fake)
+    persisted: list[str] = []
+    client = QwenClient(token="old-cred", token_persist=persisted.append)
+
+    await client.refresh_access_token()
+
+    assert client.token == "old-cred"
+    assert persisted == []
+    await client.aclose()
+
+
+async def test_refresh_survives_persist_failure(monkeypatch):
+    access = "a." + base64.urlsafe_b64encode(json.dumps({"exp": int(time.time()) + 900}).encode()).decode().rstrip("=") + ".c"
+    fake = _FakeAuthClient(get_response=_json_resp({"success": True, "data": {"access_token": access, "refresh_token": "rotated-cred"}}))
+    _patch_auth(monkeypatch, fake)
+
+    def boom(_token):
+        raise OSError("disk full")
+
+    client = QwenClient(token="old-cred", token_persist=boom)
+
+    token = await client.refresh_access_token()
+
+    assert token == access
+    assert client.token == "rotated-cred"
+    await client.aclose()
+
+
+async def test_adopt_refresh_token_ignores_non_string():
+    client = QwenClient(token="keep-me")
+    client._adopt_refresh_token(None)
+    client._adopt_refresh_token("")
+    client._adopt_refresh_token(123)
+    assert client.token == "keep-me"
+    await client.aclose()
