@@ -22,15 +22,21 @@ def load_effective_token(configured: str, store: JsonStore | None) -> str:
     """Return the credential to use, preferring a rotated one from ``store``.
 
     Qwen rotates the refresh token server-side, so the value in ``.env`` goes
-    stale while a freshly rotated one lives in the store. The stored token is
+    stale while a freshly rotated one lives in the store. Each account's rotated
+    value is keyed by the fingerprint of its own configured token, so several
+    accounts sharing one store never overwrite each other. The stored token is
     honoured only while the configured value still matches the one it was
     derived from, so editing ``.env`` deliberately replaces it.
     """
     if store is None:
         return configured
-    if store.get("source") != _token_fingerprint(configured):
-        return configured
-    stored = store.get("token")
+    fingerprint = _token_fingerprint(configured)
+    stored = store.get(fingerprint)
+    if not (isinstance(stored, str) and stored):
+        # Legacy single-slot format ({source, token}), from before rotations were
+        # stored per account. Read it once so the value is not lost on upgrade.
+        if store.get("source") == fingerprint:
+            stored = store.get("token")
     if isinstance(stored, str) and stored:
         if stored != configured:
             log.info("qwen using rotated refresh token from credential store")
@@ -39,11 +45,14 @@ def load_effective_token(configured: str, store: JsonStore | None) -> str:
 
 
 def persist_rotated_token(configured: str, store: JsonStore | None, new_token: str) -> None:
-    """Persist a rotated refresh token so it survives a restart."""
+    """Persist a rotated refresh token so it survives a restart.
+
+    Keyed by the fingerprint of the configured token, so every account in the
+    pool keeps its own rotated credential instead of sharing a single slot.
+    """
     if store is None:
         return
-    store.set("source", _token_fingerprint(configured))
-    store.set("token", new_token)
+    store.set(_token_fingerprint(configured), new_token)
 
 
 class QwenSessionRegistry(SessionRegistry):

@@ -37,9 +37,24 @@ def test_persist_handles_none_store():
 def test_persist_then_reload_round_trip():
     store = JsonStore("qwen-credentials", None)
     persist_rotated_token("env-token", store, "rotated-token")
-    assert store.get("token") == "rotated-token"
-    assert store.get("source") == _token_fingerprint("env-token")
+    assert store.get(_token_fingerprint("env-token")) == "rotated-token"
     assert load_effective_token("env-token", store) == "rotated-token"
+
+
+def test_multiple_accounts_persist_independently():
+    store = JsonStore("qwen-credentials", None)
+    persist_rotated_token("env-token-a", store, "rotated-a")
+    persist_rotated_token("env-token-b", store, "rotated-b")
+    # A second account's rotation must not clobber the first one's entry.
+    assert load_effective_token("env-token-a", store) == "rotated-a"
+    assert load_effective_token("env-token-b", store) == "rotated-b"
+
+
+def test_load_uses_legacy_single_slot():
+    store = JsonStore("qwen-credentials", None)
+    store.set("source", _token_fingerprint("env-token"))
+    store.set("token", "rotated-legacy")
+    assert load_effective_token("env-token", store) == "rotated-legacy"
 
 
 def test_load_ignores_non_string_stored_token():
