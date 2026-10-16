@@ -1099,6 +1099,38 @@ def _repair_dsml_glued_param(text: str) -> str:
     return _DSML_GLUED_PARAM_RE.sub(_repl, text)
 
 
+# Fused close+open parameter tag (tooltrace 92b6a328, 793dd6ec, 35bbad80): DeepSeek
+# chains arguments so that one param's close tag doubles as the next param's opener
+# (a close tag carrying a name= attribute). _DSML_PARAM_RE requires a standalone close,
+# so a chained block matches NO parameter at all: the invoke yields its tool name with
+# EMPTY arguments, the client rejects it as missing required, and the same shape is
+# re-emitted on every retry. Rewrite each fused token into a canonical close followed by
+# a canonical opener so the normal DSML param path decodes every argument. A bare close
+# and a normal opener are left untouched (only a close with a name= attribute is fused),
+# so well-formed blocks are unaffected.
+_DSML_FUSED_CLOSE_OPEN_RE = re.compile(
+    rf"</\s*{_DSML_SEP}\s*DSML\s*{_DSML_SEP}\s*parameter\s+name=(?P<q>['\"])(?P<pname>[^'\">]+)(?P=q)"
+    rf"(?:\s+string=(?P<sq>['\"])(?P<sval>true|false)(?P=sq))?"
+    r"\s*>",
+    re.IGNORECASE,
+)
+
+
+def _repair_dsml_fused_close_open(text: str) -> str:
+    """Split a fused close-with-name tag into a close plus a fresh opener."""
+    if "parameter" not in text:
+        return text
+    sep = "||"
+    close = f"</{sep}DSML{sep} parameter>"
+
+    def _repl(m: re.Match[str]) -> str:
+        string = f' string="{m.group("sval")}"' if m.group("sval") else ""
+        opener = f'<{sep}DSML{sep} parameter name="{m.group("pname")}"{string}>'
+        return close + opener
+
+    return _DSML_FUSED_CLOSE_OPEN_RE.sub(_repl, text)
+
+
 # Bare arguments carrier (tooltrace 797cd20e, fa460fef, 86931c23): instead of one
 # ``<parameter name="...">`` per argument, DeepSeek emits a single tag whose name is
 # the ``arguments`` attribute (not ``parameter name=``) and whose quoted value is the
@@ -1567,8 +1599,18 @@ def _parse_dsml(text: str, tool_schemas: dict[str, dict[str, Any]] | None = None
     for m in invoke_re.finditer(text):
         name = m.group("name")
         close = close_re.search(text, m.end())
-        body_end = close.start() if close else len(text)
-        block_end = close.end() if close else len(text)
+        # A close tag that sits after the next invoke opener belongs to that later
+        # block, not this one (DeepSeek omits the close between consecutive invokes).
+        # Bound the body at the next opener so values never leak across invokes.
+        next_open = invoke_re.search(text, m.end())
+        if close is not None and next_open is not None and next_open.start() < close.start():
+            close = None
+        if close is None and next_open is not None:
+            body_end = next_open.start()
+            block_end = next_open.start()
+        else:
+            body_end = close.start() if close else len(text)
+            block_end = close.end() if close else len(text)
         param_types = (tool_schemas or {}).get(name)
         args: dict[str, Any] = {}
         matched_params: set[str] = set()
@@ -1593,7 +1635,10 @@ def _parse_dsml(text: str, tool_schemas: dict[str, dict[str, Any]] | None = None
             else:
                 shared_close = True
 
-        if shared_close:
+        # Bounded re-scan also when the first pass matched NOTHING but parameter
+        # openers exist (a close tag carrying name= makes _DSML_PARAM_RE miss every
+        # param, leaving args empty even though the openers are there).
+        if shared_close or not matched_params:
             # Re-extract all params in this invoke body using bounded scanning:
             # each param's value ends at the next param opener or a close tag.
             _dsml_tag_any_re = re.compile(
@@ -2121,6 +2166,10 @@ def parse_tool_calls(text: str, tool_schemas: dict[str, dict[str, Any]] | None =
     # the latter (tooltrace 4e3abd5c).
     text = _repair_dsml_glued_invoke(text)
     text = _repair_dsml_glued_param(text)
+    # Chained params: a close tag carrying name= doubles as the next opener (tooltrace
+    # 92b6a328). Split it so the normal param path sees standalone closes; runs before
+    # the bare-attribute repair, which would otherwise rewrite a close-with-name tag.
+    text = _repair_dsml_fused_close_open(text)
     text = _repair_dsml_bare_arguments(text)
     text = _repair_dsml_bare_attributes(text)
     # DSML is a distinct tag format (not JSON), so parse it before the generic

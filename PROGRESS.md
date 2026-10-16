@@ -2,6 +2,30 @@
 
 ## Готово
 
+- **DSML: слитый close+open параметра и границы invoke починен (tool-call мангл).**
+  Симптом: Kimi падал с «Invalid args for tool», в трейсе `ok:missing_required` —
+  имя инструмента есть, аргументы пустые.
+  - **Корневая причина:** DeepSeek сцепляет параметры так, что close одного служит
+    open следующего (`</…parameter name="path" string="true">` закрывает `pattern`
+    и открывает `path`). `_DSML_PARAM_RE` требует отдельный close, поэтому не матчил
+    НИ ОДНОГО параметра, `shared_close` оставался `False`, ветка ре-извлечения не
+    запускалась (tooltrace `92b6a328`, `793dd6ec`).
+  - **`danyapi/tools/parse.py`:**
+    - `_DSML_FUSED_CLOSE_OPEN_RE` + `_repair_dsml_fused_close_open` — расщепляет
+      слитый close-with-name на канонический close + open; подключено в
+      `parse_tool_calls` до `_repair_dsml_bare_attributes`.
+    - Граница тела invoke: при отсутствии `</invoke>` (или close за следующим
+      `<invoke>`) тело заканчивается на следующем opener — значения больше не
+      утекают между вызовами (tooltrace `793dd6ec`, `35bbad80`).
+    - Bounded re-scan запускается и когда первый проход не матчил ничего, но
+      parameter-opener'ы есть (`not matched_params`).
+  - Тест: `tests/test_tools.py::test_parse_dsml_fused_close_open_chained_params`
+    (из реального request_id `92b6a328`).
+  - Верификация: `ruff check` + `ruff format --check` + `arch-check` + `pytest -q`
+    → **1361 passed**.
+  - **Осталось:** повтор `path` с `</invoke>`-разделителем (tooltrace `46a56c59ce`)
+    и `<arguments>`-носитель без `=` (`d352973b79`) — редкие классы, не починены.
+
 - **Qwen: ротация refresh-токена хранится по каждому аккаунту (переживает рестарт).**
   Симптом: после `systemctl restart danyapi3` Qwen падал в `qwen accounts ready: 0`,
   `/health` → `qwen: false`, хотя до рестарта работали 2 из 3 аккаунтов.

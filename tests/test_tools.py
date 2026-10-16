@@ -1123,6 +1123,30 @@ def test_parse_dsml_boolean_and_string_params():
     assert args["-i"] is True  # string="false" -> coerced boolean
 
 
+def test_parse_dsml_fused_close_open_chained_params():
+    """A close tag carrying name= doubles as the next param's opener.
+
+    DeepSeek chains arguments so ``</…parameter name="path" string="true">`` both
+    closes ``pattern`` and opens ``path`` (tooltrace 92b6a328, 793dd6ec, 35bbad80).
+    Before the fix _DSML_PARAM_RE matched nothing, so the call parsed with EMPTY
+    arguments and the client rejected it as missing required on every retry.
+    """
+    sep = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f"<{sep}tool_calls>\n"
+        f'<{sep}invoke name="Grep">\n'
+        f'<{sep}parameter name="pattern" string="true">foo</{sep}parameter name="path" string="true">/a.py</{sep}parameter>\n'
+        f"</{sep}invoke>\n"
+        f"</{sep}tool_calls>"
+    )
+    calls, _ = _parse_dsml(text, {"Grep": {"pattern": "string", "path": "string"}})
+    assert calls is not None and len(calls) == 1
+    import json as _json
+
+    args = _json.loads(calls[0].arguments)
+    assert args == {"pattern": "foo", "path": "/a.py"}
+
+
 def test_parse_dsml_numeric_params_with_string_true_flag():
     """DeepSeek puts string=\"true\" on ALL params including numeric ones.
 
