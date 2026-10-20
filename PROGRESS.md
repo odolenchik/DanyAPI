@@ -1049,6 +1049,12 @@
 Копии `DanyAPI2` и `DanyAPI3` — без `.git`; при синхронизации кода их надо
 приводить к `DanyAPI` вручную (`.env` у каждого свой и не трогается).
 
+Состояние на `65bb91a`: все три копии по коду идентичны (`danyapi/`, `tests/`,
+`docs/`, `scripts/`, `deploy/`, корневые файлы). Различается только `.env`
+(порт 8000 / 9000 / 6660 и, у `DanyAPI3`, явный `DANYAPI_CACHE_DIR=/tmp/danyapi3`)
+и наличие `.venv`. Проверка — `diff -rq` без `.venv`/`.git`/`.env`; тесты
+1369 passed в каждой.
+
 Последний коммит: см. `git log -1`. До него: `fix(qwen): revert WEB_VERSION to 0.2.83`
 и `chore(providers): sync web client versions with the live frontends`;
 ранее `feat(images): accept image attachments for deepseek-v4-pro (expert)`
