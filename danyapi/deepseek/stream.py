@@ -171,6 +171,11 @@ class MessageReconstructor:
         self._prev_reasoning = ""
         self.response_message_id: str | None = None
         self.hint_error: dict | None = None
+        # Upstream also reports refusals (content violations, moderation) as a
+        # plain toast/hint with no `type: "error"`. Those must not be dropped:
+        # an empty answer with no hint looks like a successful blank reply to
+        # the client, which then retries the same request forever.
+        self.notice: dict | None = None
 
     def handle(self, event: SSEEvent) -> None:
         if event.event == "ready":
@@ -178,11 +183,17 @@ class MessageReconstructor:
                 self.response_message_id = event.data.get("response_message_id")
             return
         if event.event in ("toast", "hint"):
-            if isinstance(event.data, dict) and event.data.get("type") == "error":
-                self.hint_error = {
+            if isinstance(event.data, dict):
+                payload = {
                     "message": event.data.get("content") or event.data.get("message") or "",
                     "finish_reason": event.data.get("finish_reason"),
                 }
+                if event.data.get("type") == "error":
+                    self.hint_error = payload
+                elif payload["message"]:
+                    # Kept regardless of `type`: a refusal may arrive as a plain
+                    # notice, and its text is the only clue for a blank answer.
+                    self.notice = payload
             return
         if event.event not in (None, "delta"):
             return
@@ -233,6 +244,8 @@ class MessageReconstructor:
         if other.accumulated_tokens:
             self.message["accumulated_token_usage"] = other.accumulated_tokens
         self.hint_error = other.hint_error
+        if other.notice:
+            self.notice = other.notice
 
     @property
     def status(self) -> str | None:

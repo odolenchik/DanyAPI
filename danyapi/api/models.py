@@ -15,6 +15,9 @@ MODEL_TYPE_BY_NAME = {
 
 MODEL_NAME_BY_TYPE = {model_type: name for name, model_type in MODEL_TYPE_BY_NAME.items()}
 
+# DeepSeek web search is available on the chat models; vision has no search mode.
+SEARCH_CAPABLE_MODEL_TYPES = ("default", "expert")
+
 QWEN_DEFAULT_MODELS = [
     {
         "id": "qwen3.8-max",

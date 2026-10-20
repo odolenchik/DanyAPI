@@ -795,7 +795,7 @@ async def _chat_completions_deepseek(req: ChatCompletionRequest) -> Any:
 
     model_type = _resolve_model(req.model)
     thinking = _resolve_thinking(req, default=model_type == "expert")
-    search = bool(req.search) and model_type == "default"
+    search = bool(req.search) and model_type in SEARCH_CAPABLE_MODEL_TYPES
 
     context_seq = toolemu.context_sequence(req.messages, user=getattr(req, "user", None))
     if req.session_id:
@@ -827,8 +827,19 @@ async def _chat_completions_deepseek(req: ChatCompletionRequest) -> Any:
         raise HTTPException(400, str(exc)) from exc
 
     # A live session already holds the attachments from earlier turns, so only
-    # the current turn's input needs uploading (see _history_end_index).
+    # the current turn's input needs uploading (see _history_end_index). When the
+    # session had to be rebuilt, every historical image is uploaded again: the
+    # rebuilt prompt carries text only, so the model needs the files to see the
+    # conversation. That is expensive (45 images in the live incident), hence the
+    # warning — a rebuild on every turn means the session cache is not holding.
     attachments = _collect_attachments(req, skip_sent_history=has_session)
+    if not has_session and len(attachments) > 1:
+        log.warning(
+            "no live session: re-uploading %d historical attachment(s) (session=%s request=%s)",
+            len(attachments),
+            existing_sid,
+            request_id,
+        )
     _validate_attachments(attachments, model_type)
     ref_file_ids = None
     if attachments:
@@ -1054,6 +1065,7 @@ from .deepseek import (  # noqa: E402,F401
 from .models import (  # noqa: E402,F401
     MODEL_TYPE_BY_NAME,
     QWEN_DEFAULT_MODELS,
+    SEARCH_CAPABLE_MODEL_TYPES,
     ChatMessage,
     FileSpec,
     _deepseek_usage,

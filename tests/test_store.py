@@ -17,11 +17,38 @@ def test_cache_root_uses_override(cache_dir):
     assert store_mod.cache_root() == cache_dir
 
 
-def test_cache_root_falls_back_to_temp(monkeypatch):
+def test_cache_root_falls_back_to_temp(monkeypatch, tmp_path):
+    monkeypatch.setattr(store_mod.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setattr(store_mod.settings, "cache_dir", "")
     root = store_mod.cache_root()
     assert isinstance(root, Path)
     assert root.is_absolute()
+    assert root.parent == tmp_path
+
+
+def test_cache_root_is_per_instance(monkeypatch, tmp_path):
+    """Two instances on different ports must not share one cache directory.
+
+    JsonStore rewrites its whole file on every write, so a shared directory
+    means the last writer wins: one instance silently drops the other's
+    sessions, the next turn misses its upstream chat and re-uploads the whole
+    history (45 images in the live incident).
+    """
+    monkeypatch.setattr(store_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(store_mod.settings, "cache_dir", "")
+    monkeypatch.setattr(store_mod.settings, "port", 8000)
+    first = store_mod.cache_root()
+    monkeypatch.setattr(store_mod.settings, "port", 9000)
+    second = store_mod.cache_root()
+    assert first != second
+    assert first == tmp_path / "danyapi-8000"
+    assert second == tmp_path / "danyapi-9000"
+
+
+def test_cache_root_override_wins_over_port(monkeypatch, tmp_path):
+    monkeypatch.setattr(store_mod.settings, "cache_dir", str(tmp_path))
+    monkeypatch.setattr(store_mod.settings, "port", 9000)
+    assert store_mod.cache_root() == tmp_path
 
 
 def test_disabled_without_scope(cache_dir):

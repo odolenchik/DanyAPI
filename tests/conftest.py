@@ -44,3 +44,19 @@ def instant_sleep():
 
     with patch("asyncio.sleep", side_effect=fast_sleep):
         yield
+
+
+@pytest.fixture(autouse=True)
+def isolated_cache(tmp_path_factory, monkeypatch):
+    """Point the on-disk cache at a per-test directory.
+
+    Without this, any test that builds a real store (usage tracker, session
+    registry, or the app lifespan via TestClient) writes into the live instance
+    cache under the temp dir, which is shared state between the test run and a
+    running server.
+    """
+    from danyapi import store as store_mod
+
+    root = tmp_path_factory.mktemp("cache")
+    monkeypatch.setattr(store_mod.settings, "cache_dir", str(root))
+    yield root

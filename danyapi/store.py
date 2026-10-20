@@ -15,12 +15,25 @@ log = logging.getLogger("danyapi.store")
 DEFAULT_CACHE_SUBDIR = "danyapi"
 
 
+def default_cache_subdir() -> str:
+    """Per-instance cache directory name under the system temp dir.
+
+    Instances usually run side by side (8000 / 9000 / 6660) and JsonStore
+    rewrites its whole file on every write, so a shared directory means the
+    last writer wins: one process silently drops the other's sessions and
+    context fingerprints. Every turn then misses its upstream chat, rebuilds the
+    conversation from scratch and re-uploads the whole history. The listen port
+    keeps instances apart; an explicit ``DANYAPI_CACHE_DIR`` still wins.
+    """
+    return f"{DEFAULT_CACHE_SUBDIR}-{settings.port}"
+
+
 def cache_root() -> Path:
     override = settings.cache_dir
     if override:
         root = Path(override)
     else:
-        root = Path(tempfile.gettempdir()) / DEFAULT_CACHE_SUBDIR
+        root = Path(tempfile.gettempdir()) / default_cache_subdir()
     try:
         root.mkdir(parents=True, exist_ok=True)
     except OSError as exc:

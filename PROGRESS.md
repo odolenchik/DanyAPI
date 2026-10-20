@@ -906,6 +906,79 @@
 
 ## В работе
 
+- **Изоляция дискового кэша между инстансами (45 повторных загрузок картинок).**
+  Симптом: после рестарта DanyAPI2 на 9000 «продолженный» диалог заново загрузил
+  всю историю изображений — 45 загрузок за 26 секунд на один запрос.
+  - **Корневая причина:** обе копии (DanyAPI на 8000 и DanyAPI2 на 9000) писали
+    кэш в один каталог `/tmp/danyapi`. `JsonStore._write` перезаписывает файл
+    целиком, поэтому работает «кто последний, тот и прав»: один процесс молча
+    теряет сессии и отпечатки контекста другого. Каждый ход промахивался мимо
+    upstream-чата, диалог пересобирался с нуля и история уходила на повторную
+    загрузку.
+  - **`danyapi/store.py`:** `default_cache_subdir()` → `danyapi-<settings.port>`;
+    `cache_root()` использует его вместо общего `danyapi`. Явный
+    `DANYAPI_CACHE_DIR` по-прежнему имеет приоритет.
+  - **Тесты:** `tests/test_store.py` — `test_cache_root_falls_back_to_temp`
+    изолирован через `monkeypatch` на `tempfile.gettempdir`; новые
+    `test_cache_root_is_per_instance` (8000 ≠ 9000) и
+    `test_cache_root_override_wins_over_port`. `tests/conftest.py` — autouse
+    фикстура `isolated_cache` уводит `settings.cache_dir` в `tmp_path`, иначе
+    тесты (usage-трекер, lifespan через `TestClient`) писали в боевой кэш.
+  - **Доки:** `.env.example`, `docs/configuration.html`, `docs/i18n.js` (ru+en).
+  - Верификация: `ruff check` + `ruff format --check` + `arch-check` +
+    `pytest -q` → **1369 passed**; после прогона каталоги в `/tmp` не создаются.
+    Синхронизировано в `DanyAPI2` (`store.py` + оба тест-файла), там тоже
+    1369 passed.
+  - Живые инстансы 8000/9000 перезапущены и уже пишут в свои каталоги
+    `/tmp/danyapi-8000` и `/tmp/danyapi-9000`.
+  - **Не сделано:** изменения не закоммичены. Кэш-состояние обоих инстансов при
+    проверке пересоздавалось (каталоги удалялись, чтобы поймать утечку в тестах),
+    сессии/контексты в кэше потеряны — на данные это не влияет.
+
+- **Пустой ответ DeepSeek больше не уходит клиенту как успех (зависание Kimi на
+  цензуре).** Симптом: `ReadMediaFile` показал изображение, DeepSeek его
+  отклонил, Kimi Code завис — в логе DanyAPI2 (порт 9000) 153 загрузки одной и
+  той же картинки, интервалы 13→20→40 с.
+  - **Корневая причина 1:** отказ приходит обычным `toast` без
+    `type: "error"` («Content violates terms. Message not sent.»), а
+    `MessageReconstructor.handle` сохранял только `type == "error"` → текст
+    терялся, `hint_error` пуст.
+  - **Корневая причина 2:** пустой ответ (ни `content`, ни `reasoning`, ни
+    `hint_error`) отдавался как обычный `finish_reason: "stop"` с пустым
+    `content` (non-stream 200 / stream `stop`). Клиент видел «ничего не
+    сгенерировано» и повторял запрос — отсюда бесконечный цикл, ретраи
+    прокси тут ни при чём (апстрим отвечал за 0.5 с).
+  - `deepseek/stream.py`: новый `MessageReconstructor.notice` — любой
+    toast/hint с текстом сохраняется независимо от `type`; `extend_with`
+    его переносит.
+  - `retry.py`: `blank_answer_reason(rec)` (текст отказа → `CONTENT_FILTER` →
+    generic «empty response») и `blank_answer_finish_reason(rec)`
+    (`content_filter` / reason из hint / `error`).
+  - `api/streaming.py`: guard в обоих путях — non-stream → `HTTPException(502,
+    reason)`, stream → SSE-чанк с `error.message` и `finish_reason`, затем
+    `[DONE]`. Пустой ответ никогда не считается успехом; отказ не ретраится.
+  - Тесты: `tests/test_retry.py` +6 (`REFUSAL_NOTICE_SSE`,
+    `CONTENT_FILTER_STATUS_SSE`, `EMPTY_SSE`). Негативная проверка: без фикса
+    5 из 6 падают.
+  - Верификация: `ruff check` + `ruff format --check` + `pytest -q` →
+    **1367 passed**, `arch-check` OK. Синхронизировано в `DanyAPI2`
+    (вместе с search-фиксом; там тоже 1367 passed). Живой прогон на 9001:
+    non-stream `pong` 200, stream 11 чанков + `[DONE]`.
+  - **Не сделано:** ваш процесс на 9000 не перезапускался — фикс вступит в
+    силу после рестарта DanyAPI2. E2E на реально отклонённом изображении не
+    воспроизводился (не открывал картинку); отказ покрыт SSE-фикстурами из
+    инцидента.
+
+- DeepSeek web search разрешён для `deepseek-v4-pro`: гейт в
+  `api/openai.py` (`_chat_completions_deepseek`) заменён с `model_type == "default"`
+  на `model_type in SEARCH_CAPABLE_MODEL_TYPES` (новый кортеж в `api/models.py`:
+  `default`, `expert`; `vision` без поиска). Обновлены `tests/test_retry.py`
+  (pro теперь `search=True`), `README.md`, `docs/overview.html`,
+  `docs/usage.html`, `docs/i18n.js`. Верификация: `ruff check` +
+  `ruff format --check` + `pytest -q` → 1361 passed, `arch-check` OK.
+  E2E вживую: non-stream (`search: true` + `deepseek-v4-pro` → 3 свежих
+  заголовка HN со ссылками, `finish_reason: stop`) и stream (703 `data:`-чанка,
+  маркеры `[citation:N]`, `[DONE]`) на порту 8765.
 - z.ai: выбор модели по `req.model`. Добавлен реестр `danyapi/zai/models.py`
   (`ZAI_MODELS`, `resolve_zai_model`, `openai_model_list`) с wire-id, которые
   фронтенд кладёт в тело запроса: `glm-5.3` → `glm-5.3`, `glm-5.3-flash` →

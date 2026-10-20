@@ -47,6 +47,8 @@ from .deepseek import (
     _prepare_session,
     _send_with_auth,
     _try_stop_stream,
+    blank_answer_finish_reason,
+    blank_answer_reason,
 )
 from .models import CONTEXT_LENGTH_STATUS, INPUT_EXCEEDS_LIMIT, MAX_CONTINUE_ROUNDS, _deepseek_usage, _finish_reason
 
@@ -1017,6 +1019,19 @@ async def _collect_non_stream(
                 )
             raise HTTPException(429, _busy_error_body(rec))
 
+        # A blank reply is never a success: a content-policy refusal or a bare
+        # notice arrives with no content, and passing it on as "stop" makes the
+        # client resend the same request indefinitely.
+        blank_reason = blank_answer_reason(rec)
+        if blank_reason is not None:
+            log.warning(
+                "empty answer where=non-stream session=%s request=%s reason=%s",
+                session_key,
+                request_id,
+                blank_reason,
+            )
+            raise HTTPException(502, blank_reason)
+
         account.sessions.touch_last_message(session_key, rec.id or response_message_id)
         if context_seq:
             pool.index_context(session_key, context_seq)
@@ -1609,6 +1624,44 @@ async def _stream_openai(
                             "index": 0,
                             "delta": {},
                             "finish_reason": hint.get("finish_reason") or "error",
+                        }
+                    ],
+                }
+            )
+            yield _sse(
+                {
+                    "id": chunk_id,
+                    "session_id": session_key,
+                    "object": "chat.completion.chunk",
+                    "choices": [],
+                }
+            )
+            yield "data: [DONE]\n\n"
+            return
+
+        # A blank reply is never a success: a content-policy refusal or a bare
+        # notice arrives with no content, and reporting it as a normal "stop"
+        # makes the client resend the same request indefinitely.
+        blank_reason = blank_answer_reason(rec)
+        if blank_reason is not None:
+            log.warning(
+                "empty answer where=stream session=%s request=%s reason=%s",
+                session_key,
+                request_id,
+                blank_reason,
+            )
+            yield _sse(
+                {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "error": {"message": blank_reason},
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": blank_answer_finish_reason(rec),
                         }
                     ],
                 }

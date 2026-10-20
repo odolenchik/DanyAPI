@@ -56,6 +56,35 @@ TOO_FREQUENT_SSE = (
     "\n"
 )
 
+# Content-policy refusal: the upstream closes with a plain notice toast, no
+# `type: "error"`, and no content fragments at all. Reproduced from the live
+# incident where Kimi Code hung re-sending the same refused image.
+REFUSAL_NOTICE_SSE = (
+    "event: ready\n"
+    'data: {"request_message_id":1,"response_message_id":2,"model_type":"vision"}\n'
+    "\n"
+    "event: toast\n"
+    'data: {"content":"Content violates terms. Message not sent."}\n'
+    "\n"
+    "event: close\n"
+    'data: {"click_behavior":"retry","auto_resume":false}\n'
+    "\n"
+)
+
+# Same refusal, but reported through the message status instead of a notice.
+CONTENT_FILTER_STATUS_SSE = (
+    "event: ready\n"
+    'data: {"request_message_id":1,"response_message_id":2,"model_type":"vision"}\n'
+    "\n"
+    'data: {"p":"response/status","o":"SET","v":"CONTENT_FILTER"}\n'
+    "\n"
+)
+
+# A plain empty reply: no content, no notice, no status.
+EMPTY_SSE = (
+    'event: ready\ndata: {"request_message_id":1,"response_message_id":2,"model_type":"default"}\n\ndata: {"p":"response/status","o":"SET","v":"FINISHED"}\n\n'
+)
+
 
 class FakeSession:
     def __init__(self, sid: str = "c1", last_message_id: str | None = None) -> None:
@@ -283,6 +312,63 @@ async def test_stream_omits_usage_by_default():
     assert '"usage"' not in "".join(lines)
 
 
+async def test_non_stream_refusal_notice_is_502_with_upstream_text():
+    """A refused message must not come back as a successful blank answer.
+
+    Regression: the refusal arrives as a plain toast (no `type: "error"`), so it
+    was dropped, and the empty reply was returned as `finish_reason: "stop"`.
+    The client saw "nothing generated" and resent the same request forever.
+    """
+    acct = FakeAccount([REFUSAL_NOTICE_SSE] * (openai_mod.MAX_RETRIES + 1))
+    with pytest.raises(openai_mod.HTTPException) as excinfo:
+        await _collect_non_stream(**_args(acct))
+    assert excinfo.value.status_code == 502
+    assert "Content violates terms" in str(excinfo.value.detail)
+    # Not retried: the same input will be refused again.
+    assert acct.client.completion.await_count == 1
+
+
+async def test_stream_refusal_notice_emits_error_not_empty_stop():
+    acct = FakeAccount([REFUSAL_NOTICE_SSE])
+    lines = list(await _collect(_stream_openai(**_args(acct))))
+    joined = "".join(lines)
+    assert "Content violates terms" in joined
+    assert '"finish_reason": "stop"' not in joined
+    assert joined.rstrip().endswith("data: [DONE]")
+
+
+async def test_non_stream_content_filter_status_is_502():
+    acct = FakeAccount([CONTENT_FILTER_STATUS_SSE])
+    with pytest.raises(openai_mod.HTTPException) as excinfo:
+        await _collect_non_stream(**_args(acct))
+    assert excinfo.value.status_code == 502
+    assert "refused" in str(excinfo.value.detail).lower()
+
+
+async def test_stream_content_filter_status_reports_content_filter():
+    acct = FakeAccount([CONTENT_FILTER_STATUS_SSE])
+    lines = list(await _collect(_stream_openai(**_args(acct))))
+    joined = "".join(lines)
+    assert '"finish_reason": "content_filter"' in joined
+
+
+async def test_non_stream_plain_empty_reply_is_502():
+    """Even without any hint text, an empty reply is an error, never a success."""
+    acct = FakeAccount([EMPTY_SSE])
+    with pytest.raises(openai_mod.HTTPException) as excinfo:
+        await _collect_non_stream(**_args(acct))
+    assert excinfo.value.status_code == 502
+    assert "empty" in str(excinfo.value.detail).lower()
+
+
+async def test_stream_plain_empty_reply_emits_error():
+    acct = FakeAccount([EMPTY_SSE])
+    lines = list(await _collect(_stream_openai(**_args(acct))))
+    joined = "".join(lines)
+    assert '"error"' in joined
+    assert '"finish_reason": "stop"' not in joined
+
+
 async def test_obtain_waits_for_lock():
     acct = FakeAccount([OK_SSE])
     state = {"under_lock": False}
@@ -485,7 +571,7 @@ def test_model_type_mapping():
     }
 
 
-async def test_search_gated_to_flash_and_thinking_allowed():
+async def test_search_gated_to_chat_models_and_thinking_allowed():
     captured = {}
     orig = openai_mod._collect_non_stream
 
@@ -518,7 +604,7 @@ async def test_search_gated_to_flash_and_thinking_allowed():
 
         await run("deepseek-v4-pro", search=True, thinking=None)
         assert captured["model_type"] == "expert"
-        assert captured["search"] is False
+        assert captured["search"] is True
         assert captured["thinking"] is True
 
         await run("deepseek-v4-vision", search=True, thinking=True)

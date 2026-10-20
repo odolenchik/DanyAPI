@@ -113,7 +113,7 @@ At least one valid DeepSeek or Qwen credential is required; otherwise the server
 | `DANYAPI_ACQUIRE_TIMEOUT` | empty | Seconds to wait for a free account before returning `429` (empty = wait forever) |
 | `DANYAPI_SESSION_CACHE_SIZE` | `128` | Max server-side chats cached per provider (LRU) |
 | `DANYAPI_SESSION_TTL_SECONDS` | `3600` | Seconds an unused session/context stays reusable (0 = never expire) |
-| `DANYAPI_CACHE_DIR` | empty | On-disk cache directory (default: system temp dir, e.g. `%TEMP%\danyapi`) |
+| `DANYAPI_CACHE_DIR` | empty | On-disk cache directory (default: system temp dir namespaced by listen port, e.g. `%TEMP%\danyapi-8000`) |
 | `DANYAPI_CACHE_DISABLED` | empty | Set to `1`/`true`/`yes`/`on` to disable the on-disk cache |
 
 ### Logging
@@ -217,7 +217,7 @@ Streaming: add `"stream": true`. The response uses `text/event-stream` with Open
 - `stream` — stream the response (`false` by default)
 - `temperature`, `top_p`
 - `thinking` — enable thinking mode
-- `search` — enable web search
+- `search` — enable web search (DeepSeek: `deepseek-v4-flash`, `deepseek-v4-pro`; not `deepseek-v4-vision`)
 - `session_id` — pin the conversation to a specific server-side session
 - `user` — end-user identifier used for context deduplication
 - `files` — list of `{name, content, content_type}` where `content` is base64

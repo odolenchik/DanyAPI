@@ -113,3 +113,45 @@ def _drop_session(pool, account, session_key: str) -> None:
     pool.forget(session_key)
     pool.forget_context(session_key)
     account.sessions.forget(session_key)
+
+
+# Upstream can answer with no content at all: a content-policy refusal, or a
+# bare notice toast. Reported as a plain "stop" with an empty message, that
+# looks like a successful blank answer, and the client just retries the same
+# request forever (Kimi did, re-uploading the same refused image each time).
+# A blank answer is therefore never passed through as success.
+CONTENT_FILTER_STATUS = "CONTENT_FILTER"
+EMPTY_ANSWER_MESSAGE = "DeepSeek returned an empty response"
+REFUSAL_MESSAGE = "DeepSeek refused the message (content policy); nothing was sent"
+
+
+def blank_answer_reason(rec) -> str | None:
+    """Return why a reply is empty, or None when it actually carries text.
+
+    The refusal text is preferred over a generic message: it is the only thing
+    that tells the user *why* nothing came back.
+    """
+    if getattr(rec, "content", "") or getattr(rec, "reasoning", ""):
+        return None
+    hint = getattr(rec, "hint_error", None) or {}
+    notice = getattr(rec, "notice", None) or {}
+    for payload in (hint, notice):
+        message = payload.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    if getattr(rec, "status", None) == CONTENT_FILTER_STATUS:
+        return REFUSAL_MESSAGE
+    return EMPTY_ANSWER_MESSAGE
+
+
+def blank_answer_finish_reason(rec) -> str:
+    """The OpenAI finish_reason to report for an empty answer."""
+    hint = getattr(rec, "hint_error", None) or {}
+    notice = getattr(rec, "notice", None) or {}
+    for payload in (hint, notice):
+        reason = payload.get("finish_reason")
+        if isinstance(reason, str) and reason:
+            return reason
+    if getattr(rec, "status", None) == CONTENT_FILTER_STATUS:
+        return "content_filter"
+    return "error"
