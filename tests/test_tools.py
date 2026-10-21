@@ -3405,6 +3405,99 @@ def test_dsml_param_eq_opener_canonical_untouched():
     assert [json.loads(c.arguments)["command"] for c in calls] == ["echo hi", "pwd"]
 
 
+def test_dsml_param_eq_opener_inside_invoke():
+    """tooltrace 2baa4153, 0d19b84c: the ``parameter="X"`` opener also appears INSIDE
+    an ``<invoke name="Bash">`` body, not only in the bare-parameter layout. The
+    invoke branch's bounded re-scan only looked for ``parameter name=``, so the args
+    came out empty: the call was emitted as ``Bash {}``, the client rejected it as
+    missing required, and the repair loop re-asked the same shape — 14 identical
+    ``ok:missing_required`` turns in one session until the context ran out.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f"<{S} calls>\n"
+        f'<{S} invoke name="Bash">\n'
+        f'<{S} parameter="command">V=/tmp/venv; "$V/bin/python3" -c "print(1)"{S}>\n'
+        f'<{S} parameter="timeout">300{S}>\n'
+        f"</{S} calls>"
+    )
+    schemas = {"Bash": {"command": "string", "timeout": "integer"}}
+    calls, _ = _parse_dsml(text, schemas)
+    assert calls is not None and len(calls) == 1
+    assert calls[0].name == "Bash"
+    assert json.loads(calls[0].arguments) == {
+        "command": 'V=/tmp/venv; "$V/bin/python3" -c "print(1)',
+        "timeout": 300,
+    }
+
+
+def test_dsml_colon_equals_attributes_recovered():
+    """tooltrace b1240bcd: DeepSeek replaced every ``=`` with ``:=""`` and every
+    attribute separator with ``,=""`` -- ``name="timeout" :="" 600}``. No opener
+    regex matches that spelling, so the call went out with empty args and the
+    repair loop re-asked. The mangled pairs are recovered instead, and a bare word
+    elsewhere in the body (the DSML tag name) is not mistaken for an argument.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = f'<{S} calls>\n<{S} invoke name="WaitFor">\n<{S} task_id" :="" "bash-ru1nql6e",="" "timeout":600}}\n<{S} >\n<{S} >'
+    schemas = {"WaitFor": {"task_id": "string", "timeout": "integer"}}
+    calls, _ = parse_tool_calls(text, schemas)
+    assert calls is not None and len(calls) == 1
+    assert calls[0].name == "WaitFor"
+    assert json.loads(calls[0].arguments) == {"task_id": "bash-ru1nql6e", "timeout": 600}
+
+
+def test_dsml_bare_param_opener_inside_dsml_invoke():
+    """tooltrace 42585858: the invoke and close tags carry the DSML separator, but the
+    parameter opener was written as plain XML (`<parameter name="path">`). Every param
+    regex keys on the separator, so the argument was invisible and the call went out
+    with empty args -- the same missing_required repair loop.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f"<{S} calls>\n"
+        f'<{S} invoke name="Read">\n'
+        f'<parameter name="path">/tmp/f.py</{S} parameter>\n'
+        f'<parameter name="line_offset">55</{S} parameter>\n'
+        f"</{S} invoke>\n"
+        f"</{S} calls>"
+    )
+    schemas = {"Read": {"path": "string", "line_offset": "integer"}}
+    calls, _ = parse_tool_calls(text, schemas)
+    assert calls is not None and len(calls) == 1
+    assert calls[0].name == "Read"
+    assert json.loads(calls[0].arguments) == {"path": "/tmp/f.py", "line_offset": 55}
+
+
+def test_dsml_naked_attribute_name_inside_invoke():
+    """tooltrace 5186a5ff, 6ea8d3ab, ab9045d8: the opener loses the whole
+    ``parameter name=`` prefix and the ``=`` with it, leaving only the key and a
+    dangling quote — `` ``. Every param regex wants
+    ``parameter name="X"``, so the argument was invisible and the call went out with
+    empty args; the repair loop re-asked the same shape (10 identical
+    ``ok:missing_required`` turns in session 953c0ca4). The repair restores the
+    canonical opener and keeps the ``string`` flag.
+    """
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f"<{S} calls>\n"
+        f'<{S} invoke name="Edit">\n'
+        f'<{S} path" string="true">/tmp/f.py{S}>\n'
+        f'<{S} old_string" string="true">a = 1{S}>\n'
+        f'<{S} new_string" string="true">a = 2{S}>\n'
+        f"</{S} calls>"
+    )
+    schemas = {"Edit": {"path": "string", "old_string": "string", "new_string": "string"}}
+    calls, _ = parse_tool_calls(text, schemas)
+    assert calls is not None and len(calls) == 1
+    assert calls[0].name == "Edit"
+    assert json.loads(calls[0].arguments) == {
+        "path": "/tmp/f.py",
+        "old_string": "a = 1",
+        "new_string": "a = 2",
+    }
+
+
 def test_dsml_param_eq_opener_glued_marker_before_gt():
     """tooltrace 4e3abd5c: the ``parameter="X"`` opener carries a stray DSML marker
     glued between the name quote and the closing ``>`` (``parameter="path"`` + marker +

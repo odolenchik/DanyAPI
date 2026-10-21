@@ -1146,6 +1146,39 @@ _DSML_BARE_ARGUMENTS_RE = re.compile(
 )
 
 
+# Naked attribute name (tooltrace 5186a5ff, 6ea8d3ab, ab9045d8): the parameter
+# opener loses the whole ``parameter name=`` prefix AND the ``=`` itself, leaving
+# only ``name"`` — `` `` — with the quote that
+# used to close the attribute dangling after the name. Every DSML param regex
+# expects ``parameter name="X"``, so the argument is invisible, the call parses
+# with EMPTY args, the client rejects it as missing required, and the repair loop
+# re-asks the same shape (10 identical turns in session 953c0ca4). The separator
+# is followed directly by the key identifier, which no canonical tag does, so this
+# never touches a well-formed opener.
+_DSML_NAKED_ATTR_RE = re.compile(
+    rf"<{_DSML_SEP}\s*DSML\s*{_DSML_SEP}\s*"
+    rf"(?P<key>[A-Za-z_][\w.-]*)\s*(?P<q>['\"])"
+    rf"(?:\s+string=(?P<sq>['\"])(?P<sval>true|false)(?P=sq))?"
+    rf"\s*>",
+    re.IGNORECASE,
+)
+
+
+def _repair_dsml_naked_attributes(text: str) -> str:
+    """Rewrite `` `` to a canonical parameter opener."""
+    if "DSML" not in text:
+        return text
+
+    def _repl(m: re.Match[str]) -> str:
+        key = m.group("key")
+        sval = m.group("sval")
+        sep = "||"
+        flag = f' string="{sval}"' if sval else ""
+        return f'<{sep}DSML{sep} parameter name="{key}"{flag}>'
+
+    return _DSML_NAKED_ATTR_RE.sub(_repl, text)
+
+
 def _repair_dsml_bare_arguments(text: str) -> str:
     """Rewrite a bare ``arguments="<escaped json>"`` DSML tag to a canonical param tag."""
     if "arguments" not in text:
@@ -1161,6 +1194,120 @@ def _repair_dsml_bare_arguments(text: str) -> str:
         return f'<{sep}DSML{sep} parameter name="arguments" string="true">{value}</{sep}DSML{sep} parameter>'
 
     return _DSML_BARE_ARGUMENTS_RE.sub(_repl, text)
+
+
+# Bare parameter opener inside a DSML block (tooltrace 42585858): the <invoke> and
+# the close tags carry the DSML separator, but the opener was written as plain XML --
+# <parameter name="path"> instead of the canonical DSML-prefixed tag. Every param
+# regex keys on the separator, so the argument is invisible, the call parses with
+# EMPTY args, the client rejects it as missing required, and the repair loop re-asks
+# the same shape. Only the opener is rewritten: the canonical close regex already
+# accepts a bare </parameter>.
+_BARE_PARAM_OPENER_RE = re.compile(
+    r"<\s*parameter\s+name=(?P<q>['\"])(?P<pname>[^'\">]+)(?P=q)"
+    r"(?:\s+string=(?P<sq>['\"])(?P<sval>true|false)(?P=sq))?"
+    r"\s*>",
+    re.IGNORECASE,
+)
+
+
+def _repair_dsml_bare_param_opener(text: str) -> str:
+    """Prefix a bare `<parameter ...>` opener inside a DSML block with the separator."""
+    # Only inside a DSML-prefixed invoke: a plain-XML `<invoke>` with plain openers is
+    # the generic XML format and must keep going through the XML branch.
+    if "DSML" not in text or not _DSML_INVOKE_RE.search(text):
+        return text
+
+    def _repl(m: re.Match[str]) -> str:
+        pname = m.group("pname")
+        sval = m.group("sval") or "true"
+        sep = "||"
+        return f'<{sep}DSML{sep} parameter name="{pname}" string="{sval}">'
+
+    return _BARE_PARAM_OPENER_RE.sub(_repl, text)
+
+
+_COLON_KEY_RE = re.compile(r'\s*,?\s*"?(?P<key>[A-Za-z_][\w.-]*)"?\s*')
+_COLON_SEP_RE = re.compile(r'(?:\s*:\s*)?=\s*""\s*')
+_COLON_PLAIN_SEP_RE = re.compile(r"\s*:\s*")
+
+
+def _read_dsml_colon_value(body: str, pos: int) -> tuple[Any, int]:
+    """Read one value at ``pos``: a quoted string or a bare token."""
+    n = len(body)
+    while pos < n and body[pos] in " \t\r\n":
+        pos += 1
+    if pos < n and body[pos] == '"':
+        end = pos + 1
+        while end < n:
+            if body[end] == "\\":
+                end += 2
+                continue
+            if body[end] == '"':
+                end += 1
+                break
+            end += 1
+        try:
+            return json.loads(body[pos:end]), end
+        except (ValueError, TypeError):
+            return body[pos + 1 : end - 1], end
+    end = pos
+    while end < n and body[end] not in ",}<\n":
+        end += 1
+    raw = body[pos:end].strip()
+    if raw.startswith(":"):
+        raw = raw[1:].strip()
+    if not raw:
+        return None, end
+    return _coerce_dsml(raw), end
+
+
+def _parse_dsml_colon_attrs(body: str, known_keys: Any = None) -> dict[str, Any]:
+    """Recover args from a body whose ``=`` became ``:=""``.
+
+    tooltrace b1240bcd: DeepSeek replaced every ``=`` with ``:=""`` and every
+    attribute separator with ``,=""`` -- ``name="timeout" :="" 600}`` -- so no
+    opener regex matched, the call went out with empty args, and the repair loop
+    re-asked the same shape.
+
+    A few pairs in the same body keep a plain ``"key":value`` spelling. Those are
+    only accepted for keys the tool schema declares, and only once the body has
+    shown the mangled separator -- otherwise ordinary prose would be harvested.
+    """
+    out: dict[str, Any] = {}
+    mangled_seen = False
+    pos = 0
+    n = len(body)
+    while pos < n:
+        m = _COLON_KEY_RE.match(body, pos)
+        if not m or not m.group("key"):
+            nxt = re.search(r"\S", body[pos:])
+            if not nxt:
+                break
+            pos = pos + nxt.start() + 1
+            continue
+        key = m.group("key")
+        marker = _COLON_SEP_RE.match(body, m.end())
+        if not marker:
+            plain = _COLON_PLAIN_SEP_RE.match(body, m.end())
+            if not (mangled_seen and plain and known_keys and key in known_keys):
+                # A bare word elsewhere in the body (the DSML tag name, a shell
+                # keyword) is not an attribute: only a separator marks one.
+                pos = m.end()
+                continue
+            marker = plain
+        else:
+            mangled_seen = True
+        pos = marker.end()
+        value, pos = _read_dsml_colon_value(body, pos)
+        if key in ("parameter", "name", "DSML") or key in out or value is None:
+            continue
+        if isinstance(value, str) and ("DSML" in value or '=""' in value):
+            return {}
+        out[key] = value
+        if pos <= marker.end():
+            pos = marker.end() + 1
+    return out
 
 
 # Degenerate DSML attributes (tooltrace 7e2f6788): DeepSeek collapses each argument
@@ -1645,29 +1792,41 @@ def _parse_dsml(text: str, tool_schemas: dict[str, dict[str, Any]] | None = None
                 rf"(?:</?)?\s*{_DSML_SEP}DSML{_DSML_SEP}\s*(?:\w+\s*)?[^>]*>",
                 re.IGNORECASE,
             )
-            openers: list[re.Match[str]] = []
-            for pm in _DSML_PARAM_OPENER_RE.finditer(text, m.end(), body_end):
-                openers.append(pm)
+            # Both opener spellings must be scanned here: the canonical
+            # ``parameter name="X"`` and the malformed ``parameter="X"`` whose
+            # value carries a stray trailing quote. Scanning only the canonical
+            # form left the args dict empty for a body written as
+            # ``parameter="command"``, so the call went out as ``Bash {}``, the
+            # client rejected it as missing required, and the repair loop re-asked
+            # the same shape until the turn died (tooltrace 2baa4153, 0d19b84c).
+            openers: list[tuple[re.Match[str], bool]] = [(pm, False) for pm in _DSML_PARAM_OPENER_RE.finditer(text, m.end(), body_end)]
+            openers += [(pm, True) for pm in _DSML_PARAM_EQ_OPENER_RE.finditer(text, m.end(), body_end)]
+            openers.sort(key=lambda item: item[0].start())
             # Reset args from the first pass — clean params were already added above,
             # but we need to re-extract ALL params via bounded scanning to get correct
             # values for the shared-close group.  Keep only cleanly-matched params.
             clean_args = {k: v for k, v in args.items() if k in matched_params}
             args.clear()
-            for idx, om in enumerate(openers):
+            for idx, (om, is_eq) in enumerate(openers):
                 pname = om.group("pname")
                 if pname in clean_args:
                     continue  # already correctly extracted via _DSML_PARAM_RE
                 value_start = om.end()
                 if idx + 1 < len(openers):
-                    value_end = openers[idx + 1].start()
+                    value_end = openers[idx + 1][0].start()
                 else:
                     value_end = body_end
                 raw_value = text[value_start:value_end]
                 tag_match = _dsml_tag_any_re.search(raw_value)
                 if tag_match:
                     raw_value = raw_value[: tag_match.start()]
+                raw_value = raw_value.strip()
+                # The ``parameter="X"`` variant reuses its attribute quote around
+                # the value, leaving a stray trailing quote (`sleep 120"`).
+                if is_eq and raw_value.endswith(('"', "'")):
+                    raw_value = raw_value[:-1].rstrip()
                 ptype = (param_types or {}).get(pname)
-                args[pname] = _dsml_param_value(om.group("sval"), raw_value.strip(), ptype)
+                args[pname] = _dsml_param_value(om.group("sval"), raw_value, ptype)
                 matched_params.add(pname)  # prevent _DSML_PARAM_STRING_VALUE_RE from overwriting
             for k, v in clean_args.items():
                 args.setdefault(k, v)
@@ -1698,6 +1857,17 @@ def _parse_dsml(text: str, tool_schemas: dict[str, dict[str, Any]] | None = None
                             args = inner
                         else:
                             args = {k: v for k, v in loaded.items() if k not in ("name", "arguments", "id", "type")}
+            if not args:
+                # Last resort for a body whose every ``=`` turned into ``:=""``
+                # (tooltrace b1240bcd): no opener regex matches that spelling, so
+                # the call would go out with empty args and the repair loop would
+                # re-ask the same shape until the context ran out.
+                colon_args = _parse_dsml_colon_attrs(
+                    text[m.end() : body_end],
+                    set((param_types or {}).keys()),
+                )
+                if colon_args:
+                    args = colon_args
         calls.append(ToolCall.create(name, args))
         consumed.append((m.start(), block_end))
     wrapper_chars = list(text)
@@ -2166,6 +2336,13 @@ def parse_tool_calls(text: str, tool_schemas: dict[str, dict[str, Any]] | None =
     # the latter (tooltrace 4e3abd5c).
     text = _repair_dsml_glued_invoke(text)
     text = _repair_dsml_glued_param(text)
+    # A parameter opener that lost its whole ``parameter name=`` prefix, leaving a
+    # dangling quote after the key (tooltrace 5186a5ff): rewrite before the bare
+    # attribute repair, which would otherwise read the dangling quote as a value.
+    text = _repair_dsml_naked_attributes(text)
+    # A DSML block whose parameter opener dropped the separator entirely
+    # (tooltrace 42585858): restore the prefix so the param regexes see it.
+    text = _repair_dsml_bare_param_opener(text)
     # Chained params: a close tag carrying name= doubles as the next opener (tooltrace
     # 92b6a328). Split it so the normal param path sees standalone closes; runs before
     # the bare-attribute repair, which would otherwise rewrite a close-with-name tag.
