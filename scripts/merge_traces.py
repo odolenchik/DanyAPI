@@ -81,6 +81,7 @@ def _summary(merged: dict[str, dict]) -> None:
     issue_counter: Counter[str] = Counter()
     model_counter: Counter[str] = Counter()
     degen_models: Counter[str] = Counter()
+    repeat_models: Counter[str] = Counter()
     tool_names_seen: set[str] = set()
     for r in merged.values():
         res = r.get("parse.result")
@@ -88,6 +89,8 @@ def _summary(merged: dict[str, dict]) -> None:
             parse_results[res.split(":")[0]] += 1  # ok / unparsed / no_tool_call ...
         if res == "degenerate_repeat":
             degen_models[r.get("client.model") or r.get("dany.model") or "?"] += 1
+        if res == "repeat_loop":
+            repeat_models[r.get("client.model") or r.get("dany.model") or "?"] += 1
         issue = r.get("parse.issue") or ""
         if issue and not str(issue).startswith(("no", "none")):
             # Aggregate by the leading token of each comma-separated issue entry.
@@ -124,6 +127,12 @@ def _summary(merged: dict[str, dict]) -> None:
         for k, n in degen_models.most_common():
             print(f"  {k:<32}: {n}")
         print("  hint: long multi-call turns can lose EOS and repeat the empty DSML container; Dany aborts the stream (DANYAPI_DEGENERATE_GUARD).")
+    if repeat_models:
+        total_repeat = sum(repeat_models.values())
+        print(f"\nrepeat loops (same tool call round after round, stopped): {total_repeat}")
+        for k, n in repeat_models.most_common():
+            print(f"  {k:<32}: {n}")
+        print("  hint: the model kept asking for the identical call; Dany stops the turn (DANYAPI_REPEAT_GUARD).")
     if model_counter:
         print("\nmodels:")
         for k, n in model_counter.most_common():

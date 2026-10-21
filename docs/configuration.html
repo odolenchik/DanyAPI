@@ -103,6 +103,8 @@
                             <tr><td><span class="env-var">DANYAPI_HUMAN_DELAY_MAX</span></td><td><code>3.0</code></td><td data-i18n="cf_r14_desc">Maximum delay in seconds; set both to <code>0</code> to disable</td></tr>
                             <tr><td><span class="env-var">DANYAPI_AUTO_UPDATE</span></td><td><code>1</code></td><td data-i18n="cf_r15_desc">Auto-update to the latest GitHub release on each start; <code>0</code> disables</td></tr>
                             <tr><td><span class="env-var">DANYAPI_DEGENERATE_GUARD</span></td><td><code>1</code></td><td data-i18n="cf_r16_desc">Abort a DeepSeek stream that collapses into a runaway repeat of the empty DSML container; <code>0</code> only logs it</td></tr>
+                            <tr><td><span class="env-var">DANYAPI_REPEAT_GUARD</span></td><td><code>1</code></td><td>Stop a turn that keeps emitting the identical tool call round after round; <code>0</code> only logs it</td></tr>
+                            <tr><td><span class="env-var">DANYAPI_REPEAT_THRESHOLD</span></td><td><code>5</code></td><td>How many identical tool calls in a row declare a repeat loop</td></tr>
                             <tr><td><span class="env-var">DANYAPI_DEGENERATE_THRESHOLD</span></td><td><code>20</code></td><td data-i18n="cf_r17_desc">Number of adjacent empty-container repeats that declares a stream degenerate</td></tr>
                         </tbody>
                     </table>

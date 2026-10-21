@@ -12,6 +12,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from .. import repeat as repeat_guard
 from .. import tools as toolemu
 from ..accounts import AccountPoolBusy, account_lock
 from ..config import settings
@@ -132,6 +133,16 @@ def _validate_parsed(calls: Any, tool_schemas: Any) -> list[Any]:
     """Validate already-parsed calls against the client schemas."""
     as_dicts = [{"name": call.name, "arguments": call.arguments} for call in calls]
     return validate_calls(as_dicts, tool_schemas)
+
+
+REPEAT_LOOP_STATUS = "repeat_loop"
+
+
+def _repeat_loop_hit(session: Any, calls: Any) -> bool:
+    """Whether this round repeats the previous call often enough to stop."""
+    if not settings.repeat_guard:
+        return False
+    return repeat_guard.note_calls(session, calls, settings.repeat_threshold)
 
 
 async def _retry_tool_call(
@@ -1082,6 +1093,42 @@ async def _collect_non_stream(
                     )
                     if repaired is not None:
                         tool_calls, tool_text = repaired
+                if _repeat_loop_hit(session, tool_calls):
+                    log.warning(
+                        "repeat loop: identical tool call %d times, stopping (session=%s request=%s)",
+                        settings.repeat_threshold,
+                        session_key,
+                        request_id,
+                    )
+                    repeat_guard.reset(session)
+                    if trace is not None:
+                        trace.parse(
+                            request_id,
+                            result=REPEAT_LOOP_STATUS,
+                            issue=None,
+                            session_id=session_key,
+                            model=model,
+                        )
+                    return {
+                        "id": f"chatcmpl-{uuid.uuid4().hex}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": model,
+                        "error": {
+                            "message": f"repeated tool call: the model asked for the same action {settings.repeat_threshold} times in a row, stopping here",
+                            "finish_reason": REPEAT_LOOP_STATUS,
+                        },
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": ""},
+                                "finish_reason": "error",
+                            }
+                        ],
+                        "usage": _deepseek_usage(getattr(session, "accumulated_tokens", 0)),
+                        "session_id": session_key,
+                        "x_request_id": request_id,
+                    }
                 finish = "tool_calls"
                 message = toolemu.format_tool_message(tool_calls, tool_text, reasoning)
             else:
@@ -1726,6 +1773,49 @@ async def _stream_openai(
                     )
                     if repaired is not None:
                         tool_calls, tool_text = repaired
+                if _repeat_loop_hit(session, tool_calls):
+                    # The same call has come back N times: stop instead of feeding
+                    # the client another identical round, and stop the upstream
+                    # stream so the account stops burning its rate limit.
+                    log.warning(
+                        "repeat loop: identical tool call %d times, stopping (session=%s request=%s)",
+                        settings.repeat_threshold,
+                        session_key,
+                        request_id,
+                    )
+                    repeat_guard.reset(session)
+                    await _try_stop_stream(account.client, session.id, stop_message_id)
+                    if trace is not None:
+                        trace.parse(
+                            request_id,
+                            result=REPEAT_LOOP_STATUS,
+                            issue=None,
+                            session_id=session_key,
+                            model=model,
+                        )
+                    yield _sse(
+                        {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "error": {
+                                "message": f"repeated tool call: the model asked for the same action {settings.repeat_threshold} times in a row, stopping here",
+                                "finish_reason": REPEAT_LOOP_STATUS,
+                            },
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                        }
+                    )
+                    yield _sse(
+                        {
+                            "id": chunk_id,
+                            "session_id": session_key,
+                            "object": "chat.completion.chunk",
+                            "choices": [],
+                        }
+                    )
+                    yield "data: [DONE]\n\n"
+                    return
                 for delta in toolemu.tool_call_deltas(tool_calls, tool_text):
                     yield _sse(
                         {

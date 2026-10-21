@@ -2,6 +2,68 @@
 
 ## Готово
 
+- **Сторож против цикла повторяющихся tool-вызовов (`repeat_loop`).**
+  Симптом: сессия шлёт один и тот же вызов раунд за раундом, пока не кончится
+  контекст (14 подряд в `a2b6de5d`, 10 в `953c0ca4`); приходилось жать «стоп» в вебе,
+  а без этого DeepSeek грозил блокировкой за too frequent.
+  - **Новый модуль `danyapi/repeat.py`:** сигнатура вызова (имя + аргументы с
+    сортировкой ключей), счётчик живёт в `DeepSeekSession.extra` и переживает
+    раунды; любой другой вызов или раунд без вызовов сбрасывает счётчик.
+  - **`danyapi/api/streaming.py`:** проверка после `_validate_parsed` в обоих путях
+    (non-stream и stream). При срабатывании — ошибка `finish_reason: repeat_loop`,
+    в стриме дополнительно `_try_stop_stream`, чтобы аккаунт не жёг лимит.
+  - **`danyapi/config.py`:** `DANYAPI_REPEAT_GUARD` (дефолт 1) и
+    `DANYAPI_REPEAT_THRESHOLD` (дефолт 5).
+  - **`scripts/merge_traces.py`:** отдельная секция `repeat loops` в сводке.
+  - **Тесты:** `tests/test_repeat.py` (11, покрытие 100%) + 4 интеграционных в
+    `tests/test_retry.py` (стрим, non-stream, выключенный гард, разные вызовы).
+  - Документация: `.env.example`, `README.md`, `docs/configuration.html`.
+  - Верификация: `ruff check` + `ruff format --check` + `arch-check` +
+    `pytest -q` → **1388 passed**.
+
+- **DSML: opener без DSML-разделителя.** `<invoke>` и закрывающие теги DSML-ные, а
+  параметр написан обычным XML (`<parameter name="path">`). Аргумент невидим всем
+  param-регексам → пустые аргументы → `missing_required` → цикл (tooltrace `42585858`).
+  - **`danyapi/tools/parse.py`:** `_repair_dsml_bare_param_opener` /
+    `_BARE_PARAM_OPENER_RE`; только при DSML-префиксном `<invoke>`, чтобы не сломать
+    чистый XML-путь.
+  - **Тест:** `test_dsml_bare_param_opener_inside_dsml_invoke`.
+  - Свип по логу: пустых `ok:missing_required` 61 → **41**.
+- **DSML: `=` → `:=""` и разделитель → `,=""`.** Форма `name="timeout" :="" 600}`
+  (tooltrace `b1240bcd`) не матчится ни одним opener-регексом.
+  - **`danyapi/tools/parse.py`:** `_parse_dsml_colon_attrs` как последний резерв
+    invoke-ветки; строгий фильтр ключей и значений, обычное `"key":value` — только
+    для ключей из схемы и после mangled-формы.
+  - **Тест:** `test_dsml_colon_equals_attributes_recovered`.
+  - Свип по логу: пустых `ok:missing_required` 41 → **15** (из них 6 — обрезанные
+    на 5000 символов ответы).
+- **DSML: голое имя атрибута в параметре — `parameter name=` и `=` потеряны.**
+  Симптом: тот же цикл, что и выше (10 подряд `ok:missing_required`), но от opener'а
+  остаётся только ключ и висячая кавычка — без слова `parameter` и без `=`
+  (tooltrace `5186a5ff`, `6ea8d3ab`, `ab9045d8`, сессия `953c0ca4`).
+  - **Корневая причина:** ни один param-регекс не ждёт такого тега, аргумент пропадает,
+    вызов уходит с пустыми аргументами.
+  - **`danyapi/tools/parse.py`:** `_repair_dsml_naked_attributes` /
+    `_DSML_NAKED_ATTR_RE` — переписывает в канонический opener, сохраняет
+    `string="true"`; вызывается до `_repair_dsml_bare_attributes`.
+  - **Тест:** `test_dsml_naked_attribute_name_inside_invoke` (через `parse_tool_calls`,
+    т.к. ремонт идёт до DSML-ветки).
+  - Проверено свипом по логу: `ok:missing_required` с аргументами 948 → **1039** из 1100.
+- **DSML: `parameter="X"` внутри `<invoke>` — зацикливание repair-раундов.**
+  Симптом: сессия крутит один и тот же вызов, пока не кончится контекст; в трейсе
+  ровный ряд `ok:missing_required` с `issue=Bash.command` каждые ~19 с (14 подряд,
+  tooltrace `2baa4153`, `0d19b84c`).
+  - **Корневая причина:** invoke-ветка `_parse_dsml` при повторном bounded-скане
+    слушала только `_DSML_PARAM_OPENER_RE` (`parameter name="X"`), поэтому
+    `parameter="command"` была невидима → вызов уходил как `Bash {}` → клиент
+    браковал missing required → repair повторял промпт → модель слала ту же форму.
+  - **`danyapi/tools/parse.py`:** скан обеими формами
+    (`_DSML_PARAM_OPENER_RE` + `_DSML_PARAM_EQ_OPENER_RE`, сортировка по позиции)
+    и срез висячей кавычки для eq-варианта — как в param-only ветке.
+  - **Тест:** `test_dsml_param_eq_opener_inside_invoke` в `tests/test_tools.py`;
+    проверено прогоном реального `upstream.content` из лога.
+  - **`docs/tooltrace-playbook.md`:** новый пункт в каталоге коверканий + отличие
+    от `degenerate_repeat` (цикл repair-раундов, а не runaway в одном ответе).
 - **DSML: слитый close+open параметра и границы invoke починен (tool-call мангл).**
   Симптом: Kimi падал с «Invalid args for tool», в трейсе `ok:missing_required` —
   имя инструмента есть, аргументы пустые.

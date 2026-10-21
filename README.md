@@ -152,6 +152,8 @@ multi-call reply is never truncated.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DANYAPI_DEGENERATE_GUARD` | `1` | Abort the stream on a runaway repeat; `0` only logs it |
+| `DANYAPI_REPEAT_GUARD` | `1` | Stop a turn that repeats the identical tool call; `0` only logs it |
+| `DANYAPI_REPEAT_THRESHOLD` | `5` | Identical tool calls in a row that declare a repeat loop |
 | `DANYAPI_DEGENERATE_THRESHOLD` | `20` | Adjacent empty-container repeats that declare a stream degenerate |
 
 Aborted requests are logged with `parse.result = degenerate_repeat` and surface in the

@@ -90,6 +90,7 @@ class FakeSession:
     def __init__(self, sid: str = "c1", last_message_id: str | None = None) -> None:
         self.id = sid
         self.last_message_id = last_message_id
+        self.extra: dict = {}
 
 
 class FakeResp:
@@ -525,6 +526,95 @@ async def test_stream_full_consumption_does_not_stop_upstream():
     gen = _stream_openai(**_args(acct))
     lines = list(await _collect(gen))
     assert any(line.startswith("data: ") for line in lines)
+    acct.client.stop_stream.assert_not_awaited()
+
+
+def _tool_call_sse(command: str) -> str:
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    body = f'<{S} calls>\n<{S} invoke name="Bash">\n<{S} parameter name="command" string="true">{command}</{S} parameter>\n</{S} invoke>\n</{S} calls>'
+    ready = 'data: {"request_message_id":1,"response_message_id":2,"model_type":"default"}\n\n'
+    frag = json.dumps(
+        {
+            "v": {
+                "response": {
+                    "message_id": 2,
+                    "parent_id": 1,
+                    "status": "WIP",
+                    "fragments": [{"id": 2, "type": "RESPONSE", "content": body}],
+                }
+            }
+        },
+        ensure_ascii=False,
+    )
+    finish = 'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n\n'
+    return "event: ready\n" + ready + f"data: {frag}\n\n" + finish
+
+
+async def test_non_stream_repeat_loop_returns_error(monkeypatch):
+    """The non-stream path stops the turn the same way the stream does."""
+    monkeypatch.setattr(openai_mod.settings, "repeat_threshold", 3)
+    acct = FakeAccount([_tool_call_sse("ls")] * 3)
+    args = _args(acct)
+    args["tool_mode"] = True
+    args["tool_schemas"] = {"Bash": {"command": "string"}}
+
+    results = [await _collect_non_stream(**args) for _ in range(3)]
+
+    last = results[-1]
+    assert last["error"]["finish_reason"] == "repeat_loop"
+    assert last["choices"][0]["finish_reason"] == "error"
+    assert last["choices"][0]["message"]["content"] == ""
+
+
+async def test_non_stream_repeat_guard_disabled(monkeypatch):
+    """With the guard off the same rounds pass through untouched."""
+    monkeypatch.setattr(openai_mod.settings, "repeat_guard", False)
+    monkeypatch.setattr(openai_mod.settings, "repeat_threshold", 2)
+    acct = FakeAccount([_tool_call_sse("ls")] * 3)
+    args = _args(acct)
+    args["tool_mode"] = True
+    args["tool_schemas"] = {"Bash": {"command": "string"}}
+
+    results = [await _collect_non_stream(**args) for _ in range(3)]
+
+    assert all("error" not in r for r in results)
+
+
+async def test_stream_repeat_loop_aborts_and_stops_upstream(monkeypatch):
+    """The same tool call round after round must be stopped, not fed back forever."""
+    monkeypatch.setattr(openai_mod.settings, "repeat_threshold", 3)
+    acct = FakeAccount([_tool_call_sse("ls")] * 3)
+    acct.client.stop_stream = AsyncMock()
+    args = _args(acct)
+    args["tool_mode"] = True
+    args["tool_schemas"] = {"Bash": {"command": "string"}}
+
+    results = []
+    session = acct.sessions.obtain.return_value[0]
+    for _ in range(3):
+        gen = _stream_openai(**args)
+        results.append(list(await _collect(gen)))
+
+    payloads = [json.loads(line[len("data: ") :]) for block in results for line in block if line.startswith("data: {")]
+    errors = [p for p in payloads if p.get("error", {}).get("finish_reason") == "repeat_loop"]
+    assert errors, "third identical round must be stopped"
+    assert errors[0]["choices"][0]["finish_reason"] == "error"
+    acct.client.stop_stream.assert_awaited()
+    assert "repeat_guard" not in session.extra
+
+
+async def test_stream_distinct_calls_do_not_trip_repeat_loop(monkeypatch):
+    """Different calls are a normal multi-step turn and must pass through."""
+    monkeypatch.setattr(openai_mod.settings, "repeat_threshold", 2)
+    acct = FakeAccount([_tool_call_sse("ls"), _tool_call_sse("pwd"), _tool_call_sse("whoami")])
+    acct.client.stop_stream = AsyncMock()
+    args = _args(acct)
+    args["tool_mode"] = True
+    args["tool_schemas"] = {"Bash": {"command": "string"}}
+
+    for _ in range(3):
+        await _collect(_stream_openai(**args))
+
     acct.client.stop_stream.assert_not_awaited()
 
 

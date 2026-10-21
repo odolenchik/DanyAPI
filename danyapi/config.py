@@ -182,6 +182,15 @@ class Settings:
         self.degenerate_guard = os.environ.get("DANYAPI_DEGENERATE_GUARD", "1").strip().lower() not in ("0", "false", "no", "off")
         self.degenerate_threshold = self._int_env("DANYAPI_DEGENERATE_THRESHOLD", 20, minimum=2)
 
+        # Stop a turn that keeps emitting the SAME tool call round after round.
+        # The degenerate guard above only sees a runaway inside one reply; a model
+        # that has lost the thread instead re-asks the identical call every round
+        # until the context runs out (14 and 10 consecutive turns in two logged
+        # sessions), which also burns the account's rate limit. On by default:
+        # five identical calls in a row is never a legitimate sequence.
+        self.repeat_guard = os.environ.get("DANYAPI_REPEAT_GUARD", "1").strip().lower() not in ("0", "false", "no", "off")
+        self.repeat_threshold = self._int_env("DANYAPI_REPEAT_THRESHOLD", 5, minimum=2)
+
         # Per-turn thinking: when the client sends neither `thinking` nor
         # `reasoning_effort`, decide the flag from the turn itself instead of the
         # provider default. Off by default so existing clients keep their exact
