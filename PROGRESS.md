@@ -2,6 +2,55 @@
 
 ## Готово
 
+- **Qwen: стор ротации — единственный источник истины + revive-цикл.** Симптом:
+  23.10 около 15:32 оба Qwen-аккаунта начали отвечать `401 Token is revoked`,
+  генерация картинок встала на 10 пинов подряд (151–160), бот показывал 🔴
+  «мёртвый токен», `/health` при этом рапортовал `qwen: healthy: 2`.
+  - **Причина:** Qwen ротирует `refresh_token` на сервере и убивает предыдущий.
+    У аккаунта два независимых транспорта (HTTP-клиент и браузер); кто первым
+    ротировал — тот записал выжившее значение в стор, второй остался со старой
+    копией в памяти (`load_effective_token` читался только при старте) и
+    отправлял отозванный токен на refresh.
+  - **`danyapi/qwen/accounts.py`:** `persist_rotated_token` не откатывает слот
+    на более старый `iat` (`_token_issued_at`); у `QwenAccount` появились
+    `broken_at` / `last_revive_at` и `revive()`, `mark_broken` ставит метку один раз.
+  - **`danyapi/qwen/client.py`:** `QwenClient` получил `store` / `configured` и
+    перечитывает стор перед каждым refresh (`_refresh_token_from_store`),
+    принимая только более новый `iat`; `login()` сохраняет креденшл.
+  - **`danyapi/qwen/browser.py`:** те же `store` / `configured`; при `start()` и
+    в `_sync_token_from_profile` выбирается более новый из профиля и стора,
+    поэтому устаревшая копия в профиле больше не затирает актуальный токен.
+  - **`danyapi/config.py`, `danyapi/api/openai.py`:** для `qwen_pool` запущен
+    revive-цикл (`DANYAPI_QWEN_REVIVE_INTERVAL` 900 c,
+    `..._SLOW_INTERVAL` 1800 c, `..._SLOW_AFTER` 7200 c, минимум 60);
+    `_revive_sweep` принимает и `AuthCheck`, и `bool`, так что один цикл
+    обслуживает оба пула.
+  - **Тесты:** `tests/test_qwen_client.py` (главный регресс — refresh берёт
+    токен из стора), `tests/test_qwen_credentials.py` (защита от отката по
+    `iat`), `tests/test_qwen_browser_flow.py` (стор против профиля),
+    `tests/test_accounts.py` (revive), `tests/test_revive.py` (bool-проба),
+    `tests/test_config.py`, `tests/test_api_helpers.py` (lifespan).
+  - Верификация: `ruff` + `arch-check` + `pytest -q` → **1552 passed**; на плате
+    оба новых токена приняты, `/health` → `healthy: 2, broken: 0`.
+
+- **Qwen: классификация квоты и transient-сбоев в браузерном пути.** Симптом:
+  после восстановления токенов `/v1/images/generations` всё равно отдавал 502
+  `Qwen image generation returned no image`, хотя в окне Qwen был прямой ответ
+  «You've used up your daily image generation quota».
+  - **Причина:** браузерная ветка `collect_image` читает ответ SPA, где
+    исчерпанная квота и временный сбой приходят обычным текстом без картинок.
+    Ветка не классифицировала их и отдавала голый 502: аккаунт с нулевой квотой
+    оставался в ротации, бот показывал 🔴 вместо 🟡, паблишер сжигал все ретраи.
+  - **`danyapi/qwen/api.py`:** браузерная ветка прогоняет ответ через
+    `_is_quota_exhausted` / `_is_transient_text` так же, как HTTP-транспорт:
+    квота → `_mark_quota_exhausted` + `QuotaExhausted` (429, failover у
+    вызывающего), transient → ретрай в общем бюджете `MAX_RETRIES`.
+  - **Тесты:** три кейса в `tests/test_qwen_api_browser.py` (квота помечает и не
+    ретраится; transient ретраится; успешный ретрай возвращает картинку).
+    Проверено мутацией: без правки эти три теста падают.
+  - Верификация: `pytest -q` → **1555 passed**; на плате два запроса подряд
+    `HTTP 200` (89 и 92 c, PNG ~1.6 МБ), пин 163 ушёл в `approved`.
+
 - **Пейсинг Qwen и антибот-капча как отдельное состояние.** Симптом: 22.10 Qwen
   отвечал на всё капчей (`FAIL_SYS_USER_VALIDATE` / `RGV587_ERROR` / `punish`),
   DanyAPI крутил 5 повторов на запрос и отдавал голый 502, а `/health` показывал
@@ -1188,7 +1237,10 @@
 и наличие `.venv`. Проверка — `diff -rq` без `.venv`/`.git`/`.env`; тесты
 1369 passed в каждой.
 
-Последний коммит: см. `git log -1`. До него: `fix(qwen): revert WEB_VERSION to 0.2.83`
+Последний коммит: см. `git log -1`. До него: `fix(qwen): classify image quota
+and transient failures in the browser path` (`3c8c169`) и `fix(qwen): keep the
+rotation store as the single source of truth` (`491da2c`); ранее
+`fix(qwen): revert WEB_VERSION to 0.2.83`
 и `chore(providers): sync web client versions with the live frontends`;
 ранее `feat(images): accept image attachments for deepseek-v4-pro (expert)`
 (`059dfed`), `fix(images): send Qwen image size at the top level of the body`
