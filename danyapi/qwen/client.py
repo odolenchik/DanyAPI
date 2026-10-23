@@ -10,8 +10,12 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import httpx
+
+if TYPE_CHECKING:
+    from ..store import JsonStore
 
 log = logging.getLogger("danyapi.qwen")
 
@@ -133,6 +137,8 @@ class QwenClient:
         token: str | None = None,
         timeout: float = 60.0,
         token_persist: Callable[[str], None] | None = None,
+        store: JsonStore | None = None,
+        configured: str | None = None,
     ) -> None:
         # ``token`` is the credential from the environment. With frontend
         # 0.3.12 it may be either a ``refresh_token`` (preferred) or a legacy
@@ -144,6 +150,15 @@ class QwenClient:
         # (server-side rotation). Without persisting it the rotated credential is
         # lost on the next restart and the old one is eventually revoked.
         self._token_persist = token_persist
+        # The rotation store and the key its slot is filed under. Qwen rotates
+        # the refresh token server-side, so the value this client started with
+        # can be superseded by the browser transport of the same account while
+        # the process keeps running. Re-reading the store before every refresh
+        # is what stops this client from sending the revoked copy and getting a
+        # 401. ``configured`` is the raw ``.env`` value the slot is keyed by;
+        # it defaults to the startup token.
+        self._store = store
+        self._configured = configured if configured is not None else token
         self._access_token: str | None = None
         # Reason the most recent auth attempt failed (None after a success), so
         # startup can report *why* a credential was skipped.
@@ -175,6 +190,43 @@ class QwenClient:
             return "refresh_token"
         return "token"
 
+    def _refresh_token_from_store(self) -> None:
+        """Adopt a newer rotated credential from the store, if one is there.
+
+        Qwen rotates the refresh token server-side and revokes the previous one.
+        An account has two independent transports — this HTTP client and the
+        browser — and whichever rotates first writes the surviving value to the
+        shared store. The other one still holds the now-revoked copy in memory,
+        and sending it to the refresh endpoint is exactly what answered
+        ``401 Token is revoked`` in production. Re-reading the store before
+        every refresh keeps both transports on the value the server honours.
+        """
+        if self._store is None:
+            return
+        from .accounts import _token_issued_at, load_effective_token
+
+        effective = load_effective_token(self._configured or "", self._store)
+        if not effective or effective == self.token:
+            return
+        effective_at = _token_issued_at(effective)
+        current_at = _token_issued_at(self.token)
+        if effective_at is not None and current_at is not None:
+            # Both carry ``iat``: the later credential is the one the server
+            # still honours. Adopting an older one would roll it back (for
+            # instance when the store write failed after a rotation).
+            if current_at >= effective_at:
+                return
+        elif effective == self._configured:
+            # ``load_effective_token`` falls back to the configured value when
+            # the slot is empty (or was keyed by an older ``.env`` entry). An
+            # incomparable fallback is not a rotation, so it is ignored.
+            return
+        self.token = effective
+        log.info(
+            "qwen adopted the rotated credential from the store (%s)",
+            _token_fingerprint(effective),
+        )
+
     def _apply_access_token(self, access_token: str) -> None:
         self._access_token = access_token
         self.http.headers["Authorization"] = f"Bearer {access_token}"
@@ -198,6 +250,9 @@ class QwenClient:
         and the request must look like it comes from chat.qwen.ai, hence
         ``x-request-origin``.
         """
+        # A concurrent transport may have rotated the credential already; the
+        # revoked copy in memory would answer 401 Token is revoked.
+        self._refresh_token_from_store()
         if not self.token:
             self._last_error = "no qwen credential configured"
             raise QwenError(-1, "no qwen credential configured")
@@ -416,6 +471,12 @@ class QwenClient:
         if not credential:
             raise QwenError(-1, "login failed: no token in response")
         self.token = credential
+        # A freshly signed-in credential is worth keeping: without this a
+        # restart falls back to whatever the store held before.
+        if self._store is not None:
+            from .accounts import persist_rotated_token
+
+            persist_rotated_token(self._configured or "", self._store, credential)
         self._access_token = biz.get("access_token") or None
         if self._access_token:
             self._apply_access_token(self._access_token)

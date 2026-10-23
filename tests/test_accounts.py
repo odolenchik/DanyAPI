@@ -6,6 +6,8 @@ import pytest
 
 from danyapi.accounts import AccountPool, AccountPoolBusy, ContextIndex, DeepSeekAccount, account_lock
 from danyapi.deepseek.client import DeepSeekClient
+from danyapi.qwen.accounts import QwenAccount
+from danyapi.qwen.client import QwenClient
 from danyapi.retry import START_BUFFER_SEC
 from danyapi.store import JsonStore
 
@@ -890,3 +892,67 @@ async def test_wait_turn_no_sleep_when_disabled(monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     await acct.wait_turn()
     assert slept == []
+
+
+# ---------------------------------------------------------------------------
+# QwenAccount: auth breaks carry a timestamp so the revive loop can retry them
+# ---------------------------------------------------------------------------
+
+
+def make_qwen_acct(index: int = 0) -> QwenAccount:
+    return QwenAccount(index, QwenClient(token="dummy-token"))
+
+
+def test_qwen_mark_broken_stamps_time_once():
+    acct = make_qwen_acct()
+    assert acct.broken_at is None
+    acct.mark_broken()
+    first = acct.broken_at
+    assert first is not None
+    # Idempotent, like the DeepSeek account: a second mark must not move it.
+    acct.mark_broken()
+    assert acct.broken_at == first
+
+
+def test_qwen_revive_returns_account_to_rotation():
+    acct = make_qwen_acct()
+    acct.mark_broken()
+    assert not acct.is_available()
+    assert acct.broken_at is not None
+
+    acct.revive()
+
+    assert acct.is_available()
+    assert acct.broken_at is None
+    assert acct.last_revive_at is None
+
+
+def test_qwen_revive_is_noop_on_healthy_account():
+    acct = make_qwen_acct()
+    acct.revive()
+    assert acct.is_available()
+    assert acct.broken_at is None
+
+
+async def test_qwen_revived_account_serves_again():
+    acct = make_qwen_acct()
+    pool = AccountPool([acct], label="qwen")
+    acct.mark_broken()
+    with pytest.raises(RuntimeError):
+        await pool.acquire(None)
+
+    acct.revive()
+
+    acquired, _ = await pool.acquire(None)
+    assert acquired is acct
+
+
+def test_qwen_auth_break_stays_unavailable_until_revived():
+    """An auth break has no timed cooldown: only the revive loop undoes it."""
+    acct = make_qwen_acct()
+    acct.mark_broken()
+    assert acct.quota_until == 0.0
+    assert acct.captcha_until == 0.0
+    assert acct.is_available() is False
+    # Reading availability again must not silently clear it.
+    assert acct.is_available() is False

@@ -32,10 +32,13 @@ from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .client import _token_fingerprint, jwt_claims
 from .stream import QwenStreamReconstructor
 
 if TYPE_CHECKING:
     from patchright.async_api import BrowserContext, Page
+
+    from ..store import JsonStore
 
 try:
     from patchright.async_api import async_playwright
@@ -83,6 +86,35 @@ class QwenCaptchaRequired(QwenBrowserError):
 def _looks_like_waf(text: str) -> bool:
     lowered = text[:4000].lower()
     return any(marker in lowered for marker in WAF_MARKERS)
+
+
+def _token_issued_at(token: str | None) -> float | None:
+    """The ``iat`` claim of a credential, or ``None`` when it cannot be read."""
+    iat = jwt_claims(token).get("iat")
+    if isinstance(iat, (int, float)):
+        return float(iat)
+    return None
+
+
+def _stored_is_newer(stored: str | None, profile: str | None) -> bool:
+    """True when the stored credential was issued later than the profile's.
+
+    Qwen rotates the refresh token server-side, so of two copies the later one
+    is the value the server still honours. An empty profile takes whatever the
+    store has; an unreadable ``iat`` on either side leaves the profile in charge,
+    which is the historical behaviour.
+    """
+    if not stored:
+        return False
+    if not profile:
+        return True
+    if stored == profile:
+        return False
+    stored_at = _token_issued_at(stored)
+    profile_at = _token_issued_at(profile)
+    if stored_at is None or profile_at is None:
+        return False
+    return stored_at > profile_at
 
 
 def _browser_executable() -> str | None:
@@ -136,6 +168,8 @@ class QwenBrowser:
         captcha_wait: float = 0.0,
         profile_index: int = 0,
         token_persist: Callable[[str], None] | None = None,
+        store: JsonStore | None = None,
+        configured: str | None = None,
     ) -> None:
         self._token = token
         # Called when the profile holds a refresh token different from the one
@@ -145,6 +179,12 @@ class QwenBrowser:
         # store. Without this the configured token goes stale and is eventually
         # revoked, and the next start finds every account rejected.
         self._token_persist = token_persist
+        # The shared rotation store, read here as well as written through the
+        # callback. The HTTP client of the same account rotates independently,
+        # and whichever transport rotates later holds the value the server still
+        # honours; the store is what tells the other one so.
+        self._store = store
+        self._configured = configured if configured is not None else token
         #: The credential currently believed valid, updated as the profile rotates.
         self.token = token
         #: Which profile directory to use; one per account, so sessions never mix.
@@ -191,6 +231,15 @@ class QwenBrowser:
         # what killed the previous tokens, because Qwen rotates the refresh
         # token and the old one is revoked the moment a new one is issued.
         existing = await self._profile_refresh_token()
+        stored = self._stored_token()
+        if _stored_is_newer(stored, existing):
+            # The HTTP client of this account rotated while the browser was
+            # closed, so the store holds the value the server still honours and
+            # the profile's copy is the revoked one. Inject the stored value.
+            self._token = stored or ""
+            self.token = self._token
+            existing = None
+            log.info("qwen browser took the rotated credential from the store (%s)", _token_fingerprint(stored))
         if existing:
             self.token = existing
             if existing != self._token and self._token_persist is not None:
@@ -236,6 +285,15 @@ class QwenBrowser:
                 return str(cookie["value"])
         return None
 
+    def _stored_token(self) -> str | None:
+        """The rotated credential currently in the shared store, if any."""
+        if self._store is None:
+            return None
+        from .accounts import load_effective_token
+
+        effective = load_effective_token(self._configured or "", self._store)
+        return effective or None
+
     async def _sync_token_from_profile(self) -> None:
         """Persist a refresh token the SPA rotated while we were using it.
 
@@ -243,13 +301,24 @@ class QwenBrowser:
         own and may receive a new refresh token, which then lives only in the
         profile. Mirroring it into the store keeps the configured credential
         usable after a restart, the same way the HTTP client does it.
+
+        The store is read first as well: the HTTP client of this account rotates
+        independently, and if it holds the later value that one wins over the
+        profile's copy - persisting the stale profile token would roll the store
+        back to the credential the server already revoked.
         """
-        current = await self._profile_refresh_token()
-        if not current or current == self.token:
+        stored = self._stored_token()
+        profile = await self._profile_refresh_token()
+        if _stored_is_newer(stored, profile):
+            if stored != self.token:
+                self.token = stored or ""
+                log.info("qwen browser adopted the rotated credential from the store (%s)", _token_fingerprint(stored))
             return
-        self.token = current
+        if not profile or profile == self.token:
+            return
+        self.token = profile
         if self._token_persist is not None:
-            self._token_persist(current)
+            self._token_persist(profile)
             log.info("qwen browser persisted a rotated token from the profile")
 
     async def _wait_for_composer(self) -> None:

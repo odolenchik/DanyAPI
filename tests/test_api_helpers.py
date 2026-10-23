@@ -1766,3 +1766,39 @@ def test_record_deepseek_usage_counts_delta_only():
         assert snap["totals"]["prompt_tokens"] == 200
     finally:
         reset_tracker()
+
+
+@pytest.mark.usefixtures("reset_app_state")
+async def test_lifespan_starts_a_revive_loop_for_the_qwen_pool(monkeypatch):
+    """The qwen pool gets its own revive loop, cancelled on shutdown.
+
+    Without it an account broken by ``401 Token is revoked`` stayed out of
+    rotation until the process restarted, even after the browser transport had
+    stored a working rotated credential.
+    """
+    started: list[tuple] = []
+    cancelled: list = []
+    gate = asyncio.Event()
+
+    async def fake_revive(pool, fast, slow, slow_after):
+        started.append((pool, fast, slow, slow_after))
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            cancelled.append(pool)
+            raise
+
+    monkeypatch.setattr(openai_mod, "_revive_broken_accounts", fake_revive)
+    with _patch_creds(qwen_tokens=["tok"]):
+        async with openai_mod.lifespan(app):
+            await asyncio.sleep(0)
+            assert app.state.qwen_pool is not None
+            # Only the qwen pool exists, so exactly one loop was started.
+            assert len(started) == 1
+            pool, fast, slow, slow_after = started[0]
+            assert pool is app.state.qwen_pool
+            assert fast == settings.qwen_revive_interval
+            assert slow == settings.qwen_revive_slow_interval
+            assert slow_after == settings.qwen_revive_slow_after
+    # The loop is cancelled and awaited on shutdown rather than leaked.
+    assert cancelled == [pool]

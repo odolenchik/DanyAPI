@@ -735,3 +735,157 @@ async def test_adopt_refresh_token_ignores_non_string():
     client._adopt_refresh_token(123)
     assert client.token == "keep-me"
     await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Reading the rotation store back (the two-transport desync incident)
+# ---------------------------------------------------------------------------
+
+from danyapi.store import JsonStore  # noqa: E402
+
+
+def _jwt_with_iat(iat: int, **claims) -> str:
+    payload = {"iat": iat, **claims}
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    return f"h.{encoded}.s"
+
+
+def test_refresh_token_from_store_is_a_noop_without_a_store():
+    client = QwenClient(token="keep-me")
+    client._refresh_token_from_store()
+    assert client.token == "keep-me"
+
+
+def test_refresh_token_from_store_adopts_the_rotated_value():
+    store = JsonStore("qwen-credentials", None)
+    store.set(_token_fingerprint_local("configured"), "rotated-elsewhere")
+    client = QwenClient(token="stale", store=store, configured="configured")
+
+    client._refresh_token_from_store()
+
+    assert client.token == "rotated-elsewhere"
+
+
+def test_refresh_token_from_store_keeps_the_same_value_quietly():
+    store = JsonStore("qwen-credentials", None)
+    store.set(_token_fingerprint_local("configured"), "same")
+    client = QwenClient(token="same", store=store, configured="configured")
+
+    client._refresh_token_from_store()
+
+    assert client.token == "same"
+
+
+def test_refresh_token_from_store_falls_back_to_the_configured_token():
+    # Nothing was rotated: the client keeps whatever it holds.
+    store = JsonStore("qwen-credentials", None)
+    client = QwenClient(token="held", store=store, configured="configured")
+
+    client._refresh_token_from_store()
+
+    assert client.token == "held"
+
+
+def _token_fingerprint_local(token: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+async def test_refresh_uses_the_rotated_credential_from_the_store(monkeypatch):
+    """THE production regression: the browser rotated, the HTTP client did not.
+
+    The client still holds the revoked copy in memory. Sending it to the
+    refresh endpoint is what answered ``401 Token is revoked``; the store is the
+    single source of truth, so the newer value must be sent instead.
+    """
+    rotated = _jwt_with_iat(2000, type="refresh_token")
+    stale = _jwt_with_iat(1000, type="refresh_token")
+    store = JsonStore("qwen-credentials", None)
+    store.set(_token_fingerprint_local("configured"), rotated)
+    fake = _FakeAuthClient(get_response=_json_resp({"success": True, "data": {"access_token": "fresh"}}))
+    _patch_auth(monkeypatch, fake)
+
+    client = QwenClient(token=stale, store=store, configured="configured")
+    assert client.token == stale
+
+    await client.refresh_access_token()
+
+    assert client.token == rotated
+    assert fake.get.await_args.kwargs["cookies"] == {"refresh_token": rotated}
+
+
+async def test_refresh_without_a_store_uses_the_token_in_memory(monkeypatch):
+    """Backward compatibility: no store means the old behaviour exactly."""
+    fake = _FakeAuthClient(get_response=_json_resp({"success": True, "data": {"access_token": "fresh"}}))
+    _patch_auth(monkeypatch, fake)
+
+    client = QwenClient(token="in-memory")
+    await client.refresh_access_token()
+
+    assert client.token == "in-memory"
+    assert fake.get.await_args.kwargs["cookies"] == {"token": "in-memory"}
+
+
+async def test_refresh_configured_defaults_to_the_startup_token(monkeypatch):
+    # ``configured`` is optional: the slot is then keyed by the startup token.
+    rotated = _jwt_with_iat(2000)
+    store = JsonStore("qwen-credentials", None)
+    store.set(_token_fingerprint_local("env-value"), rotated)
+    fake = _FakeAuthClient(get_response=_json_resp({"success": True, "data": {"access_token": "fresh"}}))
+    _patch_auth(monkeypatch, fake)
+
+    client = QwenClient(token="env-value", store=store)
+    await client.refresh_access_token()
+
+    assert client.token == rotated
+
+
+async def test_login_persists_the_signed_in_credential(monkeypatch):
+    store = JsonStore("qwen-credentials", None)
+    fake = _FakeAuthClient(post_response=_json_resp({"success": True, "data": {"refresh_token": "signed-in"}}))
+    _patch_auth(monkeypatch, fake)
+
+    client = QwenClient(store=store, configured="env-value")
+    await client.login("a@b.c", "pw")
+
+    assert store.get(_token_fingerprint_local("env-value")) == "signed-in"
+
+
+async def test_login_without_a_store_does_not_persist(monkeypatch):
+    fake = _FakeAuthClient(post_response=_json_resp({"success": True, "data": {"refresh_token": "signed-in"}}))
+    _patch_auth(monkeypatch, fake)
+
+    client = QwenClient()
+    assert await client.login("a@b.c", "pw") == "signed-in"
+    assert client._store is None
+
+
+def test_refresh_token_from_store_ignores_the_configured_fallback():
+    """An empty slot is not a rotation: the credential in memory is kept."""
+    store = JsonStore("qwen-credentials", None)
+    client = QwenClient(token="held", store=store, configured="configured")
+
+    client._refresh_token_from_store()
+
+    assert client.token == "held"
+
+
+def test_refresh_token_from_store_takes_the_configured_value_when_it_is_newer():
+    # ``.env`` was edited to a fresher credential: that deliberate change wins.
+    store = JsonStore("qwen-credentials", None)
+    fresh = _jwt_with_iat(2000)
+    client = QwenClient(token=_jwt_with_iat(1000), store=store, configured=fresh)
+
+    client._refresh_token_from_store()
+
+    assert client.token == fresh
+
+
+def test_refresh_token_from_store_keeps_a_newer_in_memory_token():
+    store = JsonStore("qwen-credentials", None)
+    client = QwenClient(token=_jwt_with_iat(2000), store=store, configured=_jwt_with_iat(1000))
+
+    client._refresh_token_from_store()
+
+    assert client.token == _jwt_with_iat(2000)

@@ -271,6 +271,17 @@ class Settings:
         self.deepseek_revive_slow_interval = _float_env("DANYAPI_DEEPSEEK_REVIVE_SLOW_INTERVAL", 1800.0, minimum=60.0)
         self.deepseek_revive_slow_after = _float_env("DANYAPI_DEEPSEEK_REVIVE_SLOW_AFTER", 7200.0, minimum=60.0)
 
+        # Reviving Qwen accounts marked broken. Same shape as the DeepSeek loop:
+        # an auth failure can come from an upstream outage, and the rotated
+        # refresh token in the store may already be newer than the one the
+        # account broke with, so a broken account is re-probed every
+        # DANYAPI_QWEN_REVIVE_INTERVAL seconds; one broken for longer than
+        # DANYAPI_QWEN_REVIVE_SLOW_AFTER is re-checked at the slower
+        # DANYAPI_QWEN_REVIVE_SLOW_INTERVAL cadence.
+        self.qwen_revive_interval = _float_env("DANYAPI_QWEN_REVIVE_INTERVAL", 900.0, minimum=60.0)
+        self.qwen_revive_slow_interval = _float_env("DANYAPI_QWEN_REVIVE_SLOW_INTERVAL", 1800.0, minimum=60.0)
+        self.qwen_revive_slow_after = _float_env("DANYAPI_QWEN_REVIVE_SLOW_AFTER", 7200.0, minimum=60.0)
+
     @staticmethod
     def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
         """Read an integer env var, falling back to ``default`` when unset or bad.

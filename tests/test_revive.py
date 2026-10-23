@@ -130,3 +130,101 @@ async def test_loop_runs_and_can_be_cancelled():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert acct.client.check_auth.await_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# Qwen accounts: ``check_auth`` answers with a plain bool, not ``AuthCheck``
+# ---------------------------------------------------------------------------
+
+
+class QwenReviveAccount:
+    def __init__(self, index=0):
+        self.index = index
+        self.broken = False
+        self.broken_at = None
+        self.last_revive_at = None
+        self.client = MagicMock()
+        self.client.check_auth = AsyncMock()
+
+    def is_available(self):
+        return not self.broken
+
+    def mark_broken(self):
+        self.broken = True
+        self.broken_at = 0.0
+
+    def revive(self):
+        self.broken = False
+        self.broken_at = None
+        self.last_revive_at = None
+
+    @property
+    def label(self):
+        return f"qwen-acct#{self.index}"
+
+
+async def test_sweep_revives_a_qwen_account_on_true():
+    acct = QwenReviveAccount()
+    acct.mark_broken()
+    acct.client.check_auth = AsyncMock(return_value=True)
+
+    await _revive_sweep(_pool(acct), fast=10, slow=50, slow_after=100, now=1000.0)
+
+    assert acct.is_available()
+    acct.client.check_auth.assert_awaited_once()
+
+
+async def test_sweep_keeps_a_qwen_account_broken_on_false():
+    acct = QwenReviveAccount()
+    acct.mark_broken()
+    acct.client.check_auth = AsyncMock(return_value=False)
+
+    await _revive_sweep(_pool(acct), fast=10, slow=50, slow_after=100, now=1000.0)
+
+    assert not acct.is_available()
+
+
+async def test_sweep_revives_the_account_whose_credential_was_repaired():
+    """The production case: the store now holds a working rotated token.
+
+    ``QwenClient.check_auth`` re-reads the store before refreshing, so once the
+    browser transport has written the rotated credential it answers True and the
+    account returns to rotation instead of staying out until a restart.
+    """
+    acct = QwenReviveAccount()
+    acct.mark_broken()
+    acct.client.check_auth = AsyncMock(side_effect=[False, True])
+
+    await _revive_sweep(_pool(acct), fast=10, slow=50, slow_after=100, now=1000.0)
+    assert not acct.is_available()
+
+    await _revive_sweep(_pool(acct), fast=10, slow=50, slow_after=100, now=1020.0)
+    assert acct.is_available()
+
+
+async def test_sweep_serves_both_pools_transport_agnostically():
+    ds_acct = ReviveAccount()
+    ds_acct.mark_broken()
+    ds_acct.broken_at = 0.0
+    ds_acct.client.check_auth = AsyncMock(return_value=AuthCheck.OK)
+    qwen_acct = QwenReviveAccount()
+    qwen_acct.mark_broken()
+    qwen_acct.client.check_auth = AsyncMock(return_value=True)
+
+    await _revive_sweep(_pool(ds_acct, qwen_acct), fast=10, slow=50, slow_after=100, now=1000.0)
+
+    assert ds_acct.is_available()
+    assert qwen_acct.is_available()
+
+
+async def test_qwen_revive_loop_runs_and_can_be_cancelled():
+    acct = QwenReviveAccount()
+    acct.mark_broken()
+    acct.client.check_auth = AsyncMock(return_value=False)
+    task = asyncio.create_task(_revive_broken_accounts(_pool(acct), fast=0.01, slow=0.02, slow_after=0.05))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert acct.client.check_auth.await_count >= 1

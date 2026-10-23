@@ -56,6 +56,7 @@ async def lifespan(app: FastAPI):
     qwen_accounts: list[QwenAccount] = []
     zai_browser: ZaiBrowser | None = None
     revive_task: asyncio.Task | None = None
+    qwen_revive_task: asyncio.Task | None = None
     cache_enabled = settings.cache_enabled
     deepseek_session_store = JsonStore("deepseek-sessions", "default" if cache_enabled else None)
     qwen_session_store = JsonStore("qwen-sessions", "default" if cache_enabled else None)
@@ -127,6 +128,12 @@ async def lifespan(app: FastAPI):
                     token=token,
                     timeout=settings.timeout,
                     token_persist=lambda new_token, src=configured: persist_rotated_token(src, qwen_credentials_store, new_token),
+                    # The browser transport of the same account rotates the
+                    # credential independently; re-reading the store before every
+                    # refresh is what keeps this client from sending a revoked
+                    # copy and getting ``401 Token is revoked``.
+                    store=qwen_credentials_store,
+                    configured=configured,
                 )
                 if not await client.check_auth():
                     reason = client.last_auth_error or "invalid/expired"
@@ -152,6 +159,11 @@ async def lifespan(app: FastAPI):
                         # credential, and the rotated value has to outlive the
                         # process the way the HTTP path's does.
                         token_persist=lambda new_token, src=configured: persist_rotated_token(src, qwen_credentials_store, new_token),
+                        # And read back the other way: the HTTP client may have
+                        # rotated while the browser was closed, in which case the
+                        # profile's copy is the revoked one.
+                        store=qwen_credentials_store,
+                        configured=configured,
                     )
                 qwen_accounts.append(
                     QwenAccount(
@@ -216,6 +228,18 @@ async def lifespan(app: FastAPI):
             )
             app.state.qwen_models = await _fetch_qwen_models(qwen_accounts[0].client)
             app.state.qwen_disabled_reason = ""
+            # Without this loop a Qwen account broken by an auth error stayed
+            # out of rotation until the process restarted - even when the
+            # credential had since been repaired (e.g. the rotated token the
+            # browser wrote to the store).
+            qwen_revive_task = asyncio.create_task(
+                _revive_broken_accounts(
+                    app.state.qwen_pool,
+                    settings.qwen_revive_interval,
+                    settings.qwen_revive_slow_interval,
+                    settings.qwen_revive_slow_after,
+                )
+            )
         else:
             app.state.qwen_pool = None
             app.state.qwen_models = []
@@ -243,6 +267,10 @@ async def lifespan(app: FastAPI):
             revive_task.cancel()
             with suppress(asyncio.CancelledError):
                 await revive_task
+        if qwen_revive_task is not None:
+            qwen_revive_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await qwen_revive_task
         for acct in accounts:
             await acct.client.aclose()
         for acct in qwen_accounts:
@@ -275,17 +303,22 @@ async def _revive_sweep(pool: AccountPool, fast: float, slow: float, slow_after:
         except Exception:
             log.debug("revive probe failed for %s", acct.label, exc_info=True)
             continue
-        if status is AuthCheck.OK:
+        # DeepSeek's ``check_auth`` answers with the ``AuthCheck`` enum, Qwen's
+        # with a plain bool; the sweep serves both pools.
+        ok = status is AuthCheck.OK if isinstance(status, AuthCheck) else bool(status)
+        if ok:
             acct.revive()
 
 
 async def _revive_broken_accounts(pool: AccountPool, fast: float, slow: float, slow_after: float) -> None:
-    """Re-check broken DeepSeek accounts and return working ones to rotation.
+    """Re-check broken accounts in ``pool`` and return working ones to rotation.
 
     A token is marked broken on an auth error, but that error can be purely a
-    network failure. This loop probes each broken account and clears the flag
-    once ``check_auth`` reports OK, so a transient outage does not retire an
-    account until the process restarts.
+    network failure or a credential that has since been rotated to a working
+    value. This loop probes each broken account and clears the flag once
+    ``check_auth`` reports success, so a transient outage does not retire an
+    account until the process restarts. One pool runs it for DeepSeek and one
+    for Qwen, with their own cadences.
 
     Accounts are normally re-checked every ``fast`` seconds; one broken for
     longer than ``slow_after`` is checked at the slower ``slow`` cadence, so a

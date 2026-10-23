@@ -759,3 +759,164 @@ async def test_start_injects_the_token_when_the_profile_is_empty(monkeypatch, tm
     b = QwenBrowser(token="configured", timeout=5)
     await b.start()
     ctx.add_cookies.assert_awaited_once()
+
+
+# --- the shared rotation store across the two transports ---
+
+
+def _jwt(iat: int, **claims) -> str:
+    import base64 as _b64
+    import json as _json
+
+    payload = {"iat": iat, **claims}
+    return "h." + _b64.urlsafe_b64encode(_json.dumps(payload).encode()).decode().rstrip("=") + ".s"
+
+
+def browser_with_store(configured: str, store) -> QwenBrowser:
+    b = QwenBrowser(token=configured, timeout=5, store=store, configured=configured)
+    b._started = True
+    b._page = page_stub()
+    return b
+
+
+def _fingerprint(token: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+def test_stored_token_is_none_without_a_store() -> None:
+    assert QwenBrowser(token="t")._stored_token() is None
+
+
+def test_stored_token_reads_the_rotation_slot() -> None:
+    from danyapi.store import JsonStore
+
+    store = JsonStore("qwen-credentials", None)
+    store.set(_fingerprint("configured"), "rotated")
+    b = browser_with_store("configured", store)
+    assert b._stored_token() == "rotated"
+
+
+async def test_sync_adopts_the_stored_token_when_it_is_newer() -> None:
+    """The HTTP client rotated: the store wins over the profile's stale copy."""
+    from danyapi.store import JsonStore
+
+    newer = _jwt(2000)
+    older = _jwt(1000)
+    store = JsonStore("qwen-credentials", None)
+    store.set(_fingerprint("configured"), newer)
+    persisted: list[str] = []
+    b = browser_with_store("configured", store)
+    b._token_persist = persisted.append
+    ctx = MagicMock()
+    ctx.cookies = AsyncMock(return_value=[{"name": "refresh_token", "value": older}])
+    b._context = ctx
+
+    await b._sync_token_from_profile()
+
+    assert b.token == newer
+    # The stale profile value must not be written back over the store.
+    assert persisted == []
+
+
+async def test_sync_keeps_the_profile_when_the_store_is_older() -> None:
+    from danyapi.store import JsonStore
+
+    older = _jwt(1000)
+    newer = _jwt(2000)
+    store = JsonStore("qwen-credentials", None)
+    store.set(_fingerprint("configured"), older)
+    persisted: list[str] = []
+    b = browser_with_store("configured", store)
+    b._token_persist = persisted.append
+    ctx = MagicMock()
+    ctx.cookies = AsyncMock(return_value=[{"name": "refresh_token", "value": newer}])
+    b._context = ctx
+
+    await b._sync_token_from_profile()
+
+    assert b.token == newer
+    assert persisted == [newer]
+
+
+async def test_sync_falls_back_to_the_profile_when_iat_is_unknown() -> None:
+    from danyapi.store import JsonStore
+
+    store = JsonStore("qwen-credentials", None)
+    store.set(_fingerprint("configured"), "opaque-stored")
+    persisted: list[str] = []
+    b = browser_with_store("configured", store)
+    b._token_persist = persisted.append
+    ctx = MagicMock()
+    ctx.cookies = AsyncMock(return_value=[{"name": "refresh_token", "value": "opaque-profile"}])
+    b._context = ctx
+
+    await b._sync_token_from_profile()
+
+    assert b.token == "opaque-profile"
+    assert persisted == ["opaque-profile"]
+
+
+def test_stored_is_newer_needs_both_iat_readable() -> None:
+    from danyapi.qwen.browser import _stored_is_newer
+
+    assert _stored_is_newer(None, "profile") is False
+    assert _stored_is_newer("stored", None) is True
+    assert _stored_is_newer("same", "same") is False
+    assert _stored_is_newer(_jwt(2000), _jwt(1000)) is True
+    assert _stored_is_newer(_jwt(1000), _jwt(2000)) is False
+    assert _stored_is_newer(_jwt(1000), _jwt(1000)) is False
+    assert _stored_is_newer("opaque", _jwt(1000)) is False
+    assert _stored_is_newer(_jwt(1000), "opaque") is False
+
+
+async def test_start_injects_the_stored_token_when_it_beats_the_profile(monkeypatch, tmp_path) -> None:
+    """The HTTP client rotated while the browser was closed.
+
+    The profile still carries the revoked copy; injecting the stored (newer)
+    credential is what keeps the account working.
+    """
+    from danyapi.store import JsonStore
+
+    stored = _jwt(2000)
+    profile = _jwt(1000)
+    store = JsonStore("qwen-credentials", None)
+    store.set(_fingerprint("configured"), stored)
+
+    page = page_stub()
+    ctx = context_stub(page, pages=[page])
+    ctx.cookies = AsyncMock(return_value=[{"name": "refresh_token", "value": profile}])
+    pw = pw_stub(ctx)
+    monkeypatch.setattr(browser_mod, "async_playwright", playwright_factory(pw))
+    monkeypatch.setenv("QWEN_BROWSER_DIR", str(tmp_path))
+
+    b = QwenBrowser(token="configured", timeout=5, store=store, configured="configured")
+    await b.start()
+
+    assert b.token == stored
+    ctx.add_cookies.assert_awaited_once()
+    assert ctx.add_cookies.await_args.args[0][0]["value"] == stored
+
+
+async def test_start_keeps_the_profile_when_the_store_is_older(monkeypatch, tmp_path) -> None:
+    from danyapi.store import JsonStore
+
+    profile = _jwt(2000)
+    store = JsonStore("qwen-credentials", None)
+    store.set(_fingerprint("configured"), _jwt(1000))
+
+    page = page_stub()
+    ctx = context_stub(page, pages=[page])
+    ctx.cookies = AsyncMock(return_value=[{"name": "refresh_token", "value": profile}])
+    pw = pw_stub(ctx)
+    monkeypatch.setattr(browser_mod, "async_playwright", playwright_factory(pw))
+    monkeypatch.setenv("QWEN_BROWSER_DIR", str(tmp_path))
+
+    persisted: list[str] = []
+    b = QwenBrowser(token="configured", timeout=5, token_persist=persisted.append, store=store, configured="configured")
+    await b.start()
+
+    assert b.token == profile
+    ctx.add_cookies.assert_not_awaited()
+    assert persisted == [profile]

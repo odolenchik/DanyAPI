@@ -9,7 +9,7 @@ from typing import Any
 
 from ..sessions import SessionRegistry
 from ..store import JsonStore
-from .client import QwenClient, QwenError, QwenSession
+from .client import QwenClient, QwenError, QwenSession, jwt_claims
 
 log = logging.getLogger("danyapi.qwen")
 
@@ -17,6 +17,21 @@ log = logging.getLogger("danyapi.qwen")
 def _token_fingerprint(token: str) -> str:
     """Stable id for a credential, used to bind a rotation store to its source."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+def _token_issued_at(token: str | None) -> float | None:
+    """The ``iat`` claim of a token, or ``None`` when it cannot be read.
+
+    Qwen rotates the refresh token server-side and stamps each one with its
+    issue time, so ``iat`` orders two credentials without trusting either one:
+    the later value is the one the server still honours. Anything that is not a
+    decodable JWT carrying a numeric ``iat`` returns ``None`` and is treated as
+    incomparable.
+    """
+    iat = jwt_claims(token).get("iat")
+    if isinstance(iat, (int, float)):
+        return float(iat)
+    return None
 
 
 def load_effective_token(configured: str, store: JsonStore | None) -> str:
@@ -50,10 +65,29 @@ def persist_rotated_token(configured: str, store: JsonStore | None, new_token: s
 
     Keyed by the fingerprint of the configured token, so every account in the
     pool keeps its own rotated credential instead of sharing a single slot.
+
+    The store is the single source of truth for a rotated credential, and a
+    stale writer must never roll it back: an account has two independent
+    transports (HTTP client and browser), and the one that rotated later holds
+    the value the server still honours. If the slot already holds a token issued
+    later than ``new_token`` (by ``iat``), that copy is kept; an incomparable
+    pair is written as before.
     """
     if store is None:
         return
-    store.set(_token_fingerprint(configured), new_token)
+    key = _token_fingerprint(configured)
+    existing = store.get(key)
+    if isinstance(existing, str) and existing and existing != new_token:
+        stored_at = _token_issued_at(existing)
+        new_at = _token_issued_at(new_token)
+        if stored_at is not None and new_at is not None and stored_at >= new_at:
+            log.info(
+                "qwen kept the newer stored credential (%s) over an older rotation (%s)",
+                _token_fingerprint(existing),
+                _token_fingerprint(new_token),
+            )
+            return
+    store.set(key, new_token)
 
 
 class QwenSessionRegistry(SessionRegistry):
@@ -164,11 +198,13 @@ class QwenAccount:
         "_sticky",
         "_sticky_store",
         "broken",
+        "broken_at",
         "browser",
         "captcha_at",
         "captcha_until",
         "client",
         "index",
+        "last_revive_at",
         "quota_until",
         "sem",
         "sessions",
@@ -200,6 +236,11 @@ class QwenAccount:
         self.sem = asyncio.Semaphore(1)
         self.sessions = QwenSessionRegistry(client, session_cache_size, ttl, store=store, key_prefix=f"{index}:")
         self.broken = False
+        # When the account broke (monotonic) and when the revive loop last
+        # probed it. The revive loop uses both to pick its cadence; both are
+        # cleared by ``revive()``.
+        self.broken_at: float | None = None
+        self.last_revive_at: float | None = None
         # Monotonic deadline until which a quota-exhausted account stays out of
         # rotation. 0.0 means no timed block (either healthy, or broken forever
         # by an auth error).
@@ -266,7 +307,23 @@ class QwenAccount:
     def mark_broken(self) -> None:
         if not self.broken:
             self.broken = True
+            self.broken_at = time.monotonic()
             log.warning("qwen account #%d marked broken (invalid/expired token)", self.index)
+
+    def revive(self) -> None:
+        """Return a broken account to rotation after its credential checked out.
+
+        An auth break is not always permanent: the refresh token in memory can
+        be stale while the store already holds the rotated one (the HTTP client
+        and the browser rotate independently), and an upstream outage can fail
+        a probe. The revive loop calls this once ``check_auth`` reports success
+        so the account is not out until the process restarts.
+        """
+        if self.broken:
+            self.broken = False
+            self.broken_at = None
+            self.last_revive_at = None
+            log.info("qwen account #%d revived", self.index)
 
     def mark_quota_exhausted(self, cooldown_seconds: float) -> None:
         """Take the account out of rotation until its quota window resets.

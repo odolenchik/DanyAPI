@@ -314,3 +314,60 @@ def test_deepseek_revive_clamps_to_minimum(settings_for):
     assert s.deepseek_revive_interval == 60.0
     assert s.deepseek_revive_slow_interval == 60.0
     assert s.deepseek_revive_slow_after == 60.0
+
+
+def test_qwen_revive_defaults(settings_for):
+    s = settings_for({})
+    assert s.qwen_revive_interval == 900.0
+    assert s.qwen_revive_slow_interval == 1800.0
+    assert s.qwen_revive_slow_after == 7200.0
+
+
+def test_qwen_revive_read_env(settings_for):
+    s = settings_for(
+        {
+            "DANYAPI_QWEN_REVIVE_INTERVAL": "120",
+            "DANYAPI_QWEN_REVIVE_SLOW_INTERVAL": "600",
+            "DANYAPI_QWEN_REVIVE_SLOW_AFTER": "3600",
+        }
+    )
+    assert s.qwen_revive_interval == 120.0
+    assert s.qwen_revive_slow_interval == 600.0
+    assert s.qwen_revive_slow_after == 3600.0
+
+
+def test_qwen_revive_bad_values_fall_back(settings_for):
+    s = settings_for(
+        {
+            "DANYAPI_QWEN_REVIVE_INTERVAL": "abc",
+            "DANYAPI_QWEN_REVIVE_SLOW_INTERVAL": "",
+            "DANYAPI_QWEN_REVIVE_SLOW_AFTER": "1.5.2",
+        }
+    )
+    assert s.qwen_revive_interval == 900.0
+    assert s.qwen_revive_slow_interval == 1800.0
+    assert s.qwen_revive_slow_after == 7200.0
+
+
+def test_qwen_revive_clamps_to_minimum(settings_for):
+    s = settings_for(
+        {
+            "DANYAPI_QWEN_REVIVE_INTERVAL": "0",
+            "DANYAPI_QWEN_REVIVE_SLOW_INTERVAL": "-5",
+            "DANYAPI_QWEN_REVIVE_SLOW_AFTER": "1",
+        }
+    )
+    assert s.qwen_revive_interval == 60.0
+    assert s.qwen_revive_slow_interval == 60.0
+    assert s.qwen_revive_slow_after == 60.0
+
+
+def test_qwen_revive_is_independent_of_deepseek(settings_for):
+    s = settings_for(
+        {
+            "DANYAPI_DEEPSEEK_REVIVE_INTERVAL": "300",
+            "DANYAPI_QWEN_REVIVE_INTERVAL": "120",
+        }
+    )
+    assert s.deepseek_revive_interval == 300.0
+    assert s.qwen_revive_interval == 120.0
