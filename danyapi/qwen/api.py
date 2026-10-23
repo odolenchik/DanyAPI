@@ -654,18 +654,41 @@ async def collect_image(
         # behaviour that gets an account flagged. The pin lives on the account
         # and survives restarts through its store.
         pinned = existing_sid or account.sticky_image_chat(model_id)
-        try:
-            # The composer's aspect ratio drives ``extra.meta.size``; without one
-            # the page falls back to its default 16:9, which is wrong for the
-            # vertical pins. 2:3 is the Pinterest-native shape.
-            rec = await browser.generate_image(prompt, aspect=image_size or "2:3", chat_id=pinned)
-        except Exception as exc:
-            name = type(exc).__name__
-            if "Captcha" in name:
-                _mark_captcha(account, pool, existing_sid or "")
-                raise CaptchaChallenge() from exc
-            raise HTTPException(502, f"Qwen image generation failed: {exc}") from exc
-        if not rec.image_urls:
+        for attempt in range(MAX_RETRIES + 1):
+            if attempt:
+                await asyncio.sleep(min(RETRY_BACKOFF_SEC * (2 ** (attempt - 1)), RETRY_BACKOFF_MAX_SEC))
+            try:
+                # The composer's aspect ratio drives ``extra.meta.size``; without
+                # one the page falls back to its default 16:9, which is wrong for
+                # the vertical pins. 2:3 is the Pinterest-native shape.
+                rec = await browser.generate_image(prompt, aspect=image_size or "2:3", chat_id=pinned)
+            except Exception as exc:
+                name = type(exc).__name__
+                if "Captcha" in name:
+                    _mark_captcha(account, pool, existing_sid or "")
+                    raise CaptchaChallenge() from exc
+                raise HTTPException(502, f"Qwen image generation failed: {exc}") from exc
+            if rec.image_urls:
+                break
+            # The browser reads the SPA's own answer, so an exhausted quota and a
+            # transient service failure both arrive as plain text with no image,
+            # exactly like the HTTP transport. Classify them the same way instead
+            # of reporting a bare "no image": an exhausted account has to leave
+            # the rotation (and the caller has to fail over / report the cooldown)
+            # rather than burn its retries on a quota that cannot recover today.
+            quota_reason = _is_quota_exhausted(rec)
+            if quota_reason is not None:
+                _mark_quota_exhausted(account, pool, existing_sid or "", quota_reason)
+                raise QuotaExhausted(f"image generation quota exhausted: {quota_reason}")
+            transient = _is_transient_text(rec)
+            if transient is not None and attempt < MAX_RETRIES:
+                log.warning(
+                    "qwen image transient failure (%s), attempt %d/%d",
+                    transient,
+                    attempt + 1,
+                    MAX_RETRIES,
+                )
+                continue
             raise HTTPException(502, "Qwen image generation returned no image")
         # Remember the conversation so the next image reuses it instead of
         # opening a new chat.

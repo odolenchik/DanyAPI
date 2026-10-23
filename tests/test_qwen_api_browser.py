@@ -207,6 +207,89 @@ async def test_image_generation_without_an_image_is_an_error() -> None:
     assert "no image" in str(excinfo.value.detail)
 
 
+def text_result(content: str, urls: tuple[str, ...] = ()) -> qwen_api.QwenStreamReconstructor:
+    """A reconstructed answer that carries text but no image."""
+    rec = qwen_api.QwenStreamReconstructor()
+    rec.content = content
+    rec.image_urls = list(urls)
+    return rec
+
+
+async def test_image_generation_maps_an_exhausted_quota(monkeypatch) -> None:
+    """The SPA reports an exhausted quota as plain text, not as an error code.
+
+    Reporting that as a bare 502 "no image" is what hid the real cause in
+    production: the account stayed in rotation and the caller retried a quota
+    that cannot recover until the daily window resets. The browser path must
+    classify it exactly like the HTTP transport does.
+    """
+    marked: list = []
+    monkeypatch.setattr(qwen_api, "_mark_quota_exhausted", lambda *a: marked.append(a))
+    monkeypatch.setattr(qwen_api, "_mark_captcha", lambda *a: pytest.fail("not a captcha"))
+
+    browser = browser_stub()
+    browser.generate_image = AsyncMock(return_value=text_result("You've used up your daily image generation quota. Upgrade your plan."))
+    with pytest.raises(qwen_api.QuotaExhausted) as excinfo:
+        await qwen_api.collect_image(
+            account=account_with(browser),
+            pool=MagicMock(),
+            existing_sid="s-1",
+            lock=asyncio.Semaphore(1),
+            prompt="an apple",
+            model="m",
+            model_id="m",
+        )
+    assert excinfo.value.status_code == 429
+    assert marked, "the account must leave the rotation"
+    # No retries on the same account: a daily quota does not recover in seconds.
+    assert browser.generate_image.await_count == 1
+
+
+async def test_image_generation_retries_a_transient_failure(monkeypatch) -> None:
+    """A "try again later" answer passes on its own, so it is retried."""
+    monkeypatch.setattr(qwen_api, "RETRY_BACKOFF_SEC", 0.0)
+    monkeypatch.setattr(qwen_api, "_mark_quota_exhausted", lambda *a: pytest.fail("not a quota"))
+
+    browser = browser_stub()
+    browser.generate_image = AsyncMock(return_value=text_result("The service is experiencing high load, please try again later."))
+    with pytest.raises(HTTPException) as excinfo:
+        await qwen_api.collect_image(
+            account=account_with(browser),
+            pool=MagicMock(),
+            existing_sid=None,
+            lock=asyncio.Semaphore(1),
+            prompt="an apple",
+            model="m",
+            model_id="m",
+        )
+    assert excinfo.value.status_code == 502
+    assert browser.generate_image.await_count == qwen_api.MAX_RETRIES + 1
+
+
+async def test_image_generation_recovers_after_a_transient_failure(monkeypatch) -> None:
+    """The retry that succeeds must return the image, not the earlier failure."""
+    monkeypatch.setattr(qwen_api, "RETRY_BACKOFF_SEC", 0.0)
+
+    browser = browser_stub()
+    browser.generate_image = AsyncMock(
+        side_effect=[
+            text_result("try again later"),
+            image_result("https://cdn/x.png"),
+        ]
+    )
+    result = await qwen_api.collect_image(
+        account=account_with(browser),
+        pool=MagicMock(),
+        existing_sid=None,
+        lock=asyncio.Semaphore(1),
+        prompt="an apple",
+        model="m",
+        model_id="m",
+    )
+    assert result["image_urls"] == ["https://cdn/x.png"]
+    assert browser.generate_image.await_count == 2
+
+
 # --- captcha branches inside the retry loops ---
 
 
