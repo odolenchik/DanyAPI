@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import random
 import time
 from typing import Any
 
@@ -148,7 +149,30 @@ class QwenSessionRegistry(SessionRegistry):
 
 
 class QwenAccount:
-    __slots__ = ("_sticky", "_sticky_store", "broken", "client", "index", "quota_until", "sem", "sessions")
+    __slots__ = (
+        "_browser_interval",
+        "_browser_interval_jitter",
+        "_burst",
+        "_burst_pause",
+        "_burst_pause_jitter",
+        "_cycle_start",
+        "_min_interval",
+        "_min_interval_jitter",
+        "_pacing_delay",
+        "_since_gap",
+        "_starts",
+        "_sticky",
+        "_sticky_store",
+        "broken",
+        "browser",
+        "captcha_at",
+        "captcha_until",
+        "client",
+        "index",
+        "quota_until",
+        "sem",
+        "sessions",
+    )
 
     def __init__(
         self,
@@ -158,9 +182,21 @@ class QwenAccount:
         ttl: float = 0.0,
         store: JsonStore | None = None,
         sticky_store: JsonStore | None = None,
+        burst: int = 1,
+        min_interval: float = 0.0,
+        min_interval_jitter: float = 0.0,
+        burst_pause: float = 0.0,
+        burst_pause_jitter: float = 0.0,
+        browser: object | None = None,
+        browser_interval: float = 0.0,
+        browser_interval_jitter: float = 0.0,
     ) -> None:
         self.index = index
         self.client = client
+        # Optional browser transport. Qwen's anti-bot wall rejects every plain
+        # HTTP request for image generation, so a browser is the only way to get
+        # images; text keeps using the fast HTTP client.
+        self.browser = browser
         self.sem = asyncio.Semaphore(1)
         self.sessions = QwenSessionRegistry(client, session_cache_size, ttl, store=store, key_prefix=f"{index}:")
         self.broken = False
@@ -168,8 +204,32 @@ class QwenAccount:
         # rotation. 0.0 means no timed block (either healthy, or broken forever
         # by an auth error).
         self.quota_until = 0.0
+        # Anti-bot captcha (``RGV587_ERROR``) is not a dead token and not a
+        # quota: the credential still refreshes, but Qwen answers every request
+        # with a punish page until a human solves the captcha. Keep the account
+        # out of rotation for a while and report it separately from an auth
+        # break, so /health tells "captcha" apart from "token dead".
+        self.captcha_until = 0.0
+        self.captcha_at = 0.0
         self._sticky_store = sticky_store
         self._sticky: dict[str, str] = {}
+        # Pacing: ``burst`` requests, a jittered pause between them, then a long
+        # jittered rest. Qwen punishes a driven account with a captcha that
+        # sticks for hours, so the only defence is to stay under the radar.
+        self._burst = max(1, burst)
+        self._min_interval = max(0.0, min_interval)
+        self._min_interval_jitter = max(0.0, min_interval_jitter)
+        self._burst_pause = max(0.0, burst_pause)
+        self._burst_pause_jitter = max(0.0, burst_pause_jitter)
+        # A browser request is slow on its own, so it is paced by an even think
+        # time rather than by bursts: ``browser_interval`` plus jitter before
+        # every request, no long rests.
+        self._browser_interval = max(0.0, browser_interval)
+        self._browser_interval_jitter = max(0.0, browser_interval_jitter)
+        self._since_gap = 0
+        self._cycle_start = 0.0
+        self._pacing_delay: float | None = None
+        self._starts: list[float] = []
 
     def _sticky_key(self, model: str) -> str:
         return f"{self.index}:{model}"
@@ -222,18 +282,114 @@ class QwenAccount:
             max(0.0, cooldown_seconds),
         )
 
+    def mark_captcha(self, cooldown_seconds: float) -> None:
+        """Take the account out of rotation: Qwen wants a captcha solved.
+
+        The credential is fine — the access token keeps refreshing — but the
+        anti-bot system answers every request with a punish page until a human
+        solves the captcha. Retrying is worse than useless: each attempt feeds
+        the risk score. So the account rests, and since only a human can clear
+        the challenge the cooldown is long by default.
+        """
+        self.broken = True
+        self.captcha_at = time.monotonic()
+        self.captcha_until = self.captcha_at + max(0.0, cooldown_seconds)
+        log.warning(
+            "qwen account #%d hit the anti-bot captcha, cooling down %.0fs until it is solved",
+            self.index,
+            max(0.0, cooldown_seconds),
+        )
+
     def is_available(self) -> bool:
         """True when the account may be used for a request right now.
 
-        A quota cooldown that has elapsed automatically puts the account back
-        into rotation. Accounts broken by ``mark_broken`` (auth errors) carry
-        ``quota_until == 0.0`` and stay unavailable forever.
+        A quota or captcha cooldown that has elapsed automatically puts the
+        account back into rotation. Accounts broken by ``mark_broken`` (auth
+        errors) carry ``quota_until == 0.0`` and stay unavailable forever.
         """
-        if self.broken and self.quota_until and time.monotonic() >= self.quota_until:
+        now = time.monotonic()
+        if self.broken and self.quota_until and now >= self.quota_until:
             self.broken = False
             self.quota_until = 0.0
             log.info("qwen account #%d quota cooldown elapsed, back in rotation", self.index)
+        if self.broken and self.captcha_until and now >= self.captcha_until:
+            self.broken = False
+            self.captcha_until = 0.0
+            log.info("qwen account #%d captcha cooldown elapsed, back in rotation", self.index)
         return not self.broken
+
+    @property
+    def pacing_delay(self) -> float | None:
+        """Seconds the last ``wait_turn`` call had to sleep, ``None`` if none."""
+        return self._pacing_delay
+
+    @property
+    def burst(self) -> int:
+        return self._burst
+
+    def seconds_until_ready(self, now: float | None = None) -> float:
+        """How long before this account may start another request.
+
+        Pacing runs in cycles: ``burst`` starts are spaced by ``min_interval``
+        plus a random jitter (so the gaps never repeat exactly), and once the
+        burst is used up the account rests for ``burst_pause`` plus jitter.
+        The jitter is drawn once per gap, when the previous request starts,
+        and stored — otherwise every reading of the deadline would shuffle it.
+        """
+        if self._min_interval <= 0 and self._burst_pause <= 0 and self._browser_interval <= 0:
+            return 0.0
+        ts = time.monotonic() if now is None else now
+        if self._pacing_delay is None:
+            return 0.0
+        return max(0.0, self._cycle_start + self._pacing_delay - ts)
+
+    async def wait_turn(self) -> None:
+        """Sleep until this account is allowed to start another request."""
+        delay = self.seconds_until_ready()
+        if delay > 0:
+            log.debug("qwen account #%d pacing: sleeping %.1fs", self.index, delay)
+            await asyncio.sleep(delay)
+
+    def note_request_start(self, now: float | None = None) -> None:
+        """Record a request start and advance the pacing cycle.
+
+        The gap that must follow this request is chosen here, by jittering the
+        base interval that applies next: ``min_interval`` inside a burst, the
+        long ``burst_pause`` after it.
+        """
+        ts = time.monotonic() if now is None else now
+        starts = self._starts
+        starts.append(ts)
+        cutoff = ts - 60.0
+        while starts and starts[0] < cutoff:
+            starts.pop(0)
+        if self._browser_interval > 0:
+            # Browser transport: one even think time before every request. The
+            # request itself already takes tens of seconds, so bursts and long
+            # rests would only stall the pipeline.
+            extra = random.uniform(0.0, self._browser_interval_jitter) if self._browser_interval_jitter > 0 else 0.0
+            self._cycle_start = ts
+            self._pacing_delay = self._browser_interval + extra
+            return
+        if self._min_interval <= 0 and self._burst_pause <= 0:
+            return
+        self._since_gap += 1
+        if self._since_gap >= self._burst:
+            base = self._burst_pause
+            jitter = self._burst_pause_jitter
+            self._since_gap = 0
+        else:
+            base = self._min_interval
+            jitter = self._min_interval_jitter
+        extra = random.uniform(0.0, jitter) if jitter > 0 else 0.0
+        self._cycle_start = ts
+        self._pacing_delay = base + extra
+
+    def recent_request_count(self, window: float, now: float | None = None) -> int:
+        """How many request starts fall inside the trailing ``window`` seconds."""
+        ts = time.monotonic() if now is None else now
+        cutoff = ts - max(0.0, window)
+        return sum(1 for start in self._starts if start >= cutoff)
 
     @property
     def label(self) -> str:

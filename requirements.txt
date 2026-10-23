@@ -4,5 +4,8 @@ httpx>=0.28.1
 pydantic>=2.13.4
 python-dotenv>=1.2.2
 playwright>=1.49
+# Qwen browser transport: a patched Playwright fork that keeps the CDP
+# connection from announcing itself as automation.
+patchright>=1.56
 pillow==12.3.0
 python-multipart==0.0.32

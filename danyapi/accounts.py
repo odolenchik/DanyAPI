@@ -408,15 +408,20 @@ class DeepSeekAccount:
 
 
 def _account_state(account) -> str:
-    """Classify one pool account as 'ok', 'quota' or 'auth'.
+    """Classify one pool account as 'ok', 'quota', 'captcha' or 'auth'.
 
     'quota' is a temporary cooldown (``quota_until`` set): the account comes
-    back on its own. 'auth' is an auth failure with no deadline, so it stays
-    out until the process restarts. Used by ``AccountPool.stats`` so callers
-    can tell a dead token from an exhausted daily quota.
+    back on its own. 'captcha' means Qwen's anti-bot flagged the client: the
+    token is alive but every request is answered with a punish page until a
+    human solves the challenge, so the account rests for its own cooldown.
+    'auth' is an auth failure with no deadline, so it stays out until the
+    process restarts. Used by ``AccountPool.stats`` so callers can tell a dead
+    token from a captcha and from an exhausted daily quota.
     """
     if account.is_available():
         return "ok"
+    if getattr(account, "captcha_until", 0.0):
+        return "captcha"
     return "quota" if getattr(account, "quota_until", 0.0) else "auth"
 
 
@@ -542,7 +547,9 @@ class AccountPool:
         healthy = states.count("ok")
         broken_quota = states.count("quota")
         broken_auth = states.count("auth")
+        broken_captcha = states.count("captcha")
         resets_in = [a.quota_until - now for a in self.accounts if _account_state(a) == "quota"]
+        captcha_resets_in = [a.captcha_until - now for a in self.accounts if _account_state(a) == "captcha"]
         return {
             "label": self.label,
             "accounts": len(self.accounts),
@@ -550,7 +557,9 @@ class AccountPool:
             "broken": len(self.accounts) - healthy,
             "broken_quota": broken_quota,
             "broken_auth": broken_auth,
+            "broken_captcha": broken_captcha,
             "quota_resets_in": max(0.0, min(resets_in)) if resets_in else 0.0,
+            "captcha_resets_in": max(0.0, min(captcha_resets_in)) if captcha_resets_in else 0.0,
             "session_affinities": len(self._by_session),
             "context_entries": len(self._contexts._seqs),
             "context_hits": self._contexts.hits,

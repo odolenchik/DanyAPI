@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import random
 import sys
 import time
 import uuid
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 from fastapi import HTTPException
@@ -105,9 +106,49 @@ TRANSIENT_TEXT_MARKERS = (
 
 CONTEXT_LIMIT_MARKERS = ("context", "maxinput", "toolong", "lengthexceeded", "tokenlimit")
 
+# Qwen's anti-bot system answers a flagged client with a punish page instead of a
+# completion. The credential is fine and the access token still refreshes, so
+# none of the usual classifications apply: it is not auth, not quota, not a
+# transient 502. It comes back as a JSON body (or an HTML challenge page) with
+# these markers, and retrying only feeds the risk score, so the request must fail
+# fast and the account must rest until a human solves the captcha.
+CAPTCHA_MARKERS = (
+    "fail_sys_user_validate",
+    "rgv587",
+    "_____tmd_____",
+    "x5secdata",
+    "purecaptcha",
+    "punish?",
+    "captcha",
+)
+
+#: Text that tells the caller the captcha must be solved by a human. Shared with
+#: the publishing bot, which matches on it to say what actually broke.
+CAPTCHA_DETAIL = "Qwen anti-bot captcha: the account is flagged and needs the captcha solved in a browser"
+
 
 class ContextLimitError(Exception):
     pass
+
+
+class CaptchaChallenge(HTTPException):
+    """Qwen demands a captcha: retrying is useless until a human solves it."""
+
+    def __init__(self) -> None:
+        super().__init__(502, CAPTCHA_DETAIL)
+
+
+def _is_captcha_text(text: str | bytes | None) -> bool:
+    """True when the upstream body is an anti-bot challenge, not a real answer."""
+    if not text:
+        return False
+    if isinstance(text, bytes):
+        try:
+            text = text.decode("utf-8", errors="replace")
+        except Exception:
+            return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in CAPTCHA_MARKERS)
 
 
 class QuotaExhausted(HTTPException):
@@ -205,6 +246,24 @@ def _mark_quota_exhausted(account, pool, session_key: str, reason: str) -> None:
     log.warning("qwen account #%d quota exhausted: %s", account.index, reason)
 
 
+def _mark_captcha(account, pool, session_key: str) -> None:
+    """Rest the account after an anti-bot captcha and forget its session.
+
+    Unlike a quota exhaustion this is not about usage: Qwen's risk control has
+    flagged the client and answers every request with a punish page until a
+    human solves the captcha. Retrying only raises the risk score, so the
+    account leaves rotation for ``settings.qwen_captcha_cooldown`` and the
+    request fails fast with a detail the publishing bot can report verbatim.
+    """
+    account.mark_captcha(settings.qwen_captcha_cooldown)
+    _drop_session(pool, account, session_key)
+    log.error(
+        "qwen account #%d blocked by anti-bot captcha; cooling down %.0fs. Solve the captcha in a browser to bring the account back.",
+        account.index,
+        settings.qwen_captcha_cooldown,
+    )
+
+
 async def _prepare_session(account, pool, existing_sid: str | None, model_id: str, context_seq: tuple[str, ...] | None = None, chat_type: str = "t2t"):
     try:
         session, session_key = await account.sessions.obtain(existing_sid, model_id, chat_type=chat_type)
@@ -222,6 +281,72 @@ async def _prepare_session(account, pool, existing_sid: str | None, model_id: st
     return session, session_key
 
 
+def _real_browser(account) -> object | None:
+    """Return the account's browser transport, or ``None``.
+
+    The check is on the method being a real coroutine function, not on the
+    attribute existing: a ``MagicMock`` account answers any attribute with
+    another mock, and treating that as a browser would route every test through
+    a transport it does not have.
+    """
+    browser = getattr(account, "browser", None)
+    if browser is None:
+        return None
+    if not inspect.iscoroutinefunction(getattr(browser, "capture_text", None)):
+        return None
+    return browser
+
+
+class _BrowserResponse:
+    """Minimal httpx-response stand-in for a body produced by the browser.
+
+    ``collect_non_stream`` and ``stream_openai`` consume a streaming response:
+    they read ``aiter_bytes`` and close it. Wrapping the captured body in the
+    same interface keeps both callers unchanged, so the browser transport is a
+    drop-in for the HTTP one instead of a parallel code path.
+    """
+
+    status_code: ClassVar[int] = 200
+    headers: ClassVar[dict[str, str]] = {"content-type": "text/event-stream; charset=utf-8"}
+
+    def __init__(self, body: str) -> None:
+        self._body = body.encode("utf-8")
+
+    async def aiter_bytes(self):
+        yield self._body
+
+    async def aread(self) -> bytes:
+        return self._body
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def _pace(account) -> None:
+    """Pace a Qwen request: sleep the jittered gap, then record the start.
+
+    Every Qwen request funnels through ``_send_completion``, so pacing lives
+    here — one choke point instead of three call sites. The caller already holds
+    the account lock, so ``wait_turn`` serialises the actual starts.
+
+    Qwen answers a driven account with an anti-bot captcha that then sticks for
+    hours, and there is no throttle hint to react to, so the only defence is to
+    stay under the radar: a short burst, a few seconds between requests, then a
+    long rest.
+
+    The capability is detected with ``inspect.iscoroutinefunction`` rather than
+    ``hasattr``: a ``MagicMock`` account answers any attribute with another
+    mock, and awaiting that fails. Only a real ``QwenAccount`` is paced, simple
+    test doubles that stub just the request methods keep working unchanged.
+    """
+    wait_turn = getattr(account, "wait_turn", None)
+    note_start = getattr(account, "note_request_start", None)
+    if not inspect.iscoroutinefunction(wait_turn) or not callable(note_start):
+        return
+    await wait_turn()
+    note_start()
+
+
 async def _send_completion(
     account,
     session,
@@ -233,6 +358,23 @@ async def _send_completion(
     image_model: str | None = None,
     image_size: str | None = None,
 ):
+    await _pace(account)
+    browser = _real_browser(account)
+    if browser is not None and image_model is None:
+        # Text goes through the browser too when one is configured. The HTTP
+        # client still works for auth and chat creation, but completions are
+        # exactly the endpoint baxia guards: a single HTTP completion that meets
+        # the wall marks the account captcha-broken for an hour and takes the
+        # working image path down with it.
+        try:
+            body = await browser.capture_text(prompt, model_id)
+        except Exception as exc:
+            if "Captcha" in type(exc).__name__:
+                raise CaptchaChallenge() from exc
+            raise HTTPException(502, f"Qwen request failed: {exc}") from exc
+        if _is_captcha_text(body[:2000]):
+            raise CaptchaChallenge()
+        return _BrowserResponse(body)
     try:
         resp = await account.client.completion(
             chat_session_id=session.id,
@@ -253,6 +395,8 @@ async def _send_completion(
         _handle_account_error(account, exc)
         raise HTTPException(_error_status(exc.code), f"Qwen error: {exc}") from exc
     except httpx.HTTPStatusError as exc:
+        if _is_captcha_text(exc.response.text[:2000]):
+            raise CaptchaChallenge() from exc
         raise HTTPException(exc.response.status_code, exc.response.text[:500]) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"Qwen request failed: {exc}") from exc
@@ -260,6 +404,8 @@ async def _send_completion(
     if resp.status_code != 200:
         body = await resp.aread()
         await resp.aclose()
+        if _is_captcha_text(body[:2000]):
+            raise CaptchaChallenge()
         raise HTTPException(resp.status_code, body[:500].decode("utf-8", errors="replace"))
 
     content_type = resp.headers.get("content-type", "")
@@ -267,6 +413,8 @@ async def _send_completion(
         body = await resp.aread()
         await resp.aclose()
         text = body[:500].decode("utf-8", errors="replace")
+        if _is_captcha_text(body[:2000]):
+            raise CaptchaChallenge()
         if "text/html" in content_type or b"requestInfo" in body:
             raise HTTPException(502, "Qwen WAF challenge: request blocked by anti-bot, try again later")
         try:
@@ -393,6 +541,11 @@ async def collect_non_stream(
                 except ContextLimitError:
                     _drop_session(pool, account, session_key)
                     raise HTTPException(400, "context length exceeded: conversation too long, start a new conversation") from None
+                except CaptchaChallenge:
+                    # Never retried: each attempt raises the risk score, and the
+                    # challenge only clears when a human solves it.
+                    _mark_captcha(account, pool, session_key)
+                    raise
                 except HTTPException as exc:
                     if _is_retryable_http(exc) and attempt < MAX_RETRIES:
                         log.warning(
@@ -486,6 +639,44 @@ async def collect_image(
     user=None,
 ):
     await _human_delay()
+    # The image path is paced too: without this an image request would skip the
+    # per-account think time entirely and drive the account twice as fast as the
+    # text path.
+    await _pace(account)
+    browser = _real_browser(account)
+    if browser is not None:
+        # Qwen's anti-bot wall rejects every plain HTTP image request, so images
+        # go through the browser transport: it drives the real UI, where the SPA
+        # signs the request itself. Text keeps using the fast HTTP client.
+        # Every image for an account belongs in one pinned conversation: Qwen
+        # throttles - and eventually blocks for a day - an account that keeps
+        # creating new chats, so opening a fresh chat per image is exactly the
+        # behaviour that gets an account flagged. The pin lives on the account
+        # and survives restarts through its store.
+        pinned = existing_sid or account.sticky_image_chat(model_id)
+        try:
+            # The composer's aspect ratio drives ``extra.meta.size``; without one
+            # the page falls back to its default 16:9, which is wrong for the
+            # vertical pins. 2:3 is the Pinterest-native shape.
+            rec = await browser.generate_image(prompt, aspect=image_size or "2:3", chat_id=pinned)
+        except Exception as exc:
+            name = type(exc).__name__
+            if "Captcha" in name:
+                _mark_captcha(account, pool, existing_sid or "")
+                raise CaptchaChallenge() from exc
+            raise HTTPException(502, f"Qwen image generation failed: {exc}") from exc
+        if not rec.image_urls:
+            raise HTTPException(502, "Qwen image generation returned no image")
+        # Remember the conversation so the next image reuses it instead of
+        # opening a new chat.
+        if browser.chat_id and browser.chat_id != pinned:
+            account.set_sticky_image_chat(model_id, browser.chat_id)
+        return {
+            "image_urls": rec.image_urls,
+            "revised_prompt": rec.content or "",
+            "usage": rec.usage,
+            "session_id": browser.chat_id,
+        }
     async with account_lock(lock, settings.acquire_timeout):
         # Keep every prompt for this account + image model in one chat. Qwen
         # starts limiting (then blocks for a day) once an account opens many new
@@ -518,6 +709,9 @@ async def collect_image(
                 except ContextLimitError:
                     _drop_session(pool, account, session_key)
                     raise HTTPException(400, "context length exceeded: conversation too long, start a new conversation") from None
+                except CaptchaChallenge:
+                    _mark_captcha(account, pool, session_key)
+                    raise
                 except HTTPException as exc:
                     if _is_retryable_http(exc) and attempt < MAX_RETRIES:
                         log.warning(
@@ -676,7 +870,11 @@ async def stream_openai(
                 yield "data: [DONE]\n\n"
                 return
             except HTTPException as exc:
-                if _is_retryable_http(exc) and attempt < MAX_RETRIES:
+                if isinstance(exc, CaptchaChallenge):
+                    # Never retried: the risk score only grows, and the challenge
+                    # clears only when a human solves it.
+                    _mark_captcha(account, pool, session_key)
+                elif _is_retryable_http(exc) and attempt < MAX_RETRIES:
                     log.warning(
                         "qwen provider error (%s), attempt %d/%d",
                         exc.status_code,

@@ -138,6 +138,10 @@ class FakeAccount:
         self.broken = True
         self.quota_until = cooldown_seconds
 
+    def mark_captcha(self, cooldown_seconds):
+        self.broken = True
+        self.captcha_until = cooldown_seconds
+
     def sticky_image_chat(self, model):
         return None
 

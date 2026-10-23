@@ -89,6 +89,53 @@ class Settings:
             self.qwen_quota_cooldown = float(raw_quota)
         except ValueError:
             self.qwen_quota_cooldown = 86400.0
+
+        # Pacing for Qwen accounts. Unlike DeepSeek, Qwen has no per-account
+        # throttle hint to react to: it punishes a client silently with a
+        # captcha (``RGV587_ERROR``), which then sticks to the account for
+        # hours. The only defence is to never drive an account hard in the
+        # first place, so requests go in short bursts with a jittered pause
+        # between them and a long cooldown after each burst.
+        #
+        # ``qwen_burst`` requests may start back-to-back; each start is spaced
+        # by ``qwen_min_interval`` seconds plus jitter, and after the burst the
+        # account rests for ``qwen_burst_pause`` seconds plus jitter. 0 disables
+        # pacing entirely.
+        self.qwen_burst = self._int_env("DANYAPI_QWEN_BURST", 4, minimum=1)
+        self.qwen_min_interval = _float_env("DANYAPI_QWEN_MIN_INTERVAL", 3.0)
+        self.qwen_min_interval_jitter = _float_env("DANYAPI_QWEN_MIN_INTERVAL_JITTER", 4.0)
+        self.qwen_burst_pause = _float_env("DANYAPI_QWEN_BURST_PAUSE", 360.0)
+        self.qwen_burst_pause_jitter = _float_env("DANYAPI_QWEN_BURST_PAUSE_JITTER", 240.0)
+        # Pacing for the browser transport, which has a different shape: one
+        # request already takes 30-70 s because the page is typed into and the
+        # answer is rendered, so a burst rule would make the pipeline starve.
+        # What a human does between two messages is a short think time, and that
+        # is exactly what is applied here - an even jittered gap before every
+        # request, no long rests.
+        self.qwen_browser_interval = _float_env("DANYAPI_QWEN_BROWSER_INTERVAL", 20.0)
+        self.qwen_browser_interval_jitter = _float_env("DANYAPI_QWEN_BROWSER_INTERVAL_JITTER", 20.0)
+        # How long an account rests after Qwen answers with an anti-bot captcha.
+        # Only a human can clear the challenge, so the account stays out of
+        # rotation; retrying just feeds the risk score. It returns on its own
+        # once the cooldown elapses, in case the captcha was solved manually.
+        self.qwen_captcha_cooldown = _float_env("DANYAPI_QWEN_CAPTCHA_COOLDOWN", 3600.0, minimum=60.0)
+
+        # Image generation through a real browser. Qwen's anti-bot wall rejects
+        # every plain HTTP image request, so the image path drives the actual web
+        # UI: the SPA signs the request and the browser carries the state the WAF
+        # bound to it. Text keeps using the fast HTTP client.
+        self.qwen_browser = os.environ.get("DANYAPI_QWEN_BROWSER", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        # How long one browser request may take. Image generation is slower than
+        # a text call: the prompt is typed, rendered and only then answered.
+        self.qwen_browser_timeout = _float_env("DANYAPI_QWEN_BROWSER_TIMEOUT", 240.0, minimum=30.0)
+        # How long to keep the window open for a human to clear a captcha. 0
+        # fails fast and reports the captcha instead of waiting.
+        self.qwen_captcha_wait = _float_env("DANYAPI_QWEN_CAPTCHA_WAIT", 0.0)
         raw_level = os.environ.get("DANYAPI_LOG_LEVEL", "INFO").strip()
         self.log_level = raw_level or "INFO"
         self.log_file = os.environ.get("DANYAPI_LOG_FILE", "").strip()

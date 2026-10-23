@@ -134,14 +134,44 @@ async def lifespan(app: FastAPI):
                     log.warning("qwen token #%d rejected: %s", i, reason)
                     await client.aclose()
                     continue
+                account_index = len(qwen_accounts)
+                browser = None
+                if settings.qwen_browser:
+                    # One browser per account: the session cookie lives in the
+                    # profile, so sharing a directory would make the accounts
+                    # overwrite each other's login.
+                    from ..qwen.browser import QwenBrowser
+
+                    browser = QwenBrowser(
+                        token=token,
+                        timeout=settings.qwen_browser_timeout,
+                        captcha_wait=settings.qwen_captcha_wait,
+                        profile_index=account_index,
+                        # Same rotation store the HTTP client uses: the browser
+                        # profile is the source of truth once the SPA rotates the
+                        # credential, and the rotated value has to outlive the
+                        # process the way the HTTP path's does.
+                        token_persist=lambda new_token, src=configured: persist_rotated_token(src, qwen_credentials_store, new_token),
+                    )
                 qwen_accounts.append(
                     QwenAccount(
-                        len(qwen_accounts),
+                        account_index,
                         client,
                         session_cache_size=settings.session_cache_size,
                         ttl=settings.session_ttl,
                         store=qwen_session_store,
                         sticky_store=qwen_sticky_store,
+                        burst=settings.qwen_burst,
+                        min_interval=settings.qwen_min_interval,
+                        min_interval_jitter=settings.qwen_min_interval_jitter,
+                        burst_pause=settings.qwen_burst_pause,
+                        burst_pause_jitter=settings.qwen_burst_pause_jitter,
+                        browser=browser,
+                        # The browser is slow per request, so it is paced by an
+                        # even think time instead of bursts; the HTTP path keeps
+                        # its burst settings above.
+                        browser_interval=settings.qwen_browser_interval if browser else 0.0,
+                        browser_interval_jitter=settings.qwen_browser_interval_jitter if browser else 0.0,
                     )
                 )
             if rejected and not qwen_accounts:

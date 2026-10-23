@@ -2,6 +2,77 @@
 
 ## Готово
 
+- **Пейсинг Qwen и антибот-капча как отдельное состояние.** Симптом: 22.10 Qwen
+  отвечал на всё капчей (`FAIL_SYS_USER_VALIDATE` / `RGV587_ERROR` / `punish`),
+  DanyAPI крутил 5 повторов на запрос и отдавал голый 502, а `/health` показывал
+  `qwen: true, broken: 0` — поломка была невидима мониторингу. За 15:22–19:00
+  накопилось 650 ошибок при нуле успешных генераций.
+  - **`danyapi/qwen/accounts.py`:** у `QwenAccount` появился пейсинг — серия из
+    `DANYAPI_QWEN_BURST` (4) запросов, пауза `DANYAPI_QWEN_MIN_INTERVAL` (3 c)
+    плюс джиттер до `..._JITTER` (4 c), после серии отдых
+    `DANYAPI_QWEN_BURST_PAUSE` (360 c) плюс джиттер до `..._JITTER` (240 c).
+    Джиттер выбирается в `note_request_start` и хранится, иначе каждое чтение
+    дедлайна меняло бы паузу. Плюс `mark_captcha` / `captcha_until`:
+    отдельное состояние, не auth и не квота.
+  - **`danyapi/qwen/api.py`:** `CaptchaChallenge` и `_is_captcha_text`;
+    распознавание стоит до `raise_for_status` и до цикла повторов, поэтому
+    капча падает за один запрос (было 5). `_pace()` в `_send_completion` —
+    единственная точка, через которую идут все запросы к Qwen; способность
+    проверяется `inspect.iscoroutinefunction`, чтобы `MagicMock`-двойники не
+    принимались за настоящий аккаунт.
+  - **`danyapi/accounts.py`:** `_account_state` знает `captcha`; `stats()`
+    отдаёт `broken_captcha` и `captcha_resets_in`.
+  - **`danyapi/api/openai.py`, `danyapi/config.py`:** проброс настроек пейсинга,
+    `DANYAPI_QWEN_CAPTCHA_COOLDOWN` (3600 c, минимум 60).
+  - **Тесты:** `tests/test_qwen_pacing.py` (10) — серия, джиттер, `wait_turn`,
+    состояние captcha, маркеры, снятие сессии. В `FakeAccount` добавлен
+    `mark_captcha`.
+  - Верификация: `ruff check` + `ruff format --check` + `arch-check` +
+    `pytest -q` → **1398 passed**. На плате: капча отдаётся за 2.4–3.5 c одним
+    запросом, `/health` показывает `broken_captcha` и `captcha_resets_in`.
+
+- **Qwen: браузерный транспорт вместо HTTP.** Симптом: chat.qwen.ai отвечал на
+  любой запрос капчей (`FAIL_SYS_USER_VALIDATE` / `RGV587_ERROR` / `punish`),
+  причём и текстовые, и картиночные запросы падали в 502. Проверено, что дело не
+  в токене и не в IP: httpx, `curl_cffi` с TLS-отпечатком Chrome и даже свой
+  `fetch` изнутри страницы получают ту же стену — проходит только запрос, который
+  отправляет сам SPA.
+  - **Новый модуль `danyapi/qwen/browser.py`:** patchright + persistent-профиль на
+    каждый аккаунт. Авторизация — `refresh_token` в cookie на домене `.qwen.ai`
+    (не `chat.qwen.ai`: обмен идёт на `auth.qwen.ai`, и cookie с дочернего домена
+    туда не уходит, refresh отвечает 401). Отправка — печать в композер и клик по
+    `send-button`, ответ ловится `expect_response`, парсится тем же
+    `QwenStreamReconstructor`.
+  - **Режим изображений:** у Qwen картиночных моделей нет в пикере, они живут в
+    отдельном режиме композера `Create Image` (`chat_type: t2i`). Соотношение
+    сторон задаётся в сабконфиге (`extra.meta.size`), варианты
+    `1:1, 2:3, 3:2, 3:4, 4:3, 16:9, 9:16`; по умолчанию берётся 2:3 — вертикаль
+    Pinterest.
+  - **`danyapi/qwen/api.py`:** `_BrowserResponse` (httpx-совместимая обёртка, чтобы
+    существующие циклы не переписывать), `_real_browser` (проверка через
+    `inspect.iscoroutinefunction`, иначе `MagicMock`-аккаунт уводит тесты в
+    браузерную ветку), ветки браузера в `_send_completion` и `collect_image`.
+  - **Капча:** распознаётся до ретраев (`CaptchaChallenge`), аккаунт уходит в
+    отдельное состояние `broken_captcha` с собственным кулдауном; `/health` отдаёт
+    `broken_captcha` и `captcha_resets_in`. С `DANYAPI_QWEN_CAPTCHA_WAIT` окно
+    остаётся открытым, после решения страница перезагружается, режим и соотношение
+    восстанавливаются, запрос повторяется.
+  - **Переиспользование чата:** картинки идут в один закреплённый чат на аккаунт
+    (`sticky_image_chat`), а не в новый на каждый запрос — у Qwen есть лимит на
+    количество новых чатов, и именно его превышение ведёт к суточной блокировке.
+  - **Пейсинг:** два режима. HTTP — серия с паузами и длинным отдыхом. Браузер —
+    ровный think time (`DANYAPI_QWEN_BROWSER_INTERVAL` 20 с + джиттер до 20 с):
+    один запрос и так длится 30–70 с, серии и долгие отдыхи только морили бы
+    конвейер голодом. `collect_image` теперь пейсится (раньше пропускал).
+  - **Тесты:** `test_qwen_browser.py` (25), `test_qwen_browser_flow.py` (48),
+    `test_qwen_api_browser.py` (25), `test_qwen_pacing.py` (18). Playwright
+    полностью замокан — браузер не запускается, сеть не используется.
+    Покрытие `browser.py`, `qwen/accounts.py`, `config.py` — 100%.
+  - Верификация: `ruff check` + `ruff format --check` + `arch-check` +
+    `pytest -q` → **1500 passed**. Живые прогоны: текст 26 с, картинка 63–75 с,
+    `n=2` — две картинки 1024×1536 за 135 с в одном чате, повторный запрос
+    переиспользует закреплённый чат.
+
 - **Сторож против цикла повторяющихся tool-вызовов (`repeat_loop`).**
   Симптом: сессия шлёт один и тот же вызов раунд за раундом, пока не кончится
   контекст (14 подряд в `a2b6de5d`, 10 в `953c0ca4`); приходилось жать «стоп» в вебе,
