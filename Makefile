@@ -5,8 +5,9 @@ MAKEFLAGS += --no-print-directory
 PYTHON ?= $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python3)
 PREFLIGHT := scripts/preflight.py
 ARCH_CHECK := scripts/arch-check.py
+DRIFT := scripts/platform_drift.py
 
-.PHONY: help preflight env-check deps db-ping app-check arch-check check
+.PHONY: help preflight env-check deps db-ping app-check arch-check check drift
 
 help:
 	@echo "DanyAPI targets:"
@@ -17,6 +18,7 @@ help:
 	@echo "  app-check    Verify the FastAPI app imports (no DB migrations in this project)"
 	@echo "  arch-check   Verify architectural invariants"
 	@echo "  check        Lint, then arch-check, then syntax check"
+	@echo "  drift        Probe the web front-ends for API drift (network)"
 
 preflight:
 	@echo "== preflight =="
@@ -40,6 +42,9 @@ app-check:
 
 arch-check:
 	@$(PYTHON) $(ARCH_CHECK)
+
+drift:
+	@$(PYTHON) $(DRIFT) all
 
 check:
 	@ruff check
