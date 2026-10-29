@@ -1086,6 +1086,33 @@
     (колбэки стрим-очереди вместо `_decode_cdp_data`). Верификация: `ruff check` +
     `ruff format --check` + `pytest -q` → 862 passed, `arch-check` OK.
 
+## Готово (2026-10-29)
+
+- **Qwen: мёртвый браузер больше не блокирует генерацию картинок навсегда.**
+  Симптом: с 27.10 16:31 все `/v1/images/generations` отдавали 502
+  `Qwen image generation failed: Page.goto: Target page, context or browser has
+  been closed`, а `/health` показывал `qwen: healthy: 2, broken_quota: 0`.
+  - **Причина:** браузер Qwen умер внутри живого процесса danyapi3 (процесс и
+    Xorg не перезапускались). `generate_image` / `capture` / `capture_text`
+    проверяли только флаг `_started` и непустой `_page`, поэтому мёртвый
+    контекст считался живым, `start()` выходил по `if self._started: return`, и
+    каждый следующий запрос падал на том же мёртвом хэндле (1897 ошибок).
+  - **`danyapi/qwen/browser.py`:** добавлены `is_alive()` (проверяет
+    `page.is_closed()` и, если контекст сохранён, `context.is_closed()`; любое
+    исключение от мёртвого хэндла считается за «мертво») и `_ensure_started()`,
+    который при мёртвом браузере пишет warning, делает `aclose()` и открывает
+    заново. Все три точки входа (`capture`, `capture_text`, `generate_image`)
+    переведены с `if not self._started ... await self.start()` на
+    `await self._ensure_started()`.
+  - **Тесты:** `tests/test_qwen_browser_flow.py` — 7 новых (живой/мёртвый
+    браузер, мёртвый контекст, недоступный хэндл, переоткрытие, переиспользование
+    живого). Заглушки `page_stub` / `context_stub` получили `is_closed`.
+  - Верификация: `ruff check` OK, `arch-check` OK, `pytest -q` → **1570 passed**.
+    Отдельно: `ruff format --check` ругается на `scripts/platform_drift.py` и
+    `tests/test_platform_drift.py` — это было до правки, строка в `BACKLOG.md`.
+  - Осталось: скопировать код на плату (`rsync`, §10.1 инструкции) и
+    `sudo systemctl restart danyapi3`; затем живой запрос картинки.
+
 ## В работе
 
 - **Изоляция дискового кэша между инстансами (45 повторных загрузок картинок).**

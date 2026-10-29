@@ -207,6 +207,39 @@ class QwenBrowser:
     def started(self) -> bool:
         return self._started
 
+    def is_alive(self) -> bool:
+        """True while the page behind ``started`` still exists.
+
+        ``_started`` only records that a browser was opened once. The context can
+        die under it - the process is killed, the X display goes away, Chromium
+        crashes - while the flag and the page object stay in place. Every later
+        call then fails on the dead handle with "Target page, context or browser
+        has been closed" and nothing ever reopens it. Callers use this to tell
+        the two states apart before reusing the browser.
+        """
+        if not self._started or self._page is None:
+            return False
+        try:
+            if self._page.is_closed():
+                return False
+            # The page can report itself open while the whole browser is gone,
+            # so the context is asked too. It is optional: a caller may hold a
+            # page without keeping the context around.
+            context = self._context
+            return context is None or not context.is_closed()
+        except Exception:
+            # The transport is gone: the handle cannot even answer.
+            return False
+
+    async def _ensure_started(self) -> None:
+        """(Re)open the browser when the current one is missing or dead."""
+        if self.is_alive():
+            return
+        if self._started:
+            log.warning("qwen browser is gone; reopening it (profile=%s)", _profile_dir(self._profile_index))
+            await self.aclose()
+        await self.start()
+
     async def start(self) -> None:
         """Open the browser, authenticate and wait for the composer."""
         if self._started:
@@ -408,8 +441,7 @@ class QwenBrowser:
         :class:`QwenStreamReconstructor` as the HTTP transport, so both transports
         behave identically downstream.
         """
-        if not self._started or self._page is None:
-            await self.start()
+        await self._ensure_started()
         page = self._page
         assert page is not None
         async with self._lock:
@@ -469,8 +501,7 @@ class QwenBrowser:
         so the caller feeds it through the same reconstructor as the HTTP
         transport.
         """
-        if not self._started or self._page is None:
-            await self.start()
+        await self._ensure_started()
         page = self._page
         assert page is not None
         async with self._lock:
@@ -627,8 +658,7 @@ class QwenBrowser:
         for a day - an account that keeps creating new chats, so every image for
         an account belongs in one pinned conversation.
         """
-        if not self._started or self._page is None:
-            await self.start()
+        await self._ensure_started()
         page = self._page
         assert page is not None
         async with self._lock:

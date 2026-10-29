@@ -60,6 +60,7 @@ def page_stub(*, textarea_count: int = 1, url: str = "https://chat.qwen.ai/") ->
     page.wait_for_timeout = AsyncMock()
     page.evaluate = AsyncMock()
     page.content = AsyncMock(return_value="<html></html>")
+    page.is_closed = MagicMock(return_value=False)
     page.url = url
 
     locator = MagicMock()
@@ -90,6 +91,7 @@ def context_stub(page: MagicMock, *, pages: list | None = None) -> MagicMock:
     ctx.add_cookies = AsyncMock()
     ctx.new_page = AsyncMock(return_value=page)
     ctx.close = AsyncMock()
+    ctx.is_closed = MagicMock(return_value=False)
     ctx.pages = pages if pages is not None else []
     return ctx
 
@@ -204,6 +206,72 @@ async def test_aclose_survives_errors() -> None:
 
 async def test_aclose_without_a_browser_is_a_noop() -> None:
     await QwenBrowser(token="t").aclose()
+
+
+def test_a_live_browser_reports_itself_alive() -> None:
+    b = armed(page_stub())
+    assert b.is_alive() is True
+
+
+def test_a_never_started_browser_is_not_alive() -> None:
+    assert QwenBrowser(token="t").is_alive() is False
+
+
+def test_a_closed_page_is_not_alive() -> None:
+    """The case behind the outage: ``_started`` is set, the page is gone."""
+    page = page_stub()
+    page.is_closed = MagicMock(return_value=True)
+    b = armed(page)
+    assert b.started is True
+    assert b.is_alive() is False
+
+
+def test_a_closed_context_is_not_alive() -> None:
+    """A dead browser can leave the page reporting itself open."""
+    page = page_stub()
+    ctx = context_stub(page)
+    ctx.is_closed = MagicMock(return_value=True)
+    b = armed(page)
+    b._context = ctx
+    assert b.is_alive() is False
+
+
+def test_an_unreachable_page_is_not_alive() -> None:
+    """When the transport is gone the handle cannot even answer."""
+    page = page_stub()
+    page.is_closed = MagicMock(side_effect=RuntimeError("Target closed"))
+    assert armed(page).is_alive() is False
+
+
+async def test_a_dead_browser_is_reopened_before_the_next_request(monkeypatch, tmp_path) -> None:
+    """The regression: a browser that died while the service kept running.
+
+    ``_started`` stays True and the page object stays in place, so before this
+    fix every later request failed on the dead handle with "Target page, context
+    or browser has been closed" and the browser was never reopened.
+    """
+    dead = page_stub()
+    dead.is_closed = MagicMock(return_value=True)
+    b = armed(dead)
+
+    fresh = page_stub()
+    ctx = context_stub(fresh, pages=[fresh])
+    monkeypatch.setattr(browser_mod, "async_playwright", playwright_factory(pw_stub(ctx)))
+    monkeypatch.setenv("QWEN_BROWSER_DIR", str(tmp_path))
+
+    await b._ensure_started()
+
+    assert b.is_alive() is True
+    assert b._page is fresh
+    fresh.goto.assert_awaited()
+
+
+async def test_a_live_browser_is_reused_without_reopening(monkeypatch) -> None:
+    factory = MagicMock()
+    monkeypatch.setattr(browser_mod, "async_playwright", factory)
+    b = armed(page_stub())
+    await b._ensure_started()
+    factory.assert_not_called()
 
 
 # --- composer waiting ---
