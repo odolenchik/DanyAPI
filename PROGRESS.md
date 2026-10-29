@@ -1108,10 +1108,45 @@
     браузер, мёртвый контекст, недоступный хэндл, переоткрытие, переиспользование
     живого). Заглушки `page_stub` / `context_stub` получили `is_closed`.
   - Верификация: `ruff check` OK, `arch-check` OK, `pytest -q` → **1570 passed**.
-    Отдельно: `ruff format --check` ругается на `scripts/platform_drift.py` и
-    `tests/test_platform_drift.py` — это было до правки, строка в `BACKLOG.md`.
+    `ruff format --check` тогда ругался на `scripts/platform_drift.py` и
+    `tests/test_platform_drift.py`; отформатированы в следующем пункте.
   - Осталось: скопировать код на плату (`rsync`, §10.1 инструкции) и
     `sudo systemctl restart danyapi3`; затем живой запрос картинки.
+
+- **Qwen: генерация картинок больше не упирается в занятый чат и не висит
+  получасом.** Продолжение того же разбора. После починки мёртвого браузера
+  остались две причины 502, обе воспроизведены локально на `DanyAPI3`.
+  - **Причина 1 — кнопка отправки, которой нет.** Пока Qwen генерирует, SPA
+    подменяет её (`"stop" === t ? <button className="stop-button"> :
+    <button className="send-button">`), и `button.send-button` отсутствует в
+    DOM. `_submit` набирал текст и 30 с ждал несуществующую кнопку, получал
+    «no completion captured», и каждый из пяти ретраев повторял это заново —
+    отсюда 582 ответа 502 за 29.10 и 710 за 28.10.
+  - **`danyapi/qwen/browser.py`:** константа `STOP_BUTTON` и `_wait_until_idle()`
+    (опрос стоп-кнопки с дедлайном `self._timeout`, ошибка `QwenBrowserError`,
+    если ответ так и не закончился); вызов добавлен в `_submit` перед набором
+    текста. Заодно найден и исправлен предшествующий баг: первая версия бюджета
+    оборачивала `generate_image` в `asyncio.wait_for`, а отмена корутины посреди
+    шага Playwright ломала драйвер (браузер после этого умирал) — поэтому бюджет
+    теперь проверяется **между** попытками, ни один вызов не отменяется.
+  - **`danyapi/config.py`:** `DANYAPI_QWEN_IMAGE_BUDGET` (300 с, минимум 60) —
+    общий wall-clock бюджет на цикл ретраев; исчерпан → `504`, а не зависание.
+  - **`danyapi/qwen/api.py`:** дедлайн в браузерной ветке `collect_image`,
+    проверка перед каждой попыткой.
+  - **Тесты:** `tests/test_qwen_api_browser.py` — бюджет на подставных часах (не
+    стартует попытку за пределами бюджета); `tests/test_qwen_browser_flow.py` —
+    `page_stub(stop_count=…)`, фабрика локаторов по селектору, ожидание занятого
+    чата и отказ, если он не освободился. `tests/test_qwen_browser_flow.py` и
+    `tests/test_platform_drift.py` были в `DanyAPI2/3` старее, чем в `DanyAPI`
+    (без `is_closed` в заглушках) — синхронизированы; `scripts/platform_drift.py`
+    и `tests/test_platform_drift.py` отформатированы, `ruff format --check` зелёный.
+  - Верификация: `ruff check` OK, `ruff format --check` OK, `arch-check` OK,
+    `pytest -q` → **1573 passed**. Живьём: три генерации подряд → 200 (76 с,
+    82 с, 82 с), один и тот же браузер на всю серию, `/health` → `qwen: true`.
+  - Осталось: тот же перенос на плату. **Важно:** там `qwen accounts ready: 0` —
+    оба `refresh_token` отозваны ротацией, а стор
+    `.cache/qwen-credentials-default.json` держит мёртвое значение (`jti=973b7ea2`).
+    Без свежего токена и чистки стора картинки не пойдут даже с этим кодом.
 
 ## В работе
 
@@ -1250,19 +1285,28 @@
   рефакторинга в `api/streaming.py` (~102 строки), `tools/parse.py` (~52) и др.,
   не относится к текущим фиксам (локальный `pytest -q` → 1252 passed).
   Пять coverage-сюит (`tests/test_*_coverage.py`) подняли покрытие с 94% до 97%.
-- `ruff format --check` ранее падал на `scripts/smoke_tooltrace.py` и
-  `tests/test_tooltrace.py`; оба отформатированы, сейчас формат-гейт зелёный.
+- `ruff format --check` зелёный: `scripts/smoke_tooltrace.py` и
+  `tests/test_tooltrace.py` отформатированы ранее, `scripts/platform_drift.py`
+  и `tests/test_platform_drift.py` — в этой сессии.
 
 ## Текущий commit
 
 Копии `DanyAPI2` и `DanyAPI3` — без `.git`; при синхронизации кода их надо
 приводить к `DanyAPI` вручную (`.env` у каждого свой и не трогается).
 
-Состояние на `65bb91a`: все три копии по коду идентичны (`danyapi/`, `tests/`,
-`docs/`, `scripts/`, `deploy/`, корневые файлы). Различается только `.env`
-(порт 8000 / 9000 / 6660 и, у `DanyAPI3`, явный `DANYAPI_CACHE_DIR=/tmp/danyapi3`)
-и наличие `.venv`. Проверка — `diff -rq` без `.venv`/`.git`/`.env`; тесты
-1369 passed в каждой.
+Состояние после правки бюджета и ожидания чата: все три копии по коду
+идентичны (`danyapi/`, `tests/`, `scripts/`; `diff -rq` без
+`.venv`/`.git`/`.env`/кэшей → 0 различий). Различается только `.env`
+(порт 8000 / 9000 / 6660 и, у `DanyAPI3`, явный `DANYAPI_CACHE_DIR`) и наличие
+`.venv`. Тесты: `pytest -q` → **1573 passed** в `DanyAPI` и `DanyAPI2`,
+**1573 passed** в `DanyAPI3`; `ruff check`, `ruff format --check`, `arch-check`
+зелёные везде.
+
+Изменения этой сессии ещё **не закоммичены** (7 файлов в рабочем дереве
+`DanyAPI`): `danyapi/config.py`, `danyapi/qwen/api.py`,
+`danyapi/qwen/browser.py`, `scripts/platform_drift.py`,
+`tests/test_platform_drift.py`, `tests/test_qwen_api_browser.py`,
+`tests/test_qwen_browser_flow.py`.
 
 Последний коммит: см. `git log -1`. До него: `fix(qwen): classify image quota
 and transient failures in the browser path` (`3c8c169`) и `fix(qwen): keep the

@@ -52,6 +52,9 @@ BASE_URL = "https://chat.qwen.ai"
 #: Composer and the button that submits it.
 TEXTAREA = "textarea"
 SEND_BUTTON = "button.send-button"
+#: While an answer streams the SPA swaps the send button for this one, so its
+#: presence means the chat is busy and a send would have nothing to click.
+STOP_BUTTON = "button.stop-button"
 #: Model picker: the trigger shows the current model, the items are the choices.
 MODEL_TRIGGER = ".wms-trigger"
 
@@ -354,6 +357,27 @@ class QwenBrowser:
             self._token_persist(profile)
             log.info("qwen browser persisted a rotated token from the profile")
 
+    async def _wait_until_idle(self) -> None:
+        """Wait until Qwen is no longer generating in the open chat.
+
+        While an answer streams, the SPA renders ``button.stop-button`` instead
+        of ``button.send-button``, so a send issued too early finds nothing to
+        click. Waiting here is what keeps a retry from fighting the previous
+        answer: a timed-out request leaves the SPA still working, and the next
+        one must queue behind it rather than fail.
+        """
+        page = self._page
+        assert page is not None
+        deadline = asyncio.get_running_loop().time() + self._timeout
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                if not await page.locator(STOP_BUTTON).count():
+                    return
+            except Exception:
+                return
+            await asyncio.sleep(1.0)
+        raise QwenBrowserError("Qwen is still generating in the open chat; the previous answer never finished")
+
     async def _wait_for_composer(self) -> None:
         """Wait until the chat UI is usable, or raise when a captcha blocks it.
 
@@ -583,6 +607,14 @@ class QwenBrowser:
         """
         page = self._page
         assert page is not None
+        # Never type into a busy composer. While Qwen generates, the SPA swaps the
+        # send button for a stop button (``"stop" === t ? <button className=
+        # "stop-button"> : <button className="send-button">``), so ``send-button``
+        # is not in the DOM at all and clicking it times out. That is what turned
+        # a still-running generation into a stream of 502s: each retry filled the
+        # textarea of a busy chat and waited 30 s for a button that could not
+        # appear. Wait for the previous answer to finish first.
+        await self._wait_until_idle()
         textarea = page.locator(TEXTAREA).first
         await textarea.wait_for(state="visible", timeout=30_000)
         await textarea.click()

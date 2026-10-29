@@ -654,9 +654,20 @@ async def collect_image(
         # behaviour that gets an account flagged. The pin lives on the account
         # and survives restarts through its store.
         pinned = existing_sid or account.sticky_image_chat(model_id)
+        # Wall-clock budget for the whole loop, retries included. Each browser
+        # call already has its own timeout inside Playwright, and that timeout is
+        # where waiting has to end: wrapping the call in ``asyncio.wait_for``
+        # cancels it mid-flight, and a Playwright coroutine cancelled between two
+        # driver steps leaves the browser wedged - the next call then fails and
+        # the Chromium process eventually dies. The budget is therefore checked
+        # *between* attempts, never by cancelling one.
+        deadline = asyncio.get_running_loop().time() + settings.qwen_image_budget
         for attempt in range(MAX_RETRIES + 1):
             if attempt:
                 await asyncio.sleep(min(RETRY_BACKOFF_SEC * (2 ** (attempt - 1)), RETRY_BACKOFF_MAX_SEC))
+            if asyncio.get_running_loop().time() >= deadline:
+                log.warning("qwen image generation exceeded its %ss budget", settings.qwen_image_budget)
+                raise HTTPException(504, "Qwen image generation timed out: retry budget exhausted")
             try:
                 # The composer's aspect ratio drives ``extra.meta.size``; without
                 # one the page falls back to its default 16:9, which is wrong for

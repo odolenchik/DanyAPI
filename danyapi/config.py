@@ -133,6 +133,14 @@ class Settings:
         # How long one browser request may take. Image generation is slower than
         # a text call: the prompt is typed, rendered and only then answered.
         self.qwen_browser_timeout = _float_env("DANYAPI_QWEN_BROWSER_TIMEOUT", 240.0, minimum=30.0)
+        # Total time one image generation may take, retries included. A single
+        # browser call is bounded by ``qwen_browser_timeout``, but the retry loop
+        # multiplies that by the number of attempts: Qwen answering "there was an
+        # issue connecting" several times in a row held the request for half an
+        # hour and kept the account lock the whole time. The budget is wall clock
+        # over the whole loop, so a slow provider fails the request instead of
+        # silently pinning the account.
+        self.qwen_image_budget = _float_env("DANYAPI_QWEN_IMAGE_BUDGET", 300.0, minimum=60.0)
         # How long to keep the window open for a human to clear a captcha. 0
         # fails fast and reports the captcha instead of waiting.
         self.qwen_captcha_wait = _float_env("DANYAPI_QWEN_CAPTCHA_WAIT", 0.0)

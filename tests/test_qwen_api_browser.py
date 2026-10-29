@@ -266,6 +266,45 @@ async def test_image_generation_retries_a_transient_failure(monkeypatch) -> None
     assert browser.generate_image.await_count == qwen_api.MAX_RETRIES + 1
 
 
+async def test_image_generation_gives_up_when_the_budget_runs_out(monkeypatch) -> None:
+    """A provider that keeps failing must not pin the account for half an hour.
+
+    Each browser call is bounded on its own, but the retry loop multiplied that
+    by every attempt: five "issue connecting" answers held one request for tens
+    of minutes and kept the account lock the whole time, so every later request
+    queued behind it. The budget is wall clock over the whole loop.
+    """
+    monkeypatch.setattr(qwen_api, "RETRY_BACKOFF_SEC", 0.0)
+    monkeypatch.setattr(qwen_api.settings, "qwen_image_budget", 0.05, raising=False)
+
+    # 0.0 when the deadline is taken, 0.0 for the first attempt, then past it.
+    # A fake clock, not a slow call: the budget is checked between attempts and
+    # must never cancel a call in flight - cancelling a Playwright coroutine
+    # mid-step wedges the browser, and the next request then finds a dead one.
+    ticks = iter([0.0, 0.0, 1.0, 1.0, 1.0])
+
+    class Clock:
+        def time(self) -> float:
+            return next(ticks, 1.0)
+
+    monkeypatch.setattr(qwen_api.asyncio, "get_running_loop", Clock)
+
+    browser = browser_stub()
+    browser.generate_image = AsyncMock(return_value=text_result("try again later"))
+    with pytest.raises(HTTPException) as excinfo:
+        await qwen_api.collect_image(
+            account=account_with(browser),
+            pool=MagicMock(),
+            existing_sid=None,
+            lock=asyncio.Semaphore(1),
+            prompt="an apple",
+            model="m",
+            model_id="m",
+        )
+    assert excinfo.value.status_code == 504
+    assert browser.generate_image.await_count == 1, "no attempt may start past the budget"
+
+
 async def test_image_generation_recovers_after_a_transient_failure(monkeypatch) -> None:
     """The retry that succeeds must return the image, not the earlier failure."""
     monkeypatch.setattr(qwen_api, "RETRY_BACKOFF_SEC", 0.0)

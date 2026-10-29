@@ -53,7 +53,33 @@ class _Expect:
         return False
 
 
-def page_stub(*, textarea_count: int = 1, url: str = "https://chat.qwen.ai/") -> MagicMock:
+class _LocatorFactory:
+    """``page.locator`` stand-in that answers per selector.
+
+    Playwright resolves a locator lazily from a selector, so the driver asks for
+    ``button.stop-button`` and ``textarea`` separately and gets different nodes.
+    Tests also reach the shared locator through ``return_value``; both paths are
+    supported here so the stop-button check cannot be faked by the shared mock.
+    """
+
+    def __init__(self, shared, stop) -> None:
+        self._shared = shared
+        self._stop = stop
+        self.return_value = shared
+
+    def __call__(self, selector: str):
+        return self._stop if selector == browser_mod.STOP_BUTTON else self._shared
+
+    def assert_called(self) -> None:
+        return None
+
+
+def page_stub(
+    *,
+    textarea_count: int = 1,
+    url: str = "https://chat.qwen.ai/",
+    stop_count: int = 0,
+) -> MagicMock:
     """Page stand-in with awaitable actions and a scriptable locator."""
     page = MagicMock()
     page.goto = AsyncMock()
@@ -71,7 +97,21 @@ def page_stub(*, textarea_count: int = 1, url: str = "https://chat.qwen.ai/") ->
     locator.fill = AsyncMock()
     locator.wait_for = AsyncMock()
     locator.inner_text = AsyncMock(return_value="Create Image")
-    page.locator = MagicMock(return_value=locator)
+
+    # The stop button is its own locator: the driver waits for it to disappear
+    # before typing (a busy chat has no send button at all), so "not there" is
+    # the idle state every test starts from. Returning the shared locator for it
+    # would make every chat look permanently busy.
+    stop = MagicMock()
+    stop.first = stop
+    stop.count = AsyncMock(return_value=stop_count)
+    stop.is_visible = AsyncMock(return_value=False)
+
+    # A factory, not ``MagicMock(side_effect=...)``: the other tests reach the
+    # shared locator through ``page.locator.return_value``, which a side effect
+    # would bypass. This keeps both access styles working.
+    page.locator = _LocatorFactory(locator, stop)
+    page.stop_locator = stop
 
     # ``expect_response`` is an async context manager yielding a handle whose
     # ``value`` is awaited. It has to be a real class: special methods are looked
@@ -414,6 +454,47 @@ async def test_complete_stream_yields_the_text() -> None:
 
 
 # --- submit ---
+
+
+async def test_submit_waits_for_a_busy_chat_before_typing(monkeypatch) -> None:
+    """A running answer must finish before the next prompt is typed.
+
+    While Qwen streams, the SPA renders ``stop-button`` and no ``send-button`` at
+    all. Typing into that chat and clicking a missing button is what produced
+    "no completion captured" after a 30 s wait, and the retries turned one slow
+    answer into a wall of 502s. The wait is what queues the request behind it.
+    """
+    page = page_stub(stop_count=2)
+    seen: list[int] = []
+
+    async def fake_sleep(_delay):
+        seen.append(1)
+        if len(seen) >= 3:
+            page.stop_locator.count = AsyncMock(return_value=0)
+
+    monkeypatch.setattr(browser_mod.asyncio, "sleep", fake_sleep)
+    b = armed(page)
+    body, status = await b._submit("hello")
+    assert body == OK_BODY
+    assert status == 200
+    assert len(seen) >= 3, "the driver must poll until the stop button is gone"
+    page.locator.return_value.fill.assert_awaited_with("hello")
+
+
+async def test_submit_gives_up_when_the_chat_never_goes_idle(monkeypatch) -> None:
+    """An answer that never finishes is an error, not an endless wait."""
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(browser_mod.asyncio, "sleep", no_sleep)
+    page = page_stub(stop_count=1)
+    b = QwenBrowser(token="t", timeout=0.05)
+    b._started = True
+    b._page = page
+    with pytest.raises(QwenBrowserError, match="still generating"):
+        await b._submit("hello")
+    page.locator.return_value.fill.assert_not_awaited()
 
 
 async def test_submit_types_and_sends() -> None:
