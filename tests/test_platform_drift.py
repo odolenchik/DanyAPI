@@ -19,9 +19,7 @@ def _load():
     resolves the module of the class it decorates.
     """
     name = "platform_drift"
-    spec = importlib.util.spec_from_file_location(
-        name, ROOT / "scripts" / "platform_drift.py"
-    )
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / "platform_drift.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -64,9 +62,7 @@ def test_deepseek_drift_when_spa_shell_replaces_json() -> None:
 
 def test_qwen_ok_on_expected_refusal() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200, json={"success": False, "data": {"code": "Unauthorized"}}
-        )
+        return httpx.Response(200, json={"success": False, "data": {"code": "Unauthorized"}})
 
     probes = drift.probe_qwen(_client(handler))
 
@@ -114,9 +110,7 @@ def test_run_reports_network_failure_as_drift(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_main_exit_code_reflects_drift(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        drift, "run", lambda names: [drift.Probe("x", False, "broken")]
-    )
+    monkeypatch.setattr(drift, "run", lambda names: [drift.Probe("x", False, "broken")])
     assert drift.main(["prog", "all"]) == 1
 
     monkeypatch.setattr(drift, "run", lambda names: [drift.Probe("x", True, "fine")])
@@ -124,9 +118,7 @@ def test_main_exit_code_reflects_drift(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_main_json_output(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
-    monkeypatch.setattr(
-        drift, "run", lambda names: [drift.Probe("x", True, "fine", {"v": "1"})]
-    )
+    monkeypatch.setattr(drift, "run", lambda names: [drift.Probe("x", True, "fine", {"v": "1"})])
 
     drift.main(["prog", "all", "--json"])
 

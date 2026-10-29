@@ -147,8 +147,7 @@ def probe_qwen(client: httpx.Client) -> list[Probe]:
         Probe(
             "qwen auth refresh",
             ok,
-            f"http={resp.status_code} type={_content_type(resp)} "
-            f"success={body.get('success')} code={data.get('code')}",
+            f"http={resp.status_code} type={_content_type(resp)} success={body.get('success')} code={data.get('code')}",
         )
     )
     probes.append(
@@ -193,10 +192,7 @@ def main(argv: list[str]) -> int:
             json.dumps(
                 {
                     "ok": not failed,
-                    "probes": [
-                        {"name": p.name, "ok": p.ok, "detail": p.detail, **p.extra}
-                        for p in results
-                    ],
+                    "probes": [{"name": p.name, "ok": p.ok, "detail": p.detail, **p.extra} for p in results],
                 },
                 ensure_ascii=False,
             )
