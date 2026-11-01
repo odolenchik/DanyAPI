@@ -17,6 +17,7 @@ from .. import tools as toolemu
 from ..accounts import AccountPoolBusy, account_lock
 from ..config import settings
 from ..deepseek.stream import IncrementalSSE, MessageReconstructor
+from ..loopguard import LoopGuard
 from ..tokens import count_messages_tokens
 from ..tools.prompt import build_compact_prompt
 from ..tools.validate import (
@@ -143,6 +144,38 @@ def _repeat_loop_hit(session: Any, calls: Any) -> bool:
     if not settings.repeat_guard:
         return False
     return repeat_guard.note_calls(session, calls, settings.repeat_threshold)
+
+
+def _new_loop_guard() -> LoopGuard | None:
+    """A guard for one streamed channel, or None when the feature is off."""
+    if not settings.loop_guard:
+        return None
+    return LoopGuard(max_period=settings.loop_max_period, repeats=settings.loop_repeats)
+
+
+def _loop_hit(
+    guard: LoopGuard | None,
+    delta: str,
+    *,
+    where: str,
+    session_key: str | None,
+    request_id: str | None,
+) -> bool:
+    """Feed one streamed fragment to a guard and report whether it saw a loop."""
+    if guard is None or not delta:
+        return False
+    hit = guard.feed(delta)
+    if hit is None:
+        return False
+    log.warning(
+        "loop guard: repeated block (%d lines x %d) aborted %s (session=%s request=%s)",
+        hit[0],
+        hit[1],
+        where,
+        session_key,
+        request_id,
+    )
+    return True
 
 
 async def _retry_tool_call(
@@ -642,11 +675,29 @@ async def _compact_retry_stream(
         incremental = IncrementalSSE()
         content_buf = ""
         got_content = False
+        content_guard = _new_loop_guard()
+        reasoning_guard = _new_loop_guard()
+        loop_truncated = False
         try:
             async for chunk in resp.aiter_bytes():
                 for event in incremental.feed(chunk):
                     rec.handle(event)
                 c_diff, r_diff = rec.take_diffs()
+                if _loop_hit(
+                    content_guard,
+                    c_diff,
+                    where="compact content stream",
+                    session_key=new_sid,
+                    request_id=request_id,
+                ) or _loop_hit(
+                    reasoning_guard,
+                    r_diff,
+                    where="compact reasoning stream",
+                    session_key=new_sid,
+                    request_id=request_id,
+                ):
+                    loop_truncated = True
+                    break
                 if c_diff or r_diff:
                     got_content = True
                     delta: dict = {}
@@ -671,6 +722,9 @@ async def _compact_retry_stream(
                 rec.handle(event)
         finally:
             await resp.aclose()
+
+        if loop_truncated:
+            await _try_stop_stream(account.client, new_sid, rec.id)
 
         if not got_content and not (rec.content or rec.reasoning):
             log.warning("compact retry (stream): no content (status=%s)", rec.status)
@@ -826,6 +880,7 @@ async def _collect_non_stream(
         if trace is not None:
             trace.dany(request_id, prompt=prompt, session_id=session_key, model=model)
         stop_message_id: str | None = None
+        loop_truncated = False
         started = time.monotonic()
         try:
             rec: MessageReconstructor | None = None
@@ -879,6 +934,8 @@ async def _collect_non_stream(
                 rec = MessageReconstructor()
                 incremental = IncrementalSSE()
                 response_message_id = None
+                content_guard = _new_loop_guard()
+                reasoning_guard = _new_loop_guard()
                 try:
                     async for chunk in resp.aiter_bytes():
                         for event in incremental.feed(chunk):
@@ -887,10 +944,31 @@ async def _collect_non_stream(
                                 if response_message_id:
                                     stop_message_id = response_message_id
                             rec.handle(event)
+                            c_diff, r_diff = rec.take_diffs()
+                            if _loop_hit(
+                                content_guard,
+                                c_diff,
+                                where="content stream",
+                                session_key=session_key,
+                                request_id=request_id,
+                            ) or _loop_hit(
+                                reasoning_guard,
+                                r_diff,
+                                where="reasoning stream",
+                                session_key=session_key,
+                                request_id=request_id,
+                            ):
+                                loop_truncated = True
+                                break
+                        if loop_truncated:
+                            break
                     for event in incremental.finish():
                         rec.handle(event)
                 finally:
                     await resp.aclose()
+                if loop_truncated:
+                    await _try_stop_stream(account.client, session.id, stop_message_id)
+                    break
                 if rec.id:
                     stop_message_id = rec.id
                 if not (rec.content or rec.reasoning) and _is_retryable_hint(rec) and attempt < MAX_RETRIES:
@@ -1167,6 +1245,8 @@ async def _collect_non_stream(
         }
         if cont_exhausted:
             result["x_continuation_truncated"] = True
+        if loop_truncated:
+            result["x_loop_truncated"] = True
         return result
 
 
@@ -1230,6 +1310,7 @@ async def _stream_openai(
         response_message_id = None
         stop_message_id: str | None = None
         content_buf = ""
+        loop_truncated = False
         started = time.monotonic()
         for attempt in range(MAX_RETRIES + 1):
             if attempt:
@@ -1301,6 +1382,9 @@ async def _stream_openai(
             pending: list[str] = []
             degenerate_aborted = False
             degenerate_next_check = 0
+            content_guard = _new_loop_guard()
+            reasoning_guard = _new_loop_guard()
+            loop_truncated = False
             try:
                 async for chunk in resp.aiter_bytes():
                     for event in incremental.feed(chunk):
@@ -1312,6 +1396,22 @@ async def _stream_openai(
                         c_diff, r_diff = rec.take_diffs()
                         if c_diff or r_diff:
                             got_content = True
+                        if _loop_hit(
+                            content_guard,
+                            c_diff,
+                            where="content stream",
+                            session_key=session_key,
+                            request_id=request_id,
+                        ) or _loop_hit(
+                            reasoning_guard,
+                            r_diff,
+                            where="reasoning stream",
+                            session_key=session_key,
+                            request_id=request_id,
+                        ):
+                            loop_truncated = True
+                            degenerate_aborted = True
+                            break
                         if not pending:
                             pending.append(
                                 _sse(
@@ -1849,7 +1949,7 @@ async def _stream_openai(
             finish = _finish_reason(rec.status)
 
         if tool_mode and trace is not None:
-            _trace_parse(trace, request_id, content_buf, tool_schemas, session_key, model, degenerate=degenerate_aborted)
+            _trace_parse(trace, request_id, content_buf, tool_schemas, session_key, model, degenerate=degenerate_aborted and not loop_truncated)
 
         final_chunk = {
             "id": chunk_id,
@@ -1860,6 +1960,8 @@ async def _stream_openai(
         }
         if cont_exhausted:
             final_chunk["x_continuation_truncated"] = True
+        if loop_truncated:
+            final_chunk["x_loop_truncated"] = True
         yield _sse(final_chunk)
         _record_deepseek_usage(
             session,

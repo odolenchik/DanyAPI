@@ -12,6 +12,7 @@ from ..accounts import AccountPool, DeepSeekAccount
 from ..config import settings
 from ..deepseek.client import DeepSeekError, DeepSeekSession
 from ..deepseek.stream import IncrementalSSE, MessageReconstructor
+from ..loopguard import LoopGuard
 
 # Shared retry constants — imported as local names so monkeypatch in tests works.
 # RETRYABLE_HTTP_STATUSES and _drop_session are re-exported for openai.py/streaming.py consumers.
@@ -32,6 +33,38 @@ from ..tooltrace import ToolTraceLogger
 from .models import CONTEXT_LENGTH_STATUS, CONTINUE_PROMPT, INPUT_EXCEEDS_LIMIT
 
 log = logging.getLogger("danyapi.api")
+
+
+def _new_loop_guard() -> LoopGuard | None:
+    """A guard for one streamed channel, or None when the feature is off."""
+    if not settings.loop_guard:
+        return None
+    return LoopGuard(max_period=settings.loop_max_period, repeats=settings.loop_repeats)
+
+
+def _loop_hit(
+    guard: LoopGuard | None,
+    delta: str,
+    *,
+    where: str,
+    session_key: str | None,
+    request_id: str | None,
+) -> bool:
+    """Feed one streamed fragment to a guard and report whether it saw a loop."""
+    if guard is None or not delta:
+        return False
+    hit = guard.feed(delta)
+    if hit is None:
+        return False
+    log.warning(
+        "loop guard: repeated block (%d lines x %d) aborted %s (session=%s request=%s)",
+        hit[0],
+        hit[1],
+        where,
+        session_key,
+        request_id,
+    )
+    return True
 
 
 RETRYABLE_FINISH_REASONS = {
@@ -210,14 +243,35 @@ async def _collect_continuation(
             return None
         rec = MessageReconstructor()
         incremental = IncrementalSSE()
+        content_guard = _new_loop_guard()
+        reasoning_guard = _new_loop_guard()
+        loop_truncated = False
         try:
             async for chunk in resp.aiter_bytes():
                 for event in incremental.feed(chunk):
                     rec.handle(event)
+                c_diff, r_diff = rec.take_diffs()
+                if _loop_hit(
+                    content_guard,
+                    c_diff,
+                    where="continuation content stream",
+                    session_key=session.id,
+                    request_id=request_id,
+                ) or _loop_hit(
+                    reasoning_guard,
+                    r_diff,
+                    where="continuation reasoning stream",
+                    session_key=session.id,
+                    request_id=request_id,
+                ):
+                    loop_truncated = True
+                    break
             for event in incremental.finish():
                 rec.handle(event)
         finally:
             await resp.aclose()
+        if loop_truncated:
+            await _try_stop_stream(account.client, session.id, rec.id)
         if not (rec.content or rec.reasoning) and _is_retryable_hint(rec) and attempt < MAX_RETRIES:
             continue
         if not (rec.content or rec.reasoning) and _is_rate_limit_hint(rec):

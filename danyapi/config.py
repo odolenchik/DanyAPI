@@ -246,6 +246,17 @@ class Settings:
         self.repeat_guard = os.environ.get("DANYAPI_REPEAT_GUARD", "1").strip().lower() not in ("0", "false", "no", "off")
         self.repeat_threshold = self._int_env("DANYAPI_REPEAT_THRESHOLD", 5, minimum=2)
 
+        # Abort a reply that collapsed into repeating the same lines forever.
+        # httpx's read timeout resets on every byte, so a looping upstream keeps
+        # the stream open indefinitely and the request hangs. The guard watches
+        # the reply's structure instead of its text: a block of 1..max_period
+        # lines repeated `repeats` times back to back is a loop, whatever the
+        # lines say and whether or not tools were requested. The partial answer
+        # is kept; only the runaway tail is dropped.
+        self.loop_guard = os.environ.get("DANYAPI_LOOP_GUARD", "1").strip().lower() not in ("0", "false", "no", "off")
+        self.loop_repeats = self._int_env("DANYAPI_LOOP_REPEATS", 15, minimum=2)
+        self.loop_max_period = self._int_env("DANYAPI_LOOP_MAX_PERIOD", 40, minimum=1)
+
         # Per-turn thinking: when the client sends neither `thinking` nor
         # `reasoning_effort`, decide the flag from the turn itself instead of the
         # provider default. Off by default so existing clients keep their exact
