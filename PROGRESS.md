@@ -1446,6 +1446,8 @@ ruff; это отдельная задача, в перенос не входи�
 `arch-check` зелёные везде. Правка сделана в `DanyAPI2` и синхронизирована
 в `DanyAPI` и `DanyAPI3`.
 
-**Не включено.** `DANYAPI_THINKING_HEURISTIC` по-прежнему выключен по
-умолчанию, и в `.env` ни одной копии переменных `THINKING` нет. Новая
-логика заработает только после `DANYAPI_THINKING_HEURISTIC=1`.
+**Включено.** `DANYAPI_THINKING_HEURISTIC=1` добавлен в `.env` всех трёх
+копий (бэкапы рядом, `.env.bak-thinking-*`). Проверено загрузкой настроек:
+`thinking_heuristic = True`, `long_prompt_chars = 4000`, веса
+`3/2/1`, порог `3` — одинаково во всех трёх. `.env` не коммитится
+(правило из AGENTS.md).
