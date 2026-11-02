@@ -13,10 +13,35 @@ from fastapi import HTTPException
 
 from .. import tools as toolemu
 from ..config import settings
+from ..tooltrace import ToolTraceLogger
+from ..tooltrace import classify as _classify_trace
 from .browser import ZaiBrowser, ZaiBrowserError, _CompletionAccumulator
 from .models import ZaiModelError
 
 log = __import__("logging").getLogger("danyapi.zai.api")
+
+
+def _trace_parse(
+    trace: ToolTraceLogger | None,
+    request_id: str | None,
+    model: str,
+    content: str,
+    tool_schemas: dict[str, Any] | None,
+    parsed: Any,
+) -> None:
+    """Record how the raw z.ai answer was parsed, mirroring the DeepSeek path.
+
+    Without this the trace for a z.ai request stops after ``dany``: the raw
+    provider text and the mangle class are missing, so a broken tool call on
+    this provider cannot be diagnosed from ``tooltrace.ndjson``.
+    """
+    if trace is None:
+        return
+    issue, detail = _classify_trace(content, tool_schemas)
+    result = "ok" if parsed is not None else "unparsed"
+    if issue != "ok":
+        result = f"{result}:{issue}"
+    trace.parse(request_id, result=result, issue=detail if issue != "ok" else None, model=model)
 
 
 def _usage_dict(usage: dict) -> dict:
@@ -41,6 +66,7 @@ async def collect_non_stream(
     tool_mode: bool = False,
     tool_schemas: dict[str, Any] | None = None,
     request_id: str | None = None,
+    trace: ToolTraceLogger | None = None,
 ) -> dict[str, Any]:
     try:
         acc = await asyncio.wait_for(browser.complete(prompt, model), timeout=settings.timeout + 60)
@@ -58,8 +84,13 @@ async def collect_non_stream(
     if not acc.content and not acc.reasoning:
         raise HTTPException(502, "z.ai returned an empty completion")
 
+    if tool_mode and trace is not None:
+        trace.upstream(request_id, content=acc.content, reasoning=acc.reasoning or None, model=model)
+
     if tool_mode:
         parsed = toolemu.parse_tool_calls(acc.content, tool_schemas)
+        if trace is not None:
+            _trace_parse(trace, request_id, model, acc.content, tool_schemas, parsed)
         if parsed is not None:
             tool_calls, tool_text = parsed
             message = toolemu.format_tool_message(tool_calls, tool_text, acc.reasoning)
@@ -93,6 +124,7 @@ async def stream_openai(
     tool_mode: bool = False,
     tool_schemas: dict[str, Any] | None = None,
     request_id: str | None = None,
+    trace: ToolTraceLogger | None = None,
 ) -> AsyncIterator[str]:
     """Stream an OpenAI ``chat.completion.chunk`` SSE response for z.ai.
 
@@ -185,7 +217,11 @@ async def stream_openai(
     else:
         finish = "stop"
         if tool_mode:
+            if trace is not None:
+                trace.upstream(request_id, content=content_buf, model=model)
             parsed = toolemu.parse_tool_calls(content_buf, tool_schemas)
+            if trace is not None:
+                _trace_parse(trace, request_id, model, content_buf, tool_schemas, parsed)
             if parsed is not None:
                 tool_calls, tool_text = parsed
                 for delta in toolemu.tool_call_deltas(tool_calls, tool_text):

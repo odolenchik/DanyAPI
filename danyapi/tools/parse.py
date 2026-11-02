@@ -1131,6 +1131,44 @@ def _repair_dsml_fused_close_open(text: str) -> str:
     return _DSML_FUSED_CLOSE_OPEN_RE.sub(_repl, text)
 
 
+# Bracketless close tag (tooltrace eb14e2aa): the close tag loses BOTH its opening
+# ``<`` and its ``/``, so it reads as a plain opener glued to the previous value
+# (``>content parameter name="path"...``). _DSML_PARAM_RE's value group is
+# lazy and terminates only at a close tag, so the earlier parameter swallows every
+# following argument as its value: the call parses with a few arguments and loses
+# the rest, the client rejects it as missing required, and the retry loop repeats.
+# A canonical opener always starts with ``<`` and a fused close starts with ``</``,
+# so a marker preceded by neither is this broken close; rewrite it to a canonical
+# close followed by a canonical opener. Runs before the fused-close repair, which
+# would otherwise never see it (it requires ``</``).
+_DSML_BRACKETLESS_CLOSE_RE = re.compile(
+    rf"(?<![</])(?P<sep>{_DSML_SEP})\s*DSML\s*{_DSML_SEP}\s*"
+    rf"parameter\s+name=(?P<q>['\"])(?P<pname>[^'\">]+)(?P=q)"
+    rf"(?:\s+string=(?P<sq>['\"])(?P<sval>true|false)(?P=sq))?"
+    r"\s*>",
+    re.IGNORECASE,
+)
+
+
+def _repair_dsml_bracketless_close(text: str) -> str:
+    """Restore a close tag that lost both its ``<`` and its ``/``.
+
+    The separator is taken from the matched tag, so an ASCII pair stays ASCII and a
+    fullwidth pair stays fullwidth instead of being silently converted.
+    """
+    if "DSML" not in text:
+        return text
+
+    def _repl(m: re.Match[str]) -> str:
+        sep = m.group("sep")
+        string = f' string="{m.group("sval")}"' if m.group("sval") else ""
+        close = f"</{sep}DSML{sep} parameter>"
+        opener = f'<{sep}DSML{sep} parameter name="{m.group("pname")}"{string}>'
+        return close + opener
+
+    return _DSML_BRACKETLESS_CLOSE_RE.sub(_repl, text)
+
+
 # Bare arguments carrier (tooltrace 797cd20e, fa460fef, 86931c23): instead of one
 # ``<parameter name="...">`` per argument, DeepSeek emits a single tag whose name is
 # the ``arguments`` attribute (not ``parameter name=``) and whose quoted value is the
@@ -2343,6 +2381,11 @@ def parse_tool_calls(text: str, tool_schemas: dict[str, dict[str, Any]] | None =
     # A DSML block whose parameter opener dropped the separator entirely
     # (tooltrace 42585858): restore the prefix so the param regexes see it.
     text = _repair_dsml_bare_param_opener(text)
+    # A close tag that lost both ``<`` and ``/`` reads as a glued opener and makes the
+    # previous parameter swallow every following argument (tooltrace eb14e2aa). Runs
+    # before the fused-close repair: restoring the close leaves a canonical opener,
+    # which that repair then leaves alone.
+    text = _repair_dsml_bracketless_close(text)
     # Chained params: a close tag carrying name= doubles as the next opener (tooltrace
     # 92b6a328). Split it so the normal param path sees standalone closes; runs before
     # the bare-attribute repair, which would otherwise rewrite a close-with-name tag.

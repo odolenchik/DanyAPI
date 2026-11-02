@@ -227,6 +227,17 @@ class Settings:
         # enabled, only replies the classifier judged json_malformed are retried.
         self.toolcall_retry = os.environ.get("DANYAPI_TOOLCALL_RETRY", "").strip().lower() in ("1", "true", "yes", "on")
 
+        # Ask for exactly one tool call per reply instead of letting the model
+        # batch several. On by default: batching is where most mangled payloads
+        # come from (sibling calls with no separator, a schema split across
+        # calls, a repeated parameter name, one ambiguous {path} shared by two),
+        # and with a single call there is no boundary to get wrong. The prompt
+        # asks for one call and any parsed calls beyond the first are dropped, so
+        # the client issues the next call itself. Set to 0 for a client that
+        # deliberately batches independent reads. A request may also turn it on
+        # with parallel_tool_calls=false, but cannot turn it back off.
+        self.one_tool_call_per_turn = os.environ.get("DANYAPI_ONE_TOOL_CALL_PER_TURN", "1").strip().lower() not in ("0", "false", "no", "off")
+
         # Abort a DeepSeek stream that has collapsed into runaway repetition of
         # the empty DSML ``calls`` container (a long multi-call turn can lose EOS
         # and repeat it hundreds of times until the output limit). The valid call

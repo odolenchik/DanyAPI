@@ -184,16 +184,21 @@ def build_repair_prompt(issues: list[ValidationIssue]) -> str:
 
     Kept deliberately short: it is appended to the same upstream session, so the
     model already has its own broken answer (and the tool schema) in context. We
-    only need to say what was wrong and that the reply must be the corrected JSON.
+    only need to say what was wrong and that the reply must be the corrected call.
+
+    The demanded shape is DSML, the same format the schema block asks for. Asking
+    for JSON here would contradict that block and reintroduce the hybrid replies
+    the canonical format exists to avoid.
     """
     problems = "\n".join(f"- {issue.detail}" for issue in issues[:5])
     return (
         "Your previous reply did not pass tool-call validation:\n"
         f"{problems}\n\n"
-        "Reply with ONLY the corrected JSON object in the exact same format "
-        '(a single object with key "tool_calls", an array of {"name", "arguments"}). '
-        "Fix the listed problems, keep every already-valid argument, and add no prose, "
-        "no markdown fences, and no extra keys."
+        "Reply with ONLY the corrected DSML call: one tool_calls container holding "
+        "one invoke block per call, every argument in its own parameter tag with "
+        'string="true" for text and string="false" for numbers and booleans. '
+        "Fix the listed problems, keep every already-valid argument, and add no prose "
+        "and no markdown fences."
     )
 
 
@@ -204,14 +209,15 @@ def build_unparsed_repair_prompt(issue: str | None = None) -> str:
     reply at all — the model's call-shaped text could not be turned into tool
     calls (e.g. a truncated or otherwise mangled payload). The model still sees
     its own broken answer in the session, so we only say the reply was not a
-    valid call and demand the JSON shape.
+    valid call and restate the DSML shape.
     """
     detail = f" (diagnosis: {issue})" if issue else ""
     return (
         "Your previous reply looked like a tool call but could not be parsed"
         f"{detail}.\n\n"
-        "Reply with ONLY the JSON object in the exact same format "
-        '(a single object with key "tool_calls", an array of {"name", "arguments"}). '
+        "Reply with ONLY the DSML call: one tool_calls container holding one invoke "
+        "block per call, every argument in its own parameter tag with "
+        'string="true" for text and string="false" for numbers and booleans. '
         "Use the tool name and arguments you intended, include every required "
-        "argument, and add no prose, no markdown fences, no XML/DSML tags, and no extra keys."
+        "argument, and add no prose and no markdown fences."
     )

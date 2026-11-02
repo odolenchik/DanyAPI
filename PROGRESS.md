@@ -1350,3 +1350,61 @@ non-stream результате), по образцу существующего
 
 Общее покрытие проекта 97% — это предсуществующее состояние (на базе до правки
 было столько же); CI-гейт `--cov-fail-under=100` не проходит и не проходил.
+
+## Синхронизация трёх копий и единый журнал (2026-11-02)
+
+**Задача.** Привести код `DanyAPI/`, `DanyAPI2/`, `DanyAPI3/` к одному
+состоянию, приняв `DanyAPI2` за источник истины, и закрепить правило, что
+`PROGRESS.md` и `BACKLOG.md` ведутся только в `DanyAPI/`.
+
+**Что обнаружено.** Прежняя запись утверждала, что все три копии по коду
+идентичны; `diff -rq` это опроверг. Расхождения были **в обе стороны**:
+в `DanyAPI2` — `one_tool_call_per_turn` (`config.py`, `api/streaming.py`),
+в `DanyAPI` — `render_tool_schema`, `CHOICE_INSTRUCTIONS`,
+`TOOL_CALL_INSTRUCTION.format` в `tools/prompt.py`. Ни одна копия не была
+подмножеством другой, поэтому простое копирование что-то затирало.
+
+**Бэкап до изменений:**
+`/home/odolen/ssd_new/danyapi-sync-backup-20261102-205914/` — три `tar.gz`,
+по одному на копию (без `.venv`, кэшей, логов, `.env`).
+
+**Перенесено** из `DanyAPI2` в `DanyAPI` и `DanyAPI3`, 16 файлов:
+`danyapi/api/openai.py`, `danyapi/api/streaming.py`, `danyapi/config.py`,
+`danyapi/tools/{format,__init__,parse,prompt,validate}.py`,
+`danyapi/zai/api.py` и семь тестов
+(`test_api_helpers`, `test_config`, `test_prompt_accounts_coverage`,
+`test_tools_api`, `test_tools`, `test_validate`, `test_zai_trace`).
+`test_zai_trace.py` существовал только в `DanyAPI2`.
+
+**Проверено после переноса.** `diff -rq` по `danyapi/` и `tests/` между
+всеми тремя — пусто. `pytest -q` → **1648 passed** в каждой копии,
+`arch-check` OK. `ruff check` / `ruff format --check` зелёные в `DanyAPI2`
+и `DanyAPI3`. В `DanyAPI` ruff даёт одну ошибку и два файла на
+переформатирование — это `scripts/probe_zai_models.py` и
+`scripts/probe_zai_web_body.py`, они есть **только в `DanyAPI`**, переносом
+не затрагивались, ошибка предсуществующая.
+
+**Потеряно при переносе (осознанно).** `render_tool_schema`,
+`CHOICE_INSTRUCTIONS` и `TOOL_CALL_INSTRUCTION.format` из `DanyAPI`-версии
+`tools/prompt.py` — остались только в архиве. Решение принято явно:
+`DanyAPI2` становится истиной.
+
+**Следствие для поведения.** `one_tool_call_per_turn` теперь есть во всех
+копиях и включён по умолчанию (`DANYAPI_ONE_TOOL_CALL_PER_TURN=1`):
+ответ ограничивается одним tool call. Кому это не нужно — выключать в `.env`
+соответствующей копии.
+
+**Новое правило.** В `AGENTS.md` всех трёх копий (файлы идентичны, md5
+`229990f05e05db128ec8cb262056d0ed`), раздел Workflow Rules, добавлен пункт:
+`PROGRESS.md` и `BACKLOG.md` живут только в `DanyAPI/` и пишутся только там,
+независимо от того, в какой из трёх копий идёт работа; править их копии в
+`DanyAPI2/` и `DanyAPI3/` нельзя.
+
+**Ошибка в ходе работы.** Первая попытка записи этой заметки перезаписала
+`PROGRESS.md` целиком (1428 строк → 50). Файл восстановлен из бэкапа
+(md5 `e5ac05cdc06623293b34089a7d79c46b`, совпадает с копией в `DanyAPI3`),
+затем заметка дописана в конец. Урок: для журнала — только append,
+перезапись `Write` без `mode: append` недопустима.
+
+**Не сделано.** Два `probe_zai_*.py` в `DanyAPI` по-прежнему не проходят
+ruff; это отдельная задача, в перенос не входило.

@@ -395,6 +395,7 @@ async def _compact_retry(
     tools: Any = None,
     tool_choice: Any = None,
     response_format: Any = None,
+    single_call: bool = False,
 ) -> dict | None:
     """Summarize the dropped history, then answer in a fresh session.
 
@@ -438,6 +439,7 @@ async def _compact_retry(
         tool_choice=tool_choice,
         response_format=response_format,
         summary=summary,
+        single_call=single_call,
     )
     prompt = "\n\n".join(part for part in (system, compact_body) if part).strip()
     if not prompt:
@@ -525,6 +527,8 @@ async def _compact_retry(
             )
         if parsed is not None:
             tool_calls, tool_text = parsed
+            if single_call:
+                tool_calls = toolemu.limit_tool_calls(tool_calls)
             finish = "tool_calls"
             message = toolemu.format_tool_message(tool_calls, tool_text, rec.reasoning)
         else:
@@ -586,6 +590,7 @@ async def _compact_retry_stream(
     tools: Any = None,
     tool_choice: Any = None,
     response_format: Any = None,
+    single_call: bool = False,
 ) -> AsyncIterator[str] | None:
     """Summarize the dropped history, then answer in a fresh session.
 
@@ -626,6 +631,7 @@ async def _compact_retry_stream(
         tool_choice=tool_choice,
         response_format=response_format,
         summary=summary,
+        single_call=single_call,
     )
     prompt = "\n\n".join(part for part in (system, compact_body) if part).strip()
     if not prompt:
@@ -770,6 +776,8 @@ async def _compact_retry_stream(
                     content_buf = parsed[1] or content_buf
             if parsed is not None:
                 tool_calls, tool_text = parsed
+                if single_call:
+                    tool_calls = toolemu.limit_tool_calls(tool_calls)
                 issues = _validate_parsed(tool_calls, tool_schemas)
                 if issues:
                     repaired = await _repair_tool_calls(
@@ -873,6 +881,7 @@ async def _collect_non_stream(
     tools: Any = None,
     tool_choice: Any = None,
     response_format: Any = None,
+    single_call: bool = False,
 ):
     await _human_delay()
     async with account_lock(lock, settings.acquire_timeout, account):
@@ -1007,6 +1016,7 @@ async def _collect_non_stream(
                 tools=tools,
                 tool_choice=tool_choice,
                 response_format=response_format,
+                single_call=single_call,
             )
             if compact_result is not None:
                 return compact_result
@@ -1040,6 +1050,7 @@ async def _collect_non_stream(
                     tools=tools,
                     tool_choice=tool_choice,
                     response_format=response_format,
+                    single_call=single_call,
                 )
                 if compact_result is not None:
                     return compact_result
@@ -1153,6 +1164,8 @@ async def _collect_non_stream(
                     content = parsed[1] or content
             if parsed is not None:
                 tool_calls, tool_text = parsed
+                if single_call:
+                    tool_calls = toolemu.limit_tool_calls(tool_calls)
                 issues = _validate_parsed(tool_calls, tool_schemas)
                 if issues:
                     repaired = await _repair_tool_calls(
@@ -1273,6 +1286,7 @@ async def _stream_openai(
     tools: Any = None,
     tool_choice: Any = None,
     response_format: Any = None,
+    single_call: bool = False,
 ):
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -1566,6 +1580,7 @@ async def _stream_openai(
                 tools=tools,
                 tool_choice=tool_choice,
                 response_format=response_format,
+                single_call=single_call,
             )
             if compact_gen is not None:
                 async for item in compact_gen:
@@ -1629,6 +1644,7 @@ async def _stream_openai(
                     tools=tools,
                     tool_choice=tool_choice,
                     response_format=response_format,
+                    single_call=single_call,
                 )
                 if compact_gen is not None:
                     async for item in compact_gen:
@@ -1855,6 +1871,8 @@ async def _stream_openai(
                     content_buf = parsed[1] or content_buf
             if parsed is not None:
                 tool_calls, tool_text = parsed
+                if single_call:
+                    tool_calls = toolemu.limit_tool_calls(tool_calls)
                 issues = _validate_parsed(tool_calls, tool_schemas)
                 if issues:
                     repaired = await _repair_tool_calls(

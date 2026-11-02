@@ -37,6 +37,7 @@ CI enforces 100% coverage; keep tests complete.
 - WIP=1: one feature at a time. Do not start a new one until the current one passes DoD.
 - No opportunistic refactoring: unrelated issues go to `BACKLOG.md`, leave the code alone.
 - Before ending a session, update `PROGRESS.md` (done, in progress, current commit).
+- `PROGRESS.md` and `BACKLOG.md` live only in `DanyAPI/` and are written only there, no matter which of the three copies (`DanyAPI/`, `DanyAPI2/`, `DanyAPI3/`) you are working in. Never edit the copies in `DanyAPI2/` or `DanyAPI3/`.
 - Commit only after DoD passes; run the full verification line first.
 - Do not bypass tests or lint: fix the failure, never silence it.
 - Keep changes scoped to the task; no unrelated cleanup.

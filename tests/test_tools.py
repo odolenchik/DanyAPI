@@ -20,6 +20,7 @@ from danyapi.tools import (
     _parse_dsml,
     _parse_xml_tool_calls,
     _render_tool_call_mention,
+    _repair_dsml_bracketless_close,
     _repair_dsml_separator,
     _strip_dsml,
     _tail_after_last_user,
@@ -31,6 +32,7 @@ from danyapi.tools import (
     format_tool_message,
     is_degenerate_repeat,
     is_tool_round,
+    limit_tool_calls,
     parse_tool_calls,
     render_json_mode,
     render_message,
@@ -38,6 +40,7 @@ from danyapi.tools import (
     tool_call_deltas,
     tool_schema_map,
 )
+from danyapi.tools.prompt import DSML_EXAMPLE, _dsml_param, _dsml_tag
 
 WEATHER_TOOL = {
     "type": "function",
@@ -65,10 +68,70 @@ class Message:
 def test_render_tool_schema_basic():
     schema = render_tool_schema([WEATHER_TOOL])
     assert schema is not None
-    assert schema is not None
     assert "get_weather" in schema
     assert '"city"' in schema
-    assert '"tool_calls"' in schema
+    # The call format is DSML: one container, an invoke per call.
+    assert _dsml_tag("tool_calls") in schema
+    assert _dsml_tag('invoke name="Read"') in schema
+
+
+def test_render_tool_schema_has_no_json_call_format():
+    """The instruction must not ask for JSON: that demand is what produced hybrids."""
+    schema = render_tool_schema([WEATHER_TOOL])
+    assert schema is not None
+    assert "Do NOT use XML, DSML" not in schema
+    assert "valid JSON object" not in schema
+    assert '"tool_calls": [' not in schema
+
+
+def test_render_tool_schema_example_round_trips():
+    """The example must parse back into a call, or the model copies a shape the
+    parser cannot read."""
+    example = DSML_EXAMPLE
+    calls, _wrapper = _parse_dsml(example)
+    assert calls is not None
+    assert len(calls) == 1
+    assert calls[0].name == "Read"
+    assert json.loads(calls[0].arguments) == {"path": "/home/user/file.py", "line_offset": 10}
+
+
+def test_render_tool_schema_single_call_asks_for_one():
+    schema = render_tool_schema([WEATHER_TOOL], single_call=True)
+    assert schema is not None
+    # The multi-call example must be gone: it taught the model to batch.
+    assert "Multiple calls:" not in schema
+    assert "exactly ONE function per reply" in schema
+    assert "the container holds a single invoke block" in schema
+
+
+def test_render_tool_schema_single_call_required_choice():
+    schema = render_tool_schema([WEATHER_TOOL], "required", single_call=True)
+    assert schema is not None
+    assert "MUST call exactly one function" in schema
+
+
+def test_render_tool_schema_single_call_named_function_choice():
+    schema = render_tool_schema([WEATHER_TOOL], "get_weather", single_call=True)
+    assert schema is not None
+    assert "exactly the function get_weather" in schema
+
+
+def test_render_tool_schema_single_call_auto_keeps_opt_out():
+    schema = render_tool_schema([WEATHER_TOOL], "auto", single_call=True)
+    assert schema is not None
+    assert "reply normally with your answer" in schema
+
+
+def test_render_tool_schema_default_allows_several_invokes():
+    schema = render_tool_schema([WEATHER_TOOL])
+    assert schema is not None
+    assert "Several calls go in the one tool_calls container" in schema
+
+
+def test_build_prompt_single_call_reaches_schema():
+    prompt, tool_mode = build_prompt([Message(role="user", content="weather in Moscow?")], [WEATHER_TOOL], single_call=True)
+    assert tool_mode is True
+    assert "exactly ONE function per reply" in prompt
 
 
 def test_render_tool_schema_empty_tools():
@@ -807,6 +870,14 @@ def test_format_tool_message():
     assert tool_call["function"]["name"] == "get_weather"
 
 
+def test_limit_tool_calls_keeps_first_only():
+    first = ToolCall.create("Read", {"path": "a.py"})
+    second = ToolCall.create("Read", {"path": "b.py"})
+    assert limit_tool_calls([first, second]) == [first]
+    assert limit_tool_calls([first]) == [first]
+    assert limit_tool_calls([]) == []
+
+
 def test_tool_call_deltas():
     calls = [ToolCall.create("get_weather", {"city": "Moscow"})]
     deltas = tool_call_deltas(calls)
@@ -937,10 +1008,11 @@ def test_build_prompt_multi_step_tool_round_sends_only_latest_exchange():
     assert tool_mode
     # The newest exchange is sent...
     assert "NEW-RESULT-beta" in prompt
-    assert '"name": "Grep"' in prompt
-    # ...and the earlier one is not repeated.
+    assert 'invoke name="Grep"' in prompt
+    # ...and the earlier one is not repeated. The format example also names
+    # Read, so the earlier call is identified by its own argument instead.
     assert "OLD-RESULT-alpha" not in prompt
-    assert '"name": "Read"' not in prompt
+    assert '"a.py"' not in prompt
 
 
 def test_build_prompt_multi_step_tool_round_keeps_assistant_prose():
@@ -1478,10 +1550,45 @@ def test_content_fingerprint_variants():
 
 def test_render_tool_call_mention_variants():
     assert _render_tool_call_mention(None) == ""
-    assert _render_tool_call_mention({"name": "f", "arguments": [1]}) == '{"tool_calls": [{"name": "f", "arguments": [1]}]}'
-    assert _render_tool_call_mention({"function": {"name": "g", "arguments": "{}"}}) == '{"tool_calls": [{"name": "g", "arguments": {}}]}'
+    # A non-object argument list has no declared parameter to name, so no
+    # parameter tag is rendered — only the invoke wrapper.
+    assert _render_tool_call_mention({"name": "f", "arguments": [1]}) == _dsml_tag('invoke name="f"') + "\n" + _dsml_tag("invoke", closing=True)
+    assert _render_tool_call_mention({"function": {"name": "g", "arguments": "{}"}}) == _dsml_tag('invoke name="g"') + "\n" + _dsml_tag("invoke", closing=True)
     # Empty name → empty string (no mention rendered)
     assert _render_tool_call_mention({"name": "", "arguments": "{}"}) == ""
+
+
+def test_render_tool_call_mention_is_dsml():
+    """A past call is shown in the same format the instruction asks for, and it
+    parses back into the same arguments."""
+    mention = _render_tool_call_mention({"function": {"name": "Read", "arguments": '{"path": "/a.py", "line_offset": 10}'}})
+    assert _dsml_tag('invoke name="Read"') in mention
+    assert "tool_calls" not in mention
+    calls, _wrapper = _parse_dsml(mention)
+    assert calls is not None
+    assert calls[0].name == "Read"
+    assert json.loads(calls[0].arguments) == {"path": "/a.py", "line_offset": 10}
+
+
+def test_render_tool_call_mention_keeps_non_string_arguments_typed():
+    mention = _render_tool_call_mention({"name": "f", "arguments": {"n": 10, "on": True}})
+    calls, _wrapper = _parse_dsml(mention)
+    assert calls is not None
+    assert json.loads(calls[0].arguments) == {"n": 10, "on": True}
+
+
+def test_render_tool_call_mention_handles_non_object_arguments():
+    """A raw string that is not a JSON object, an empty one, and a type with no
+    parameter form each fall back without inventing arguments."""
+    # Not JSON at all: the text is passed through as a single arguments parameter.
+    assert "not json" in _render_tool_call_mention({"name": "f", "arguments": "not json"})
+    # A JSON array is not a parameter map, so it goes through the same fallback.
+    assert "[1, 2]" in _render_tool_call_mention({"name": "f", "arguments": "[1, 2]"})
+    # An empty argument string adds no parameter tag at all.
+    bare = _render_tool_call_mention({"name": "f", "arguments": ""})
+    assert _dsml_param("arguments", "x") not in bare
+    # An argument type with no parameter form yields only the invoke wrapper.
+    assert _render_tool_call_mention({"name": "f", "arguments": 42}) == _dsml_tag('invoke name="f"') + "\n" + _dsml_tag("invoke", closing=True)
 
 
 def test_render_message_roles():
@@ -4045,3 +4152,39 @@ def test_build_prompt_history_skips_reminder_in_rendered_context():
     prompt, _ = build_prompt(messages)
     assert "User: second" in prompt
     assert "system-reminder" not in prompt
+
+
+def test_dsml_bracketless_close_keeps_every_argument():
+    """tooltrace eb14e2aa: a close tag lost BOTH its opening bracket and its slash,
+    so it read as a plain opener and the previous parameter swallowed the rest of
+    the call as its value. Every argument must survive the repair."""
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f'<{S} invoke name="Grep">\n'
+        f'<{S} parameter name="-C" string="false">8</{S} parameter>'
+        f'<{S} parameter name="output_mode" string="true">content'
+        f'<{S} parameter name="path" string="true">/a/b.py</{S} parameter>'
+        f'<{S} parameter name="pattern" string="true">def main</{S} parameter>\n'
+        f"</{S} invoke>"
+    )
+    calls = parse_tool_calls(text)
+    assert calls is not None
+    args = json.loads(calls[0][0].arguments)
+    assert args == {"-C": 8, "output_mode": "content", "path": "/a/b.py", "pattern": "def main"}
+
+
+def test_dsml_bracketless_close_leaves_canonical_tags_alone():
+    """A canonical opener and a canonical close must not be rewritten."""
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    canonical = f'<{S} parameter name="path" string="true">/a.py</{S} parameter>'
+    assert _repair_dsml_bracketless_close(canonical) == canonical
+    # A fused close (carrying a slash) belongs to _repair_dsml_fused_close_open.
+    fused = f'</{S} parameter name="next">'
+    assert _repair_dsml_bracketless_close(fused) == fused
+
+
+def test_dsml_bracketless_close_restores_close_and_opener():
+    """The repaired token must be a canonical close plus a canonical opener."""
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    broken = f'value{S} parameter name="x" string="false">'
+    assert _repair_dsml_bracketless_close(broken) == (f'value</{S} parameter><{S} parameter name="x" string="false">')

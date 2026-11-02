@@ -177,6 +177,43 @@ async def test_non_stream_formats_tool_calls():
     assert json.loads(call["function"]["arguments"]) == {"city": "Moscow"}
 
 
+DS_TWO_CALLS_SSE = (
+    "event: ready\n"
+    'data: {"request_message_id":1,"response_message_id":2,"model_type":"default"}\n'
+    "\n"
+    'data: {"v":{"response":{"message_id":2,"parent_id":1,"status":"WIP","fragments":['
+    '{"id":2,"type":"RESPONSE","content":"{\\"tool_calls\\": [{\\"name\\": \\"get_weather\\", '
+    '\\"arguments\\": {\\"city\\": \\"Moscow\\"}}, {\\"name\\": \\"get_weather\\", '
+    '\\"arguments\\": {\\"city\\": \\"Paris\\"}}]}"}]}}}\n'
+    "\n"
+    'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n'
+    "\n"
+)
+
+
+async def test_non_stream_single_call_drops_extra_calls():
+    acct = FakeAccount([DS_TWO_CALLS_SSE])
+    result = await openai_mod._collect_non_stream(**_deepseek_args(acct), single_call=True)
+    message = result["choices"][0]["message"]
+    assert len(message["tool_calls"]) == 1
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {"city": "Moscow"}
+
+
+async def test_non_stream_keeps_extra_calls_by_default():
+    acct = FakeAccount([DS_TWO_CALLS_SSE])
+    result = await openai_mod._collect_non_stream(**_deepseek_args(acct))
+    message = result["choices"][0]["message"]
+    assert len(message["tool_calls"]) == 2
+
+
+async def test_stream_single_call_drops_extra_calls():
+    acct = FakeAccount([DS_TWO_CALLS_SSE])
+    gen = openai_mod._stream_openai(**_deepseek_args(acct), single_call=True)
+    arguments = _stream_arguments(await collect_stream(gen))
+    # Only the first call's arguments are streamed; Paris never appears.
+    assert json.loads(arguments) == {"city": "Moscow"}
+
+
 async def test_non_stream_falls_back_to_content():
     acct = FakeAccount([DS_PLAIN_SSE])
     result = await openai_mod._collect_non_stream(**_deepseek_args(acct))

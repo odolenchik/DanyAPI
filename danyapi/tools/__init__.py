@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .format import format_tool_message, tool_call_deltas
+from .format import format_tool_message, limit_tool_calls, tool_call_deltas
 from .parse import (
     _balanced_json,
     _coerce_scalar,
@@ -16,6 +16,7 @@ from .parse import (
     _parse_bare_array_calls,
     _parse_dsml,
     _parse_xml_tool_calls,
+    _repair_dsml_bracketless_close,
     _repair_dsml_separator,
     _strip_dsml,
     _strip_fences,
@@ -78,6 +79,7 @@ __all__ = [
     "_parse_dsml",
     "_parse_xml_tool_calls",
     "_render_tool_call_mention",
+    "_repair_dsml_bracketless_close",
     "_repair_dsml_separator",
     "_strip_dsml",
     "_strip_fences",
@@ -97,6 +99,7 @@ __all__ = [
     "format_tool_message",
     "is_degenerate_repeat",
     "is_tool_round",
+    "limit_tool_calls",
     "parse_tool_calls",
     "render_json_mode",
     "render_message",

@@ -35,28 +35,96 @@ class ToolCall:
         return cls(call_id, name, args_text)
 
 
+# DSML is the canonical tool-call wire format. DeepSeek speaks it natively, so
+# asking for JSON only produced hybrids: the model answered half in its own
+# tags and half in the demanded shape. The prompt now asks for DSML and the
+# parser in ``parse.py`` reads it back.
+
+# Tags are assembled from parts rather than written out: the canonical marker is
+# two pipes, the word DSML, two more pipes, then the tag body. Keeping the
+# pieces separate also makes the shape obvious at a glance.
+_DSML_BARS = "|" * 2
+_DSML_WORD = "DSML"
+
+
+def _dsml_tag(body: str, closing: bool = False) -> str:
+    """Render one canonical DSML tag: marker, then the tag body."""
+    slash = "/" if closing else ""
+    return "<" + slash + _DSML_BARS + _DSML_WORD + _DSML_BARS + body + ">"
+
+
+def _dsml_param(name: str, value: str, string: bool = True) -> str:
+    """Render one argument: a parameter tag holding the value."""
+    flag = "true" if string else "false"
+    opener = _dsml_tag(f'parameter name="{name}" string="{flag}"')
+    return opener + value + _dsml_tag("parameter", closing=True)
+
+
+# One short example in the exact shape ``_parse_dsml`` reads back: the invoke
+# carries the function name, each argument sits in its own parameter tag, and the
+# ``string`` flag says whether the value is text or has to be coerced.
+DSML_EXAMPLE = "\n".join(
+    (
+        _dsml_tag("tool_calls"),
+        "  " + _dsml_tag('invoke name="Read"'),
+        "    " + _dsml_param("path", "/home/user/file.py"),
+        "    " + _dsml_param("line_offset", "10", string=False),
+        "  " + _dsml_tag("invoke", closing=True),
+        _dsml_tag("tool_calls", closing=True),
+    )
+)
+
 TOOL_CALL_INSTRUCTION = (
     "You have access to the following functions. Call them when the user's request requires it.\n\n"
     "{functions}\n\n"
-    "When you need to call one or more functions, your ENTIRE reply must be ONLY a valid JSON object — "
-    "no markdown fences, no code blocks, no XML tags, no <invoke>, no <tool_calls> wrapper, "
-    "no prose before or after. Use exactly this structure:\n\n"
-    'Single call: {{"tool_calls": [{{"name": "Read", "arguments": {{"path": "/home/user/file.py", "line_offset": 10}}}}]}}\n'
-    'Multiple calls: {{"tool_calls": [{{"name": "Grep", "arguments": {{"pattern": "def main"}}}}, '
-    '{{"name": "Glob", "arguments": {{"pattern": "**/*"}}}}]}}\n\n'
+    "When you need to call a function, write it in DSML: one invoke block per call, "
+    "every argument in its own parameter tag. Several calls go in the one tool_calls "
+    "container. Use exactly this shape:\n\n"
+    "{example}\n\n"
     "Rules:\n"
-    '- The outermost structure is a single JSON object with one key: "tool_calls" (an array).\n'
-    '- Each entry has exactly two keys: "name" and "arguments".\n'
     "- Use EXACTLY the function names and parameter names from the definitions above.\n"
-    '- The value of "arguments" must be a JSON object with only declared keys — no extra fields.\n'
-    "- Do NOT use XML, DSML tags, or any non-JSON format.\n"
+    '- One parameter tag per argument; string="true" for text, string="false" for '
+    "numbers, booleans, arrays and objects.\n"
+    "- Do not add parameters that are not declared above.\n"
     "{choice}"
 )
+
+# Repeats the wire format in the tail of every tool round. The schema block that
+# carries the instruction sits at the top of a long session, so by the tenth round
+# it is tens of thousands of characters away and the model drifts back to its own
+# habits; a short reminder next to the newest result keeps the format in view.
+TOOL_FORMAT_TAIL_DSML = "Tool-call format:\n\n" + DSML_EXAMPLE
 
 CHOICE_INSTRUCTIONS = {
     "required": "You MUST call one or more functions from the list above.",
     "function": "You MUST call exactly the function specified below and no other functions.",
 }
+
+# Single-call variant of ``TOOL_CALL_INSTRUCTION``. Batching several calls into
+# one reply is where most mangled payloads come from (sibling calls with no
+# separator, a schema split across calls, a repeated parameter name, one
+# ambiguous ``{path}`` shared by two calls): with exactly one call there is no
+# boundary to get wrong. A caller that needs several actions gets them one per
+# round instead.
+SINGLE_CALL_INSTRUCTION = (
+    "You have access to the following functions. Call them when the user's request requires it.\n\n"
+    "{functions}\n\n"
+    "When you need to call a function, write it in DSML: one invoke block holding the "
+    "call, every argument in its own parameter tag, all inside one tool_calls container. "
+    "Use exactly this shape:\n\n"
+    "{example}\n\n"
+    "Rules:\n"
+    "- Call exactly ONE function per reply: the container holds a single invoke block.\n"
+    "- If the task needs several calls, make the most important one first and stop; "
+    "its result comes back and you can call the next one then.\n"
+    "- Use EXACTLY the function name and parameter names from the definitions above.\n"
+    '- One parameter tag per argument; string="true" for text, string="false" for '
+    "numbers, booleans, arrays and objects.\n"
+    "- Do not add parameters that are not declared above.\n"
+    "{choice}"
+)
+
+SINGLE_CHOICE_REQUIRED = "You MUST call exactly one function from the list above."
 
 JSON_MODE_INSTRUCTION = """You must reply with ONLY a valid JSON object, no markdown fences, no extra text, no explanations, no comments inside the JSON.
 {constraints}"""
@@ -83,7 +151,7 @@ def _choice_name(tool_choice: Any) -> str | None:
     return None
 
 
-def render_tool_schema(tools: list[Any] | None, tool_choice: Any = None) -> str | None:
+def render_tool_schema(tools: list[Any] | None, tool_choice: Any = None, single_call: bool = False) -> str | None:
     if not tools:
         return None
     functions: list[dict] = []
@@ -111,12 +179,13 @@ def render_tool_schema(tools: list[Any] | None, tool_choice: Any = None) -> str 
                 params_json = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
             lines.append(f"   parameters (JSON Schema): {params_json}")
     if choice in CHOICE_INSTRUCTIONS:
-        choice_line = CHOICE_INSTRUCTIONS[choice]
+        choice_line = SINGLE_CHOICE_REQUIRED if single_call and choice == "required" else CHOICE_INSTRUCTIONS[choice]
     elif isinstance(choice, str) and choice not in ("auto", "none", "required"):
         choice_line = f"You MUST call exactly the function {choice} and no other functions."
     else:
         choice_line = "If you do not need to call any function, reply normally with your answer."
-    return TOOL_CALL_INSTRUCTION.format(functions="\n".join(lines), choice=choice_line)
+    template = SINGLE_CALL_INSTRUCTION if single_call else TOOL_CALL_INSTRUCTION
+    return template.format(functions="\n".join(lines), example=DSML_EXAMPLE, choice=choice_line)
 
 
 def _content_text(content: Any) -> str:
@@ -205,6 +274,32 @@ def context_sequence(messages: list[Any], user: str | None = None) -> tuple[str,
     return tuple(sequence)
 
 
+def _dsml_params(arguments: Any) -> str:
+    """Render a call's arguments as DSML parameter tags.
+
+    Text values keep their own form; everything else is emitted as compact JSON
+    with ``string="false"`` so the parser coerces it back to the same type.
+    """
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except (TypeError, ValueError):
+            parsed = None
+        if not isinstance(parsed, dict):
+            return _dsml_param("arguments", arguments) if arguments else ""
+    elif isinstance(arguments, dict):
+        parsed = arguments
+    else:
+        return ""
+    parts = []
+    for key, value in parsed.items():
+        if isinstance(value, str):
+            parts.append(_dsml_param(str(key), value))
+        else:
+            parts.append(_dsml_param(str(key), json.dumps(value, ensure_ascii=False), string=False))
+    return "".join("\n    " + part for part in parts)
+
+
 def _render_tool_call_mention(call: Any) -> str:
     if not isinstance(call, dict):
         return ""
@@ -215,10 +310,11 @@ def _render_tool_call_mention(call: Any) -> str:
     else:
         name = call.get("name") or ""
         args = call.get("arguments") or ""
-    if isinstance(args, (dict, list)):
-        args = json.dumps(args, ensure_ascii=False)
-    # Render in the target JSON format so DeepSeek mimics it instead of its native XML/DSML.
-    return f'{{"tool_calls": [{{"name": "{name}", "arguments": {args}}}]}}' if name else ""
+    if not name:
+        return ""
+    # Rendered in the canonical DSML format so the model sees its own calls the
+    # same way the instruction asks it to write new ones.
+    return _dsml_tag(f'invoke name="{name}"') + _dsml_params(args) + "\n" + _dsml_tag("invoke", closing=True)
 
 
 def render_message(msg: Any) -> str:
@@ -311,8 +407,15 @@ def _render_tool_tail(messages: list[Any], max_chars: int | None = None) -> str:
             if text:
                 tool_parts.append(text)
     # Truncate individual tool results if total exceeds max_chars.
-    trailer = "Continue the conversation and provide the final answer based on the tool results."
-    fixed_len = sum(len(p) + 1 for p in parts) + len(trailer) + 1
+    # A flat "provide the final answer" reads as an instruction to stop calling
+    # tools, which fights the agent loop on multi-step work. Offer both outcomes
+    # instead so a mid-task turn keeps calling.
+    trailer = "Continue the conversation: call more functions if the task still needs them, otherwise give the final answer based on the tool results."
+    # The schema block that states the wire format stays at the top of the
+    # session, so by a later round it is tens of thousands of characters behind
+    # the newest result. Restating the format here keeps it in view.
+    format_block = TOOL_FORMAT_TAIL_DSML
+    fixed_len = sum(len(p) + 1 for p in parts) + len(trailer) + len(format_block) + 2
     if max_chars is not None and tool_parts:
         budget = max_chars - fixed_len
         total_tool_len = sum(len(t) + 1 for t in tool_parts)
@@ -326,6 +429,7 @@ def _render_tool_tail(messages: list[Any], max_chars: int | None = None) -> str:
                     truncated.append(t)
             tool_parts = truncated
     parts.extend(tool_parts)
+    parts.append(format_block)
     parts.append(trailer)
     return "\n".join(parts)
 
@@ -542,6 +646,7 @@ def build_compact_prompt(
     response_format: Any = None,
     summary: str | None = None,
     max_chars: int = MAX_APPEND_PROMPT_CHARS,
+    single_call: bool = False,
 ) -> tuple[str, str]:
     """Build a compact prompt for retry after CONTEXT_LENGTH_EXCEEDED.
 
@@ -560,7 +665,7 @@ def build_compact_prompt(
         block
         for block in (
             extract_system(messages),
-            render_tool_schema(tools, tool_choice),
+            render_tool_schema(tools, tool_choice, single_call=single_call),
             render_json_mode(response_format),
         )
         if block
@@ -645,8 +750,9 @@ def build_prompt(
     tool_choice: Any = None,
     has_session: bool = False,
     response_format: Any = None,
+    single_call: bool = False,
 ) -> tuple[str, bool]:
-    schema = render_tool_schema(tools, tool_choice)
+    schema = render_tool_schema(tools, tool_choice, single_call=single_call)
     tools_present = schema is not None
     json_block = render_json_mode(response_format)
 

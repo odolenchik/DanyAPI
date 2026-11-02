@@ -146,11 +146,16 @@ def test_issue_dataclass_fields():
     assert issue.detail == "Grep.pattern"
 
 
-def test_build_repair_prompt_lists_issues_and_demands_json():
+def test_build_repair_prompt_lists_issues_and_demands_dsml():
     issues = [ValidationIssue("extra_argument", "get_weather.offset")]
     prompt = build_repair_prompt(issues)
     assert "get_weather.offset" in prompt
     assert "tool_calls" in prompt
+    assert "DSML" in prompt
+    # The repair must ask for the same format the schema block asks for. A JSON
+    # demand here contradicts it and brings back the hybrid replies.
+    assert "corrected JSON" not in prompt
+    assert "no XML/DSML" not in prompt
 
 
 def test_build_repair_prompt_caps_listed_issues():
@@ -202,13 +207,16 @@ def test_should_retry_unparsed_non_string_choice_is_auto():
 # --- build_unparsed_repair_prompt: parse-fail variant of the repair prompt ----
 
 
-def test_build_unparsed_repair_prompt_demands_json():
+def test_build_unparsed_repair_prompt_demands_dsml():
     from danyapi.tools.validate import build_unparsed_repair_prompt
 
     prompt = build_unparsed_repair_prompt("json_malformed")
     assert "could not be parsed" in prompt
     assert "json_malformed" in prompt
-    assert '"tool_calls"' in prompt
+    assert "DSML" in prompt
+    # A JSON demand would contradict the schema block's DSML instruction.
+    assert "ONLY the JSON object" not in prompt
+    assert "no XML/DSML" not in prompt
     # The model's broken reply is still in the session, so no issue list is sent.
     assert "did not pass tool-call validation" not in prompt
 

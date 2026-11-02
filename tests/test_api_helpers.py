@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 import danyapi.api.openai as openai_mod
 from danyapi.accounts import AccountPoolBusy
+from danyapi.api.models import ChatCompletionRequest
 from danyapi.api.openai import app, settings
 from danyapi.deepseek.client import DeepSeekError
 from danyapi.usage import UsageTracker, init_tracker, reset_tracker
@@ -137,6 +138,33 @@ def make_pool(acct=None):
     acct = acct or FakeAccount()
     pool.acquire = AsyncMock(return_value=(acct, None))
     return pool, acct
+
+
+WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the weather in a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}
+
+TWO_CALLS_SSE = (
+    "event: ready\n"
+    'data: {"request_message_id":1,"response_message_id":2,"model_type":"default"}\n'
+    "\n"
+    'data: {"v":{"response":{"message_id":2,"parent_id":1,"status":"WIP","fragments":['
+    '{"id":2,"type":"RESPONSE","content":"{\\"tool_calls\\": [{\\"name\\": \\"get_weather\\", '
+    '\\"arguments\\": {\\"city\\": \\"Moscow\\"}}, {\\"name\\": \\"get_weather\\", '
+    '\\"arguments\\": {\\"city\\": \\"Paris\\"}}]}"}]}}}\n'
+    "\n"
+    'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n'
+    "\n"
+)
 
 
 def _rec(status=None, hint=None):
@@ -737,6 +765,40 @@ def test_chat_deepseek_non_stream():
     data = resp.json()
     assert data["choices"][0]["message"]["content"] == "Hi"
     assert data["session_id"] == "s1"
+
+
+def test_chat_deepseek_non_stream_single_call_drops_extra(monkeypatch):
+    """End-to-end: parallel_tool_calls=false reaches the prompt and the cut.
+
+    The request asks for one call per reply, the upstream sends two, and the
+    client gets only the first — the policy is enforced at the HTTP boundary,
+    not just inside the helper.
+    """
+    seen: dict[str, str] = {}
+
+    async def fake_completion(prompt, *args, **kwargs):
+        seen["prompt"] = prompt
+        return FakeResp(sse_text=TWO_CALLS_SSE)
+
+    pool, acct = make_pool()
+    acct.client.completion = fake_completion
+    app.state.pool = pool
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "weather in two cities?"}],
+            "tools": [WEATHER_TOOL],
+            "parallel_tool_calls": False,
+        },
+    )
+    client.close()
+    assert resp.status_code == 200
+    assert "exactly ONE function per reply" in seen["prompt"]
+    calls = resp.json()["choices"][0]["message"]["tool_calls"]
+    assert len(calls) == 1
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Moscow"}
 
 
 def test_chat_deepseek_stream():
@@ -1802,3 +1864,22 @@ async def test_lifespan_starts_a_revive_loop_for_the_qwen_pool(monkeypatch):
             assert slow_after == settings.qwen_revive_slow_after
     # The loop is cancelled and awaited on shutdown rather than leaked.
     assert cancelled == [pool]
+
+
+def test_single_tool_call_from_request_flag():
+    req = ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}], parallel_tool_calls=False)
+    assert openai_mod._single_tool_call(req) is True
+
+
+def test_single_tool_call_follows_server_setting(monkeypatch):
+    req = ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}])
+    monkeypatch.setattr(openai_mod.settings, "one_tool_call_per_turn", True)
+    assert openai_mod._single_tool_call(req) is True
+    monkeypatch.setattr(openai_mod.settings, "one_tool_call_per_turn", False)
+    assert openai_mod._single_tool_call(req) is False
+
+
+def test_single_tool_call_cannot_be_opted_out_per_request(monkeypatch):
+    req = ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}], parallel_tool_calls=True)
+    monkeypatch.setattr(openai_mod.settings, "one_tool_call_per_turn", True)
+    assert openai_mod._single_tool_call(req) is True

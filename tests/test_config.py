@@ -170,6 +170,21 @@ def test_toolcall_retry_enabled_variants(settings_for, value):
     assert settings_for({"DANYAPI_TOOLCALL_RETRY": value}).toolcall_retry is True
 
 
+def test_one_tool_call_per_turn_on_by_default(settings_for):
+    assert settings_for({}).one_tool_call_per_turn is True
+    assert settings_for({"DANYAPI_ONE_TOOL_CALL_PER_TURN": ""}).one_tool_call_per_turn is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "FALSE", "Off"])
+def test_one_tool_call_per_turn_disabled_variants(settings_for, value):
+    assert settings_for({"DANYAPI_ONE_TOOL_CALL_PER_TURN": value}).one_tool_call_per_turn is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "TRUE", "On"])
+def test_one_tool_call_per_turn_enabled_variants(settings_for, value):
+    assert settings_for({"DANYAPI_ONE_TOOL_CALL_PER_TURN": value}).one_tool_call_per_turn is True
+
+
 def test_degenerate_guard_on_by_default(settings_for):
     assert settings_for({}).degenerate_guard is True
     assert settings_for({"DANYAPI_DEGENERATE_GUARD": ""}).degenerate_guard is True

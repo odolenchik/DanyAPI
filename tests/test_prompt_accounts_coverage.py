@@ -15,6 +15,7 @@ from danyapi.accounts import AccountPool, AccountPoolBusy, ContextIndex, DeepSee
 from danyapi.deepseek.client import DeepSeekClient
 from danyapi.store import JsonStore
 from danyapi.tools.prompt import (
+    _dsml_tag,
     _render_tool_tail,
     build_compact_prompt,
     build_prompt,
@@ -96,8 +97,35 @@ def test_render_tool_tail_assistant_text_and_inline_tool_call():
 
     assert tools_present is True
     assert "looking now" in prompt
-    assert '"name": "Read"' in prompt
+    assert 'invoke name="Read"' in prompt
     assert "file body" in prompt
+
+
+def test_tool_round_tail_restates_the_format():
+    """The schema block carrying the format sits at the top of the session; a
+    tool round must repeat it next to the newest result, or the model drifts."""
+    messages = [
+        SimpleNamespace(role="user", content="q"),
+        SimpleNamespace(
+            role="assistant",
+            content="",
+            tool_calls=[{"function": {"name": "Read", "arguments": '{"path": "a.py"}'}}],
+        ),
+        SimpleNamespace(role="tool", content="body", tool_call_id="c1"),
+    ]
+    prompt, _ = build_prompt(messages, has_session=True)
+    assert "Tool-call format:" in prompt
+    assert _dsml_tag("tool_calls") in prompt
+    # The reminder sits after the tool result, not before it.
+    assert prompt.index("body") < prompt.index("Tool-call format:")
+
+
+def test_plain_round_has_no_format_reminder():
+    """A round with no tool call is not a tool round: nothing is repeated."""
+    messages = [SimpleNamespace(role="user", content="hello")]
+    prompt, _ = build_prompt(messages, has_session=True)
+    assert "Tool-call format:" not in prompt
+    assert prompt == "hello"
 
 
 def test_render_tool_tail_truncates_long_results():

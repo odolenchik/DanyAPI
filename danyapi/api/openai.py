@@ -36,6 +36,20 @@ from .models import ChatCompletionRequest, ImageGenerationRequest
 log = logging.getLogger("danyapi.api")
 
 
+def _single_tool_call(req: ChatCompletionRequest) -> bool:
+    """Whether this request must get exactly one tool call per reply.
+
+    The server-wide setting turns the policy on; an explicit
+    ``parallel_tool_calls=false`` from the client turns it on for that request
+    only. There is no way for a client to turn it back off once the server-wide
+    setting is on: the policy exists to keep replies parseable, and a per-request
+    opt-out would reintroduce the mangled multi-call payloads it prevents.
+    """
+    if getattr(req, "parallel_tool_calls", None) is False:
+        return True
+    return settings.one_tool_call_per_turn
+
+
 def _get_trace() -> ToolTraceLogger:
     """Lazily construct the shared tool-trace logger (no-op if disabled)."""
     cached = getattr(app.state, "tooltrace", None)
@@ -878,6 +892,7 @@ async def _chat_completions_deepseek(req: ChatCompletionRequest) -> Any:
             pool.register(account.index, existing_sid)
     has_session = existing_sid is not None and account.sessions.get(existing_sid) is not None
 
+    single_call = _single_tool_call(req)
     try:
         prompt, tool_mode = toolemu.build_prompt(
             req.messages,
@@ -885,6 +900,7 @@ async def _chat_completions_deepseek(req: ChatCompletionRequest) -> Any:
             getattr(req, "tool_choice", None),
             has_session,
             getattr(req, "response_format", None),
+            single_call=single_call,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -931,6 +947,7 @@ async def _chat_completions_deepseek(req: ChatCompletionRequest) -> Any:
         "tools": getattr(req, "tools", None),
         "tool_choice": getattr(req, "tool_choice", None),
         "response_format": getattr(req, "response_format", None),
+        "single_call": single_call,
         # Rebuild the prompt with full history if the session dies mid-flight
         # (stale parent pointer): the fresh session has no context, so a delta
         # prompt would arrive with nothing behind it.
@@ -940,6 +957,7 @@ async def _chat_completions_deepseek(req: ChatCompletionRequest) -> Any:
             getattr(req, "tool_choice", None),
             False,
             getattr(req, "response_format", None),
+            single_call=single_call,
         )[0],
     }
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-Id": request_id}
@@ -987,6 +1005,7 @@ async def _chat_completions_qwen(req: ChatCompletionRequest) -> Any:
     # (system + tools + history) so the recreated session gets complete context.
     has_session = existing_sid is not None and account.sessions.get(existing_sid) is not None
 
+    single_call = _single_tool_call(req)
     try:
         prompt, tool_mode = toolemu.build_prompt(
             req.messages,
@@ -994,6 +1013,7 @@ async def _chat_completions_qwen(req: ChatCompletionRequest) -> Any:
             getattr(req, "tool_choice", None),
             has_session,
             getattr(req, "response_format", None),
+            single_call=single_call,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -1045,6 +1065,7 @@ async def _chat_completions_zai(req: ChatCompletionRequest) -> Any:
             getattr(req, "tool_choice", None),
             False,
             getattr(req, "response_format", None),
+            single_call=_single_tool_call(req),
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -1065,6 +1086,7 @@ async def _chat_completions_zai(req: ChatCompletionRequest) -> Any:
                     tool_mode=tool_mode,
                     tool_schemas=tool_schemas,
                     request_id=request_id,
+                    trace=trace,
                 ),
                 req.model,
             ),
@@ -1079,6 +1101,7 @@ async def _chat_completions_zai(req: ChatCompletionRequest) -> Any:
         tool_mode=tool_mode,
         tool_schemas=tool_schemas,
         request_id=request_id,
+        trace=trace,
     )
     if isinstance(result, dict):
         result["x_request_id"] = request_id
