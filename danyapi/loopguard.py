@@ -19,35 +19,91 @@ import hashlib
 
 
 class LoopGuard:
-    """Track streamed text and report a runaway line-block repeat.
+    """Track streamed text and report a runaway repeat.
 
-    Feed fragments with :meth:`feed`; once a block of 1..``max_period`` lines has
-    repeated ``repeats`` times in a row it returns ``(period, count)`` and keeps
-    returning that same result on every later call.
+    Line-level detection covers a block of 1..``max_period`` lines repeated
+    ``repeats`` times in a row. It needs newlines, though, so a model that loops
+    inside a single line (a marker, a phrase, a run of characters with no break)
+    would stream forever unnoticed. A second, character-level pass covers that
+    shape: a block of 1..``char_max_period`` characters repeated
+    ``char_repeats`` times, provided the run covers at least ``char_min_chars``
+    characters so ordinary repetition (a rule of dashes, a short indent) never
+    trips it.
+
+    Feed fragments with :meth:`feed`; once either pass sees a loop it returns
+    ``(period, count)`` and keeps returning that same result on every later call.
     """
 
-    def __init__(self, *, max_period: int = 40, repeats: int = 15) -> None:
+    def __init__(
+        self,
+        *,
+        max_period: int = 40,
+        repeats: int = 15,
+        char_max_period: int = 200,
+        char_repeats: int = 15,
+        char_min_chars: int = 2000,
+    ) -> None:
         self.max_period = max(1, max_period)
         self.repeats = max(2, repeats)
+        self.char_max_period = max(1, char_max_period)
+        self.char_repeats = max(2, char_repeats)
+        self.char_min_chars = max(1, char_min_chars)
         self.hit: tuple[int, int] | None = None
         self._hashes: list[bytes] = []
         self._buf = ""
+        # Character pass: keep only the tail a repeat could still be visible in,
+        # and run the scan in steps so its cost stays amortised per fed byte.
+        self._char_window = max(self.char_min_chars, self.char_max_period * self.char_repeats)
+        self._char_buf = ""
+        self._char_step = max(1, self._char_window // 8)
+        self._char_total = 0
+        self._char_last_check = 0
 
     def feed(self, delta: str) -> tuple[int, int] | None:
         """Feed a streamed fragment and report a loop as soon as one is visible."""
         if self.hit is not None or not delta:
             return self.hit
         self._buf += delta
-        if "\n" not in self._buf:
-            return None
-        parts = self._buf.split("\n")
-        # The text after the last newline is a line still being streamed: it is
-        # incomplete, so it must never take part in a comparison.
-        self._buf = parts.pop()
-        for line in parts:
-            self._hashes.append(hashlib.blake2b(line.encode("utf-8", "replace"), digest_size=8).digest())
-        self.hit = self._detect()
+        if "\n" in self._buf:
+            parts = self._buf.split("\n")
+            # The text after the last newline is a line still being streamed: it
+            # is incomplete, so it must never take part in a comparison.
+            self._buf = parts.pop()
+            for line in parts:
+                self._hashes.append(hashlib.blake2b(line.encode("utf-8", "replace"), digest_size=8).digest())
+            self.hit = self._detect()
+        if self.hit is None:
+            self.hit = self._track_chars(delta)
         return self.hit
+
+    def _track_chars(self, delta: str) -> tuple[int, int] | None:
+        self._char_total += len(delta)
+        self._char_buf += delta
+        if len(self._char_buf) > self._char_window:
+            self._char_buf = self._char_buf[-self._char_window :]
+        if self._char_total - self._char_last_check < self._char_step:
+            return None
+        self._char_last_check = self._char_total
+        return self._detect_chars()
+
+    def _detect_chars(self) -> tuple[int, int] | None:
+        buf = self._char_buf
+        size = len(buf)
+        for period in range(1, self.char_max_period + 1):
+            need = period * self.char_repeats
+            if need > size:
+                break
+            if need < self.char_min_chars:
+                continue
+            block = buf[size - period :]
+            count = 1
+            index = size - period
+            while index - period >= 0 and buf[index - period : index] == block:
+                count += 1
+                index -= period
+                if count >= self.char_repeats:
+                    return period, count
+        return None
 
     def _detect(self) -> tuple[int, int] | None:
         window = self.max_period * self.repeats

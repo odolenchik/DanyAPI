@@ -267,6 +267,14 @@ class Settings:
         self.loop_guard = os.environ.get("DANYAPI_LOOP_GUARD", "1").strip().lower() not in ("0", "false", "no", "off")
         self.loop_repeats = self._int_env("DANYAPI_LOOP_REPEATS", 15, minimum=2)
         self.loop_max_period = self._int_env("DANYAPI_LOOP_MAX_PERIOD", 40, minimum=1)
+        # The line pass above needs newlines, so a model looping inside a single
+        # line would stream forever unseen. The character pass looks for a block
+        # of 1..char_max_period characters repeated char_repeats times, but only
+        # once the run covers at least char_min_chars characters, so ordinary
+        # short repeats (a rule of dashes, an indent) never trip it.
+        self.loop_char_max_period = self._int_env("DANYAPI_LOOP_CHAR_MAX_PERIOD", 200, minimum=1)
+        self.loop_char_repeats = self._int_env("DANYAPI_LOOP_CHAR_REPEATS", 15, minimum=2)
+        self.loop_char_min_chars = self._int_env("DANYAPI_LOOP_CHAR_MIN_CHARS", 2000, minimum=1)
 
         # Per-turn thinking: when the client sends neither `thinking` nor
         # `reasoning_effort`, decide the flag from the turn itself instead of the

@@ -39,7 +39,13 @@ def _new_loop_guard() -> LoopGuard | None:
     """A guard for one streamed channel, or None when the feature is off."""
     if not settings.loop_guard:
         return None
-    return LoopGuard(max_period=settings.loop_max_period, repeats=settings.loop_repeats)
+    return LoopGuard(
+        max_period=settings.loop_max_period,
+        repeats=settings.loop_repeats,
+        char_max_period=settings.loop_char_max_period,
+        char_repeats=settings.loop_char_repeats,
+        char_min_chars=settings.loop_char_min_chars,
+    )
 
 
 def _loop_hit(

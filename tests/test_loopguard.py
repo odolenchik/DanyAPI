@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import random
+import string
+
 from danyapi.loopguard import LoopGuard
 
 NL = "\n"
@@ -127,3 +130,79 @@ def test_non_utf8_surrogate_is_encoded_safely():
     for _ in range(20):
         guard.feed("bad \udcff line" + NL)
     assert guard.hit is not None
+
+
+# ---------------------------------------------------------------------------
+# character-level pass: a loop with no newline in it
+# ---------------------------------------------------------------------------
+
+
+def test_char_repeat_without_newline_hits():
+    """A model looping inside one line used to stream forever unnoticed."""
+    assert _run("好的" * 5000) is not None
+
+
+def test_repeated_phrase_without_newline_hits():
+    assert _run("the same phrase over and over " * 300) is not None
+
+
+def test_char_repeat_below_min_chars_does_not_hit():
+    # Fewer characters than char_min_chars: ordinary short runs must survive.
+    assert _run("ab" * 100) is None
+
+
+def test_varied_text_without_newline_does_not_hit():
+    words = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+    text = " ".join(f"{words[i % len(words)]}{i * 7919}" for i in range(3000))
+    assert _run(text) is None
+
+
+def test_long_single_line_code_does_not_hit():
+    assert _run("".join(f"x{i}={i};" for i in range(3000))) is None
+
+
+def test_high_entropy_text_does_not_hit():
+    rnd = random.Random(1234)
+    text = "".join(rnd.choice(string.ascii_letters + string.digits + "+/") for _ in range(20000))
+    assert _run(text) is None
+
+
+def test_char_buffer_stays_bounded():
+    guard = LoopGuard()
+    for _ in range(500):
+        guard.feed("x" * 100)
+    assert len(guard._char_buf) <= guard._char_window
+
+
+def test_short_phrase_repeat_needs_enough_characters():
+    """A 7-character phrase repeated 15 times is below char_min_chars.
+
+    The character pass deliberately skips a period whose full run cannot reach
+    char_min_chars, so a short repeated phrase must not trip it early.
+    """
+    guard = LoopGuard(char_min_chars=2000)
+    guard.feed("повтор " * 20)
+    assert guard.hit is None
+
+
+def test_char_pass_reports_a_period_above_the_character_floor():
+    guard = LoopGuard()
+    hit = guard.feed("повтор " * 500)
+    assert hit is not None
+    period, count = hit
+    assert period >= 7
+    assert count >= guard.char_repeats
+
+
+def test_line_hit_takes_precedence_over_char_pass():
+    guard = LoopGuard()
+    hit = guard.feed(NL.join(["same line"] * 50))
+    assert hit is not None
+    assert hit[0] == 1
+
+
+def test_char_knobs_are_clamped():
+    guard = LoopGuard(char_max_period=0, char_repeats=0, char_min_chars=0)
+    assert guard.char_max_period == 1
+    assert guard.char_repeats == 2
+    assert guard.char_min_chars == 1
