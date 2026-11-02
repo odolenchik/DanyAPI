@@ -2,8 +2,10 @@
 
 The heuristic is opt-in via ``DANYAPI_THINKING_HEURISTIC`` and only consulted
 when the client sent neither ``thinking`` nor ``reasoning_effort``. Signals add
-up to a score: a strong one (long prompt, error/difficulty cue) clears the
-threshold alone, weak ones (long history, automatic tool round) must combine.
+up to a score across three levels: a strong one (error, very long prompt,
+specific engineering word) clears the threshold alone, a medium one (ordinary
+question word, merely long prompt) needs a weak companion, and weak ones (long
+history, automatic tool round) must combine.
 """
 
 import asyncio
@@ -20,7 +22,12 @@ from danyapi.api.openai import _looks_hard, _resolve_thinking, settings
 def heuristic_on(monkeypatch):
     monkeypatch.setattr(settings, "thinking_heuristic", True)
     monkeypatch.setattr(settings, "thinking_min_prompt_chars", 2000)
+    monkeypatch.setattr(settings, "thinking_long_prompt_chars", 4000)
     monkeypatch.setattr(settings, "thinking_min_messages", 8)
+    monkeypatch.setattr(settings, "thinking_strong_weight", 3)
+    monkeypatch.setattr(settings, "thinking_medium_weight", 2)
+    monkeypatch.setattr(settings, "thinking_weak_weight", 1)
+    monkeypatch.setattr(settings, "thinking_score_threshold", 3)
 
 
 def _req(text, *, role="user", extra_messages=(), **kwargs):
@@ -76,20 +83,38 @@ def _history(n):
 # ---------------------------------------------------------------------------
 
 
-def test_long_prompt_is_hard(heuristic_on):
-    assert _looks_hard(_req("x" * 2000)) is True
+def test_very_long_prompt_is_hard(heuristic_on):
+    assert _looks_hard(_req("x" * 4000)) is True
 
 
 def test_error_text_is_hard(heuristic_on):
     assert _looks_hard(_req("I got this:\nTraceback (most recent call last):")) is True
 
 
-def test_difficulty_keyword_is_hard(heuristic_on):
-    assert _looks_hard(_req("why does this fail")) is True
+def test_hard_keyword_is_hard(heuristic_on):
+    assert _looks_hard(_req("refactor this module")) is True
 
 
-def test_russian_difficulty_keyword_is_hard(heuristic_on):
-    assert _looks_hard(_req("почему это падает")) is True
+def test_russian_hard_keyword_is_hard(heuristic_on):
+    assert _looks_hard(_req("отрефактори этот модуль")) is True
+
+
+# ---------------------------------------------------------------------------
+# medium signals need a weak companion
+# ---------------------------------------------------------------------------
+
+
+def test_merely_long_prompt_is_not_hard_alone(heuristic_on):
+    # 2000 characters is medium: without a weak signal it stays below.
+    assert _looks_hard(_req("x" * 2000)) is False
+
+
+def test_question_word_is_not_hard_alone(heuristic_on):
+    assert _looks_hard(_req("why does this fail")) is False
+
+
+def test_russian_question_word_is_not_hard_alone(heuristic_on):
+    assert _looks_hard(_req("почему это падает")) is False
 
 
 # ---------------------------------------------------------------------------
@@ -136,15 +161,21 @@ def test_tool_choice_without_tools_is_not_hard(heuristic_on):
 
 
 # ---------------------------------------------------------------------------
-# weak signals combine into a hard turn
+# signals combine into a hard turn
 # ---------------------------------------------------------------------------
 
 
-def test_tools_plus_long_history_is_hard(heuristic_on):
-    assert _looks_hard(_req("hi", extra_messages=_history(7), tools=TOOLS)) is True
+def test_two_weak_signals_are_not_hard(heuristic_on):
+    # 1 + 1 stays below a threshold of 3.
+    assert _looks_hard(_req("hi", extra_messages=_history(7), tools=TOOLS)) is False
 
 
-def test_tools_plus_difficulty_is_hard(heuristic_on):
+def test_medium_prompt_plus_tools_is_hard(heuristic_on):
+    # 2 + 1 clears the threshold.
+    assert _looks_hard(_req("x" * 2000, tools=TOOLS)) is True
+
+
+def test_tools_plus_question_word_is_hard(heuristic_on):
     assert _looks_hard(_req("why does this fail", tools=TOOLS)) is True
 
 
@@ -195,7 +226,7 @@ def test_only_last_user_turn_is_inspected(heuristic_on):
 
 
 def test_multimodal_last_turn_is_flattened(heuristic_on):
-    parts = [{"type": "text", "text": "why does this break"}]
+    parts = [{"type": "text", "text": "refactor this module"}]
     req = _req(parts)
     assert _looks_hard(req) is True
 
@@ -227,7 +258,7 @@ def test_heuristic_does_not_flip_search(heuristic_on):
 
 
 def test_search_off_on_a_hard_turn(heuristic_on):
-    req = _req("why does this fail")
+    req = _req("refactor this module")
     assert _looks_hard(req) is True
     assert bool(req.search) is False
 

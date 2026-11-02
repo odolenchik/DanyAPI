@@ -273,23 +273,32 @@ class Settings:
         # provider default. Off by default so existing clients keep their exact
         # behavior; opt in with DANYAPI_THINKING_HEURISTIC=1.
         self.thinking_heuristic = os.environ.get("DANYAPI_THINKING_HEURISTIC", "").strip().lower() in ("1", "true", "yes", "on")
-        # A user turn at or above this many characters counts as hard.
+        # A user turn at or above this many characters counts as medium-hard.
         try:
             self.thinking_min_prompt_chars = max(1, int(os.environ.get("DANYAPI_THINKING_MIN_PROMPT_CHARS", "2000")))
         except ValueError:
             self.thinking_min_prompt_chars = 2000
+        # At or above this length the prompt is a strong signal on its own.
+        try:
+            self.thinking_long_prompt_chars = max(
+                self.thinking_min_prompt_chars,
+                int(os.environ.get("DANYAPI_THINKING_LONG_PROMPT_CHARS", "4000")),
+            )
+        except ValueError:
+            self.thinking_long_prompt_chars = 4000
         # A conversation with at least this many messages counts as hard.
         try:
             self.thinking_min_messages = max(1, int(os.environ.get("DANYAPI_THINKING_MIN_MESSAGES", "8")))
         except ValueError:
             self.thinking_min_messages = 8
-        # Hard-turn signals add up to a score; reaching the threshold turns
-        # thinking on. A strong signal (long prompt, error/difficulty cue)
-        # clears it alone; weak ones (long history, automatic tool round) must
-        # combine. Tunable so the balance can be adjusted without a code change.
-        self.thinking_strong_weight = self._int_env("DANYAPI_THINKING_STRONG_WEIGHT", 2, minimum=1)
+        # Hard-turn signals add up to a score across three levels; reaching the
+        # threshold turns thinking on. One strong signal clears it alone, a
+        # medium one needs a weak companion, and weak ones must stack. Tunable
+        # so the balance can be adjusted without a code change.
+        self.thinking_strong_weight = self._int_env("DANYAPI_THINKING_STRONG_WEIGHT", 3, minimum=1)
+        self.thinking_medium_weight = self._int_env("DANYAPI_THINKING_MEDIUM_WEIGHT", 2, minimum=1)
         self.thinking_weak_weight = self._int_env("DANYAPI_THINKING_WEAK_WEIGHT", 1, minimum=1)
-        self.thinking_score_threshold = self._int_env("DANYAPI_THINKING_SCORE_THRESHOLD", 2, minimum=1)
+        self.thinking_score_threshold = self._int_env("DANYAPI_THINKING_SCORE_THRESHOLD", 3, minimum=1)
 
         # Reviving DeepSeek accounts marked broken. A token is marked broken when
         # an auth probe fails, but that can mean only the network was down. A

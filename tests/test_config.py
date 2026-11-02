@@ -241,20 +241,23 @@ def test_thinking_thresholds_floor_at_one(settings_for):
 
 def test_thinking_score_defaults(settings_for):
     s = settings_for({})
-    assert s.thinking_strong_weight == 2
+    assert s.thinking_strong_weight == 3
+    assert s.thinking_medium_weight == 2
     assert s.thinking_weak_weight == 1
-    assert s.thinking_score_threshold == 2
+    assert s.thinking_score_threshold == 3
 
 
 def test_thinking_score_read_env(settings_for):
     s = settings_for(
         {
             "DANYAPI_THINKING_STRONG_WEIGHT": "5",
+            "DANYAPI_THINKING_MEDIUM_WEIGHT": "4",
             "DANYAPI_THINKING_WEAK_WEIGHT": "3",
             "DANYAPI_THINKING_SCORE_THRESHOLD": "7",
         }
     )
     assert s.thinking_strong_weight == 5
+    assert s.thinking_medium_weight == 4
     assert s.thinking_weak_weight == 3
     assert s.thinking_score_threshold == 7
 
@@ -263,24 +266,28 @@ def test_thinking_score_falls_back_on_bad_values(settings_for):
     s = settings_for(
         {
             "DANYAPI_THINKING_STRONG_WEIGHT": "abc",
+            "DANYAPI_THINKING_MEDIUM_WEIGHT": "x",
             "DANYAPI_THINKING_WEAK_WEIGHT": "",
             "DANYAPI_THINKING_SCORE_THRESHOLD": "1.5",
         }
     )
-    assert s.thinking_strong_weight == 2
+    assert s.thinking_strong_weight == 3
+    assert s.thinking_medium_weight == 2
     assert s.thinking_weak_weight == 1
-    assert s.thinking_score_threshold == 2
+    assert s.thinking_score_threshold == 3
 
 
 def test_thinking_score_floors_at_one(settings_for):
     s = settings_for(
         {
             "DANYAPI_THINKING_STRONG_WEIGHT": "0",
+            "DANYAPI_THINKING_MEDIUM_WEIGHT": "-1",
             "DANYAPI_THINKING_WEAK_WEIGHT": "-3",
             "DANYAPI_THINKING_SCORE_THRESHOLD": "0",
         }
     )
     assert s.thinking_strong_weight == 1
+    assert s.thinking_medium_weight == 1
     assert s.thinking_weak_weight == 1
     assert s.thinking_score_threshold == 1
 

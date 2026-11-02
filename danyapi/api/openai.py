@@ -679,9 +679,19 @@ _THINKING_ERROR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Specific engineering work: naming one of these is evidence the turn needs real
+# reasoning, not just a lookup. A strong signal clears the threshold alone.
+_THINKING_HARD_RE = re.compile(
+    r"\b(?:prove|analy[sz]e|optimi[sz]e|refactor|algorithm|debug)\b"
+    r"|докажи|проанализируй|оптимиз|архитектур|рефактор|алгоритм|отлад",
+    re.IGNORECASE,
+)
+
+# Everyday question words. They show up in ordinary questions as often as in
+# hard ones, so on their own they only nudge the score, never clear it.
 _THINKING_DIFFICULTY_RE = re.compile(
-    r"\b(?:why|prove|explain|analy[sz]e|optimi[sz]e|refactor|algorithm|debug)\b"
-    r"|почему|объясни|докажи|проанализируй|оптимиз|архитектур|рефактор|алгоритм|отлад",
+    r"\b(?:why|explain)\b"
+    r"|почему|объясни",
     re.IGNORECASE,
 )
 
@@ -706,11 +716,12 @@ def _thinking_text(req: ChatCompletionRequest) -> str:
 
 
 # A turn's signals add up to a "hard" score; reaching the threshold turns
-# thinking on. A long prompt or an error/difficulty cue is strong enough alone,
-# while a long history and an automatic tool round are weak hints that only
-# matter together. Weights and threshold live in settings so the balance can be
-# tuned via env (DANYAPI_THINKING_*_WEIGHT / _SCORE_THRESHOLD) without a code
-# change.
+# thinking on. Signals come in three levels: an error, a very long prompt or a
+# specific engineering word is strong enough alone, an ordinary question word
+# or a merely long prompt needs a weak companion, and a long history or an
+# automatic tool round are weak hints that only matter together. Weights and
+# threshold live in settings so the balance can be tuned via env
+# (DANYAPI_THINKING_*_WEIGHT / _SCORE_THRESHOLD) without a code change.
 
 
 def _tool_signal(req: ChatCompletionRequest) -> int:
@@ -736,15 +747,20 @@ def _looks_hard(req: ChatCompletionRequest) -> bool:
 
     Consulted only when the client sent neither ``thinking`` nor
     ``reasoning_effort`` and ``DANYAPI_THINKING_HEURISTIC`` is on. Signals add
-    up to a score; a strong one clears the threshold alone, weak ones must
-    combine. A short, plain prompt stays off.
+    up to a score; a strong one clears the threshold alone, a medium one needs
+    a weak companion, and weak ones must combine. A short, plain prompt stays
+    off.
     """
     text = _thinking_text(req)
     score = 0
-    if len(text) >= settings.thinking_min_prompt_chars:
+    if len(text) >= settings.thinking_long_prompt_chars:
         score += settings.thinking_strong_weight
-    if _THINKING_ERROR_RE.search(text) or _THINKING_DIFFICULTY_RE.search(text):
+    elif len(text) >= settings.thinking_min_prompt_chars:
+        score += settings.thinking_medium_weight
+    if _THINKING_ERROR_RE.search(text) or _THINKING_HARD_RE.search(text):
         score += settings.thinking_strong_weight
+    elif _THINKING_DIFFICULTY_RE.search(text):
+        score += settings.thinking_medium_weight
     if len(req.messages or []) >= settings.thinking_min_messages:
         score += settings.thinking_weak_weight
     score += _tool_signal(req)
