@@ -20,6 +20,7 @@ def test_defaults(settings_for):
     assert s.host == "0.0.0.0"
     assert s.port == 8000
     assert s.deepseek_tokens == []
+    assert s.deepseek_device_ids == []
     assert s.qwen_tokens == []
     assert s.deepseek_email == ""
     assert s.deepseek_password == ""
@@ -96,6 +97,20 @@ def test_deepseek_single_token_fallback(settings_for):
 def test_deepseek_tokens_win_over_single(settings_for):
     s = settings_for({"DEEPSEEK_TOKENS": "a,b", "DEEPSEEK_TOKEN": "solo"})
     assert s.deepseek_tokens == ["a", "b"]
+
+
+def test_deepseek_device_ids_empty_by_default(settings_for):
+    assert settings_for({"DEEPSEEK_TOKENS": "a"}).deepseek_device_ids == []
+
+
+def test_deepseek_device_ids_paired_by_position(settings_for):
+    s = settings_for({"DEEPSEEK_TOKENS": "a,b", "DEEPSEEK_DEVICE_IDS": " d1 , d2 "})
+    assert s.deepseek_device_ids == ["d1", "d2"]
+
+
+def test_deepseek_device_ids_length_mismatch_raises(settings_for):
+    with pytest.raises(ValueError):
+        settings_for({"DEEPSEEK_TOKENS": "a,b", "DEEPSEEK_DEVICE_IDS": "d1"})
 
 
 def test_qwen_tokens_comma(settings_for):

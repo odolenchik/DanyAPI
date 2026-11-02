@@ -84,7 +84,8 @@ async def lifespan(app: FastAPI):
         qwen_disabled_reason = ""
         if settings.deepseek_tokens:
             for i, token in enumerate(settings.deepseek_tokens):
-                client = DeepSeekClient(token=token, timeout=settings.timeout)
+                device_id = settings.deepseek_device_ids[i] if settings.deepseek_device_ids else None
+                client = DeepSeekClient(token=token, device_id=device_id, timeout=settings.timeout)
                 status = await client.check_auth()
                 if status is AuthCheck.REJECTED:
                     # The token was answered for and refused. Keep it in the pool

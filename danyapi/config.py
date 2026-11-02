@@ -41,6 +41,14 @@ class Settings:
         if not tokens and single:
             tokens = [single]
         self.deepseek_tokens = tokens
+        # The `did` each token was issued to, parallel to DEEPSEEK_TOKENS by
+        # position. A browser keeps one value for months; a fresh UUID per
+        # process makes every restart look like a new device holding the same
+        # token. Leave empty to keep the old per-process behaviour.
+        device_ids = [d.strip() for d in os.environ.get("DEEPSEEK_DEVICE_IDS", "").split(",") if d.strip()]
+        if device_ids and len(device_ids) != len(tokens):
+            raise ValueError(f"DEEPSEEK_DEVICE_IDS has {len(device_ids)} entries but DEEPSEEK_TOKENS has {len(tokens)}; they are paired by position")
+        self.deepseek_device_ids = device_ids
         self.deepseek_email = os.environ.get("DEEPSEEK_EMAIL", "")
         self.deepseek_password = os.environ.get("DEEPSEEK_PASSWORD", "")
         qwen_tokens = [t.strip() for t in os.environ.get("QWEN_TOKENS", "").split(",") if t.strip()]

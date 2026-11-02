@@ -888,6 +888,7 @@ def _patch_creds(ds_tokens=None, ds_email="", qwen_tokens=None, qwen_email="", c
     stack = ExitStack()
     for patch_cm in (
         patch.object(settings, "deepseek_tokens", ds_tokens or []),
+        patch.object(settings, "deepseek_device_ids", []),
         patch.object(settings, "qwen_tokens", qwen_tokens or []),
         patch.object(settings, "deepseek_email", ds_email),
         patch.object(settings, "qwen_email", qwen_email),
@@ -923,6 +924,7 @@ def test_deepseek_rejected_kept_broken():
 
     with (
         patch.object(settings, "deepseek_tokens", ["bad"]),
+        patch.object(settings, "deepseek_device_ids", []),
         patch.object(settings, "qwen_tokens", []),
         patch.object(settings, "deepseek_email", ""),
         patch.object(settings, "qwen_email", ""),
@@ -946,6 +948,7 @@ def test_deepseek_unreachable_used_optimistically():
 
     with (
         patch.object(settings, "deepseek_tokens", ["tok"]),
+        patch.object(settings, "deepseek_device_ids", []),
         patch.object(settings, "qwen_tokens", []),
         patch.object(settings, "deepseek_email", ""),
         patch.object(settings, "qwen_email", ""),
@@ -965,6 +968,7 @@ def test_deepseek_email_login():
 
     with (
         patch.object(settings, "deepseek_tokens", []),
+        patch.object(settings, "deepseek_device_ids", []),
         patch.object(settings, "qwen_tokens", []),
         patch.object(settings, "deepseek_email", "a@b.c"),
         patch.object(settings, "deepseek_password", "pw"),
@@ -991,6 +995,7 @@ def test_qwen_email_login():
 
     with (
         patch.object(settings, "deepseek_tokens", []),
+        patch.object(settings, "deepseek_device_ids", []),
         patch.object(settings, "qwen_tokens", []),
         patch.object(settings, "deepseek_email", ""),
         patch.object(settings, "qwen_email", "a@b.c"),
@@ -1553,6 +1558,7 @@ def test_lifespan_qwen_invalid_token():
     stack = ExitStack()
     for patch_cm in (
         patch.object(settings, "deepseek_tokens", []),
+        patch.object(settings, "deepseek_device_ids", []),
         patch.object(settings, "qwen_tokens", ["bad"]),
         patch.object(settings, "deepseek_email", ""),
         patch.object(settings, "qwen_email", ""),
