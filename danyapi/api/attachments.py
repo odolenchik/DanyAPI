@@ -95,7 +95,7 @@ async def _fresh_pow_upload_headers(account) -> dict:
     try:
         return await account.pow_upload.make_header(lambda: account.client.create_pow_challenge("/api/v0/file/upload_file"))
     except DeepSeekError as exc:
-        _handle_account_error(account, exc)
+        _handle_account_error(account, exc, "upload pow challenge")
         raise HTTPException(_deepseek_status(exc), _deepseek_error_detail(exc)) from exc
 
 
@@ -113,7 +113,7 @@ async def _upload_attachments(account, attachments: list[Attachment], model_type
                 pow_headers=pow_headers,
             )
         except DeepSeekError as exc:
-            _handle_account_error(account, exc)
+            _handle_account_error(account, exc, "file upload")
             raise HTTPException(_deepseek_status(exc), f"file upload failed: {exc}") from exc
         file_id = info.get("id")
         if not file_id:

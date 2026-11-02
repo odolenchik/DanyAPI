@@ -661,7 +661,10 @@ def test_model_type_mapping():
     }
 
 
-async def test_search_gated_to_chat_models_and_thinking_allowed():
+async def test_search_gated_to_chat_models_and_thinking_allowed(monkeypatch):
+    # Provider defaults are what this test pins down, so keep the per-turn
+    # heuristic out of it regardless of what the environment sets.
+    monkeypatch.setattr(openai_mod.settings, "thinking_heuristic", False)
     captured = {}
     orig = openai_mod._collect_non_stream
 

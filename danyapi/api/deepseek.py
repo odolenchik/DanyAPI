@@ -144,20 +144,20 @@ def _deepseek_error_detail(exc: DeepSeekError) -> str:
     return f"DeepSeek error: {exc}"
 
 
-def _handle_account_error(account: DeepSeekAccount, exc: Exception) -> None:
+def _handle_account_error(account: DeepSeekAccount, exc: Exception, stage: str) -> None:
     code = getattr(exc, "biz_code", None)
     if code in DEEPSEEK_AUTH_ERROR_CODES:
         account.mark_broken()
-        log.warning("account #%d auth error %s: %s", account.index, code, exc)
+        log.warning("account #%d auth error at %s %s: %s", account.index, stage, code, exc)
     else:
-        log.warning("account #%d error: %s", account.index, exc)
+        log.warning("account #%d error at %s: %s", account.index, stage, exc)
 
 
 async def _fresh_pow_headers(account) -> dict:
     try:
         return await account.pow.make_header(account.client.create_pow_challenge)
     except DeepSeekError as exc:
-        _handle_account_error(account, exc)
+        _handle_account_error(account, exc, "chat pow challenge")
         raise HTTPException(_deepseek_status(exc), _deepseek_error_detail(exc)) from exc
 
 
@@ -295,7 +295,7 @@ async def _prepare_session(
     try:
         session, session_key = await account.sessions.obtain(existing_sid)
     except DeepSeekError as exc:
-        _handle_account_error(account, exc)
+        _handle_account_error(account, exc, "session create")
         raise HTTPException(_deepseek_status(exc), _deepseek_error_detail(exc)) from exc
     if session_key != existing_sid:
         pool.register(account.index, session_key)

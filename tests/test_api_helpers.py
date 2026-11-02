@@ -288,13 +288,13 @@ def test_deepseek_error_detail():
 
 def test_handle_account_error_auth():
     acct = FakeAccount()
-    openai_mod._handle_account_error(acct, DeepSeekError(40001, "bad"))
+    openai_mod._handle_account_error(acct, DeepSeekError(40001, "bad"), "chat pow challenge")
     assert acct.broken
 
 
 def test_handle_account_error_other():
     acct = FakeAccount()
-    openai_mod._handle_account_error(acct, DeepSeekError(5000, "bad"))
+    openai_mod._handle_account_error(acct, DeepSeekError(5000, "bad"), "session create")
     assert not acct.broken
 
 
