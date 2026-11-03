@@ -1646,3 +1646,59 @@ return reasoning_effort != "off"
 
 **Проверено.** В `DanyAPI` и обеих копиях: `ruff check`,
 `ruff format --check`, `arch-check OK`, `pytest -q` → **1681 passed**.
+
+## Отказ по содержимому — 400, а не 429 (2026-11-04)
+
+Симптом: цензура DeepSeek отклонила загруженное фото, и клиент получил
+**HTTP 429** «DeepSeek server is busy, try again later». Живой запрос на
+`DanyAPI3` (порт 6660) с картинкой 5.6 МБ:
+
+```
+deepseek upload file OK: image_0.png (1055ms)
+deepseek create session OK (311ms)
+POST /v1/chat/completions 429
+{"detail":"{\"error\": {\"message\": \"Content violates terms. Message not sent.\",
+ \"finish_reason\": \"file_audit_reject\"}}"}
+```
+
+**Причина.** `api/streaming.py` в non-stream пути превращал в 429 **любой**
+`hint_error` без разбора `finish_reason`; `_is_rate_limit_hint` вызывался, но
+его результат шёл только в лог. 429 есть в `RETRYABLE_HTTP_STATUSES` и сам
+провоцирует повтор, поэтому клиент бесконечно перезаливал одно и то же
+отклонённое фото. Правильная обработка (`blank_answer_reason`,
+`blank_answer_finish_reason`) уже существовала, но была недостижима: проверка
+`hint_error` стояла выше. В stream-пути отказ уже отдавался корректно — отсюда
+асимметрия.
+
+**`danyapi/retry.py`.** Добавлен `is_content_refusal(rec)` — пустой ответ с
+подсказкой, которая не троттлинг (`RATE_LIMIT_HINT_REASONS`/маркеры) и не
+занятость (`RETRYABLE_FINISH_REASONS`). `RETRYABLE_FINISH_REASONS` перенесён
+сюда из `api/deepseek.py` (нижний слой, `api/deepseek.py` реэкспортирует его
+через существующий `from ..retry import`) — иначе классификатор в `retry.py`
+не смог бы отличить занятость от отказа без циклического импорта.
+
+**`danyapi/api/streaming.py`.** Non-stream ветка теперь разводит три случая:
+троттлинг → 429 (как было), занятость после ретраев → 429 (как было),
+отказ по содержимому → **400** с телом
+`{"error": {"message", "finish_reason", "type": "content_refusal"}}`.
+Сессия не запоминает `parent_message_id` отказа (апстрим его не сохранил).
+
+**Тесты.** `tests/test_retry.py` +2: отказ даёт 400 (а не 429) с настоящей
+причиной и не трогает сессию; отказ не ретраится (одна попытка вместо
+`MAX_RETRIES + 1`). Файл: 51 тест.
+
+**Проверено.** `ruff check`, `ruff format --check`, `arch-check OK`,
+`pytest -q` → **1683 passed** в `DanyAPI`; в `DanyAPI2`/`DanyAPI3`
+синхронизировано, `test_retry.py` → 51 passed. E2E на 6660 после перезапуска:
+то же фото → **400**
+`{"error": {"message": "Content violates terms. Message not sent.",
+"finish_reason": "file_audit_reject", "type": "content_refusal"}}`,
+в логе `content refusal where=non-stream ... reason=file_audit_reject`, одна
+попытка, ретраев нет.
+
+**Не проверено / осталось.**
+- Отдельно замечен `40301 INVALID_POW_RESPONSE` на загрузке (1 раз из 4):
+  `_upload_attachments` не ретраит сбой PoW и отдаёт 502. К цензуре отношения
+  не имеет, в `BACKLOG.md` не заносил.
+- `deepseek-v4-pro` и `deepseek-v4-vision` на вебе обслуживает одна модель
+  V4.1-Flash, `model_type` режим не переключает.

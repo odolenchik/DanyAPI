@@ -918,3 +918,40 @@ async def test_stream_rate_limit_hint_logs_and_emits_error(caplog):
     joined = "".join(lines)
     assert "too_frequent" in joined
     assert "where=stream" in caplog.text
+
+
+# A moderation refusal arrives as an error hint with a non-throttle reason and
+# no content. Reported as 429, it told the client to retry the same refused
+# upload forever; it must be a 400 naming the real reason instead.
+FILE_AUDIT_REJECT_SSE = (
+    "event: ready\n"
+    'data: {"request_message_id":1,"response_message_id":2,"model_type":"vision"}\n'
+    "\n"
+    "event: hint\n"
+    'data: {"type":"error","content":"Content violates terms. Message not sent.","finish_reason":"file_audit_reject"}\n'
+    "\n"
+    "event: close\n"
+    'data: {"click_behavior":"retry","auto_resume":false}\n'
+    "\n"
+)
+
+
+async def test_non_stream_content_refusal_is_400_not_429():
+    acct = FakeAccount([FILE_AUDIT_REJECT_SSE])
+    with pytest.raises(openai_mod.HTTPException) as excinfo:
+        await _collect_non_stream(**_args(acct))
+    assert excinfo.value.status_code == 400
+    detail = json.loads(excinfo.value.detail)
+    assert detail["error"]["type"] == "content_refusal"
+    assert detail["error"]["finish_reason"] == "file_audit_reject"
+    assert "Content violates terms" in detail["error"]["message"]
+    # The refusal never stored a message upstream, so the session must not
+    # remember a parent pointer for it.
+    acct.sessions.touch_last_message.assert_not_called()
+
+
+async def test_non_stream_content_refusal_does_not_retry():
+    acct = FakeAccount([FILE_AUDIT_REJECT_SSE] * (openai_mod.MAX_RETRIES + 1))
+    with pytest.raises(openai_mod.HTTPException):
+        await _collect_non_stream(**_args(acct))
+    assert acct.client.completion.await_count == 1

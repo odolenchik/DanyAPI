@@ -51,6 +51,7 @@ from .deepseek import (
     _try_stop_stream,
     blank_answer_finish_reason,
     blank_answer_reason,
+    is_content_refusal,
 )
 from .models import CONTEXT_LENGTH_STATUS, INPUT_EXCEEDS_LIMIT, MAX_CONTINUE_ROUNDS, _deepseek_usage, _finish_reason
 
@@ -1123,7 +1124,36 @@ async def _collect_non_stream(
                     model=model,
                     elapsed_ms=(time.monotonic() - started) * 1000,
                 )
-            raise HTTPException(429, _busy_error_body(rec))
+                raise HTTPException(429, _busy_error_body(rec))
+            if _is_retryable_hint(rec):
+                # Upstream busy states (expert_busy_use_default, server_busy, …)
+                # are retried above; once the retries are exhausted the account is
+                # merely occupied, so the client should back off, not fix input.
+                raise HTTPException(429, _busy_error_body(rec))
+            if is_content_refusal(rec):
+                # Moderation refused the content, not the rate. 429 would tell
+                # the client to retry the same request forever, re-uploading the
+                # refused file each time; 400 says the input is the problem.
+                log.warning(
+                    "content refusal where=non-stream session=%s request=%s reason=%s",
+                    session_key,
+                    request_id,
+                    blank_answer_finish_reason(rec),
+                )
+                raise HTTPException(
+                    400,
+                    json.dumps(
+                        {
+                            "error": {
+                                "message": blank_answer_reason(rec),
+                                "finish_reason": blank_answer_finish_reason(rec),
+                                "type": "content_refusal",
+                            }
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            raise HTTPException(502, _busy_error_body(rec))
 
         # A blank reply is never a success: a content-policy refusal or a bare
         # notice arrives with no content, and passing it on as "stop" makes the

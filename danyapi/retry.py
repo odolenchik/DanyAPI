@@ -28,6 +28,17 @@ RETRYABLE_HTTP_STATUSES: set[int] = {408, 425, 429, 500, 502, 503, 504}
 RATE_LIMIT_HINT_REASONS: set[str] = {"too_frequent"}
 RATE_LIMIT_HINT_MARKERS: tuple[str, ...] = ("too frequent", "rate limit", "too many requests")
 
+# Upstream busy states, reported as hints. They are retried within a turn and,
+# once the retries run out, must stay 429 — the account is healthy, it is just
+# occupied. Anything outside both this set and RATE_LIMIT_HINT_REASONS that
+# arrives as an empty-answer hint is a refusal of the content itself.
+RETRYABLE_FINISH_REASONS: set[str] = {
+    "expert_busy_use_default",
+    "parallel_chat_limit",
+    "server_busy",
+    "busy",
+}
+
 # Windows (seconds) over which request starts are counted when a rate-limit hint
 # is logged. Diagnostics only — nothing reads them to make decisions, they are
 # just the traffic figures a pacing threshold would be derived from.
@@ -155,3 +166,26 @@ def blank_answer_finish_reason(rec) -> str:
     if getattr(rec, "status", None) == CONTENT_FILTER_STATUS:
         return "content_filter"
     return "error"
+
+
+def is_content_refusal(rec) -> bool:
+    """True when the upstream refused the *content*, not the request rate.
+
+    A moderation refusal ("Content violates terms", finish_reason
+    ``file_audit_reject``) arrives as the same empty-answer hint as a throttle.
+    It must not be reported as 429: the request will never succeed, so a client
+    that honours 429 retries it forever, re-uploading the same refused file.
+    A hint whose reason is a throttle, or whose text reads like one, is not a
+    refusal.
+    """
+    if getattr(rec, "content", "") or getattr(rec, "reasoning", ""):
+        return False
+    hint = getattr(rec, "hint_error", None)
+    if not hint:
+        return False
+    if _is_rate_limit_hint(rec):
+        return False
+    reason = hint.get("finish_reason")
+    if isinstance(reason, str) and reason in RETRYABLE_FINISH_REASONS:
+        return False
+    return True

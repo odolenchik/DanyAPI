@@ -20,6 +20,7 @@ from ..retry import (  # noqa: F401
     MAX_RETRIES,
     RETRY_BACKOFF_MAX_SEC,
     RETRY_BACKOFF_SEC,
+    RETRYABLE_FINISH_REASONS,
     RETRYABLE_HTTP_STATUSES,
     _drop_session,
     _is_rate_limit_hint,
@@ -28,6 +29,7 @@ from ..retry import (  # noqa: F401
     _log_rate_limit_hint,
     blank_answer_finish_reason,
     blank_answer_reason,
+    is_content_refusal,
 )
 from ..tooltrace import ToolTraceLogger
 from .models import CONTEXT_LENGTH_STATUS, CONTINUE_PROMPT, INPUT_EXCEEDS_LIMIT
@@ -72,13 +74,6 @@ def _loop_hit(
     )
     return True
 
-
-RETRYABLE_FINISH_REASONS = {
-    "expert_busy_use_default",
-    "parallel_chat_limit",
-    "server_busy",
-    "busy",
-}
 
 DEEPSEEK_AUTH_ERROR_CODES = {40001, 40002, 40003, 40012, 40029}
 
