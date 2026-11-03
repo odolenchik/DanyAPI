@@ -59,6 +59,26 @@ def test_reasoning_effort_high_beats_a_plain_short_turn(heuristic_on):
     assert _resolve_thinking(_req("hi", reasoning_effort="high"), default=False) is True
 
 
+@pytest.mark.parametrize("effort", ["off", "OFF", "Off", " off ", "none", "NONE", "disabled", "Disabled"])
+def test_reasoning_effort_off_is_case_and_space_insensitive(heuristic_on, effort):
+    """Every documented spelling of "do not think" must switch thinking off."""
+    stack = "Traceback (most recent call last):\n  File x.py"
+    assert _resolve_thinking(_req(stack, reasoning_effort=effort), default=True) is False
+
+
+@pytest.mark.parametrize("effort", ["low", "HIGH", "max", "minimal", "medium"])
+def test_reasoning_effort_on_spellings_enable_thinking(heuristic_on, effort):
+    assert _resolve_thinking(_req("hi", reasoning_effort=effort), default=False) is True
+
+
+@pytest.mark.parametrize("effort", ["", "   "])
+def test_blank_reasoning_effort_counts_as_unset(heuristic_on, effort):
+    """A blank field is what some SDKs send for an unset value; it must not
+    force thinking on and must fall through to the heuristic."""
+    assert _resolve_thinking(_req("hi", reasoning_effort=effort), default=False) is False
+    assert _resolve_thinking(_req("x" * 4000, reasoning_effort=effort), default=False) is True
+
+
 # ---------------------------------------------------------------------------
 # heuristic off: provider default wins (regression guard)
 # ---------------------------------------------------------------------------

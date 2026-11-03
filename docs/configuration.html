@@ -109,6 +109,14 @@
                             <tr><td><span class="env-var">DANYAPI_LOOP_REPEATS</span></td><td><code>15</code></td><td>How many times the same block of lines must repeat back to back before the stream is aborted</td></tr>
                             <tr><td><span class="env-var">DANYAPI_LOOP_MAX_PERIOD</span></td><td><code>40</code></td><td>Longest repeating block, in lines, the loop guard will recognise (1 catches a single repeated line)</td></tr>
                             <tr><td><span class="env-var">DANYAPI_DEGENERATE_THRESHOLD</span></td><td><code>20</code></td><td data-i18n="cf_r17_desc">Number of adjacent empty-container repeats that declares a stream degenerate</td></tr>
+                            <tr><td><span class="env-var">DANYAPI_THINKING_HEURISTIC</span></td><td><code>0</code></td><td>Decide thinking per turn when the client sends neither <code>thinking</code> nor <code>reasoning_effort</code>; <code>1</code>/<code>true</code>/<code>yes</code>/<code>on</code> enables it. Signals below add up to a score, and reaching <code>DANYAPI_THINKING_SCORE_THRESHOLD</code> turns thinking on</td></tr>
+                            <tr><td><span class="env-var">DANYAPI_THINKING_MIN_PROMPT_CHARS</span></td><td><code>2000</code></td><td>A last-user-turn prompt at or above this many characters scores as medium-hard</td></tr>
+                            <tr><td><span class="env-var">DANYAPI_THINKING_LONG_PROMPT_CHARS</span></td><td><code>4000</code></td><td>A prompt at or above this length is a strong signal on its own; never below <code>DANYAPI_THINKING_MIN_PROMPT_CHARS</code></td></tr>
+                            <tr><td><span class="env-var">DANYAPI_THINKING_MIN_MESSAGES</span></td><td><code>8</code></td><td>A conversation with at least this many messages scores as a weak hint</td></tr>
+                            <tr><td><span class="env-var">DANYAPI_THINKING_STRONG_WEIGHT</span></td><td><code>3</code></td><td>Score for a strong signal: an error/stack trace, an engineering word (<code>prove</code>, <code>refactor</code>, <code>debug</code>, <code>оптимиз</code>, …) or a very long prompt</td></tr>
+                            <tr><td><span class="env-var">DANYAPI_THINKING_MEDIUM_WEIGHT</span></td><td><code>2</code></td><td>Score for a medium signal: an ordinary question word (<code>why</code>, <code>explain</code>, <code>почему</code>) or a merely long prompt</td></tr>
+                            <tr><td><span class="env-var">DANYAPI_THINKING_WEAK_WEIGHT</span></td><td><code>1</code></td><td>Score for a weak hint: a long history or an automatic (<code>tool_choice</code> unset/<code>auto</code>) tool round</td></tr>
+                            <tr><td><span class="env-var">DANYAPI_THINKING_SCORE_THRESHOLD</span></td><td><code>3</code></td><td>Score needed to enable thinking; one strong signal clears it alone</td></tr>
                         </tbody>
                     </table>
                 </div>

@@ -1564,3 +1564,67 @@ ruff; это отдельная задача, в перенос не входи�
 - `DEEPSEEK_DEVICE_IDS` прописан в `.env` только у `DanyAPI2`; в `DanyAPI`
   и `DanyAPI3` переменной нет, там по-прежнему случайный UUID на процесс.
   Код во всех трёх копиях одинаковый.
+## Нормализация `reasoning_effort` в thinking (2026-11-04)
+
+Симптом: клиент, который просит «не думать», получал thinking и втрое больше
+токенов. Живой запрос на `DanyAPI3` (порт 6660, до правки): длинный «сложный»
+промпт с `reasoning_effort="none"` → `reasoning_content` 534 симв.,
+2872 completion-tokens против 1445 без поля.
+
+**Причина.** `_resolve_thinking` сравнивал значение буквально:
+
+```python
+return reasoning_effort != "off"
+```
+
+`"OFF"`, `"none"` (штатное выключение в Anthropic-формате DeepSeek,
+см. Thinking Mode), `"none "`, `"disabled"` и пустая строка считались
+«включить», причём пустая строка ещё и обходила эвристику целиком.
+
+**`danyapi/api/openai.py`.** Добавлены `_THINKING_OFF_EFFORTS` =
+`{"off", "none", "disabled"}` и `_normalized_effort` (strip + lower, `""`
+для не-строки и для пустого значения). `_resolve_thinking` теперь: явный
+`thinking` → нормализованный `reasoning_effort` (непустой) → эвристика →
+дефолт провайдера. Пустое значение считается незаданным и проваливается в
+эвристику, а не форсит включение.
+
+**`tests/test_thinking_heuristic.py`.** +15 кейсов: параметризованные
+написания выключения (`off`/`OFF`/`Off`/` off `/`none`/`NONE`/`disabled`/
+`Disabled`), включения (`low`/`HIGH`/`max`/`minimal`/`medium`) и пустое
+значение (`""`, `"   "`), которое не должно ни форсить thinking, ни мешать
+эвристике. Файл: 52 теста.
+
+**Поведение эвристики не менялось.** Решено оставить как есть: при
+`DANYAPI_THINKING_HEURISTIC=1` эвристика перебивает дефолт модели, в том
+числе `expert`-дефолт у `deepseek-v4-pro` и `True` у Qwen. На живом инстансе
+`deepseek-v4-pro` с коротким промптом и без полей даёт thinking выключенным —
+это подтверждённое, а не случайное поведение.
+
+**Проверено.** `ruff check` + `ruff format --check` + `pytest -q` →
+**1681 passed**. E2E на временном инстансе (`DANYAPI_PORT=59969`,
+`DANYAPI_THINKING_HEURISTIC=1`):
+
+| запрос | результат |
+|---|---|
+| длинный сложный + `reasoning_effort="none"` | thinking **выкл** |
+| длинный сложный + `reasoning_effort="OFF"` | thinking **выкл** |
+| короткий простой + `reasoning_effort="OFF"` | thinking **выкл** |
+| короткий простой + `reasoning_effort=""` | thinking **выкл** |
+| длинный сложный + `reasoning_effort=""` | thinking **вкл** (эвристика) |
+| длинный сложный + `reasoning_effort="high"` | thinking **вкл** |
+| короткий простой, поля не заданы | thinking **выкл** |
+| длинный сложный, поля не заданы | thinking **вкл** |
+
+Отдельно проверено, что флаг вообще работает на веб-бэкенде:
+`thinking=false` → без `reasoning_content` (48 completion-tokens),
+`thinking=true` → 75 симв. рассуждений (108 токенов). `model_type`
+(`default`/`expert`/`vision`) сам по себе режим не переключает: `pro` и
+`vision` с явным `thinking=true` думают так же, как `flash`.
+
+**Не проверено / осталось.**
+- Правка сделана только в `DanyAPI`. `DanyAPI2` и `DanyAPI3` — без `.git`,
+  код в них пока старый; при синхронизации перенести
+  `danyapi/api/openai.py` и `tests/test_thinking_heuristic.py`.
+- `docs/configuration.html` по-прежнему не описывает ни одну
+  `DANYAPI_THINKING_*` (переменные есть только в `.env.example`).
+- Не коммичено: `danyapi/api/openai.py`, `tests/test_thinking_heuristic.py`.

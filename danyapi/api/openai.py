@@ -768,18 +768,35 @@ def _looks_hard(req: ChatCompletionRequest) -> bool:
     return score >= settings.thinking_score_threshold
 
 
+# Values a client uses to say "do not think". DeepSeek's own API spells it
+# "none" (Anthropic format) and Kimi's clients send "off"; "disabled" is the
+# OpenAI-compatible wording. Anything else that is not blank turns thinking on.
+_THINKING_OFF_EFFORTS = frozenset({"off", "none", "disabled"})
+
+
+def _normalized_effort(value: object) -> str:
+    """Lower-case a ``reasoning_effort`` value, or return "" when it is unset.
+
+    Clients disagree on spelling and casing ("off", "OFF", "none", "none "),
+    and some serialize an unset field as an empty string. Normalising here
+    keeps a blank value from reading as "enabled".
+    """
+    return value.strip().lower() if isinstance(value, str) else ""
+
+
 def _resolve_thinking(req: ChatCompletionRequest, *, default: bool) -> bool:
     """Resolve thinking flag from client request.
 
     Priority: explicit ``thinking`` field > ``reasoning_effort`` (Kimi) >
     per-turn difficulty heuristic (opt-in) > provider default.
-    Kimi sends reasoning_effort="low"|"medium"|"high"; any non-"off" value means enabled.
+    ``reasoning_effort`` is compared case-insensitively after stripping; a
+    blank value counts as unset so it cannot silently force thinking on.
     """
     if req.thinking is not None:
         return req.thinking
-    reasoning_effort = getattr(req, "reasoning_effort", None)
-    if reasoning_effort is not None:
-        return reasoning_effort != "off"
+    effort = _normalized_effort(getattr(req, "reasoning_effort", None))
+    if effort:
+        return effort not in _THINKING_OFF_EFFORTS
     if settings.thinking_heuristic:
         return _looks_hard(req)
     return default
