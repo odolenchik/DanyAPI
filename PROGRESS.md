@@ -1628,3 +1628,21 @@ return reasoning_effort != "off"
 - `docs/configuration.html` по-прежнему не описывает ни одну
   `DANYAPI_THINKING_*` (переменные есть только в `.env.example`).
 - Не коммичено: `danyapi/api/openai.py`, `tests/test_thinking_heuristic.py`.
+## Документация только в `DanyAPI/` (2026-11-04)
+
+Чтобы не множить сущности, вся проза живёт теперь в одной копии. В
+`DanyAPI2/` и `DanyAPI3/` файлы `README.md`, `architecture.md`, `PROGRESS.md`,
+`BACKLOG.md` и `docs/*.md` заменены короткими указателями на
+`../DanyAPI/...`; правила добавлены в `AGENTS.md` и `CLAUDE.md` обеих копий
+(блок «Это рабочая копия» и пути в разделе Routing) и в `AGENTS.md` самой
+`DanyAPI/`.
+
+**Что не тронуто.** В `docs/` лежит не только документация: `install.sh`,
+`install.ps1`, `setup.py`, `start.py`, `setup.sh`, `setup.bat` — установщик
+(`README.md:44,56` велит запускать `docs/setup.py` и `docs/start.py`, а
+`docs/index.html:70` раздаёт `curl .../docs/install.sh | bash`), плюс HTML-сайт
+справки (`*.html`, `i18n.js`, `site.js`, `style.css`, `theme.js`). Всё это
+осталось в копиях без изменений.
+
+**Проверено.** В `DanyAPI` и обеих копиях: `ruff check`,
+`ruff format --check`, `arch-check OK`, `pytest -q` → **1681 passed**.
