@@ -131,6 +131,20 @@ At least one valid DeepSeek or Qwen credential is required; otherwise the server
 |----------|---------|-------------|
 | `DANYAPI_HUMAN_DELAY_MIN` | `0.5` | Minimum delay in seconds before sending a request |
 | `DANYAPI_HUMAN_DELAY_MAX` | `3.0` | Maximum delay in seconds before sending a request |
+| `DANYAPI_SEARCH_ALWAYS_ON` | empty | Keep DeepSeek's web search enabled on every turn, like a search button left pressed for the whole chat. The provider then searches only when the prompt asks for it in words. A request field `"search": true` still works per request |
+
+### Web search
+
+DeepSeek's own web search is a per-turn toggle, not a tool call: the flag asks the
+provider to search, and the results are merged into the same answer, so a client
+gets the search context without any URLs. Set `"search": true` in the request, or
+set `DANYAPI_SEARCH_ALWAYS_ON=1` to leave the toggle on for every turn — then a
+prompt that says "search the internet for …" triggers a search while an ordinary
+turn is answered normally.
+
+Two limits worth knowing: search is unavailable on `deepseek-v4-vision`, and the
+citation markers DeepSeek puts in its answer (`[citation:3]`) carry no URLs, so
+DanyAPI cannot turn them into `url_citation` annotations.
 
 ### Tool-call trace (diagnostics)
 

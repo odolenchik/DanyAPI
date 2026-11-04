@@ -352,3 +352,26 @@ async def test_route_flag_off_uses_provider_default(monkeypatch):
 async def test_route_explicit_thinking_still_wins(heuristic_on, monkeypatch):
     captured = await _run_deepseek_route(monkeypatch, "hi", extra={"thinking": True})
     assert captured["thinking"] is True
+
+
+async def test_route_search_follows_the_request_flag(monkeypatch):
+    monkeypatch.setattr(settings, "search_always_on", False)
+    captured = await _run_deepseek_route(monkeypatch, "hi")
+    assert captured["search"] is False
+    captured = await _run_deepseek_route(monkeypatch, "hi", extra={"search": True})
+    assert captured["search"] is True
+
+
+async def test_route_search_always_on_keeps_the_toggle_pressed(monkeypatch):
+    # The web client's search button stays pressed for the whole chat; the
+    # provider still decides per turn whether to search.
+    monkeypatch.setattr(settings, "search_always_on", True)
+    captured = await _run_deepseek_route(monkeypatch, "hi")
+    assert captured["search"] is True
+
+
+async def test_route_search_always_on_still_excludes_vision(monkeypatch):
+    # vision has no search mode, so the always-on toggle cannot enable it.
+    monkeypatch.setattr(settings, "search_always_on", True)
+    captured = await _run_deepseek_route(monkeypatch, "hi", extra={"model": "deepseek-v4-vision"})
+    assert captured["search"] is False

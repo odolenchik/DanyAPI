@@ -906,7 +906,7 @@ async def _chat_completions_deepseek(req: ChatCompletionRequest) -> Any:
 
     model_type = _resolve_model(req.model)
     thinking = _resolve_thinking(req, default=model_type == "expert")
-    search = bool(req.search) and model_type in SEARCH_CAPABLE_MODEL_TYPES
+    search = (bool(req.search) or settings.search_always_on) and model_type in SEARCH_CAPABLE_MODEL_TYPES
 
     context_seq = toolemu.context_sequence(req.messages, user=getattr(req, "user", None))
     if req.session_id:

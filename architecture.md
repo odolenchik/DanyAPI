@@ -109,6 +109,11 @@ Qwen reattaches the same way (`QwenSessionRegistry._attach`): `QwenClient.fetch_
 ### Sticky Image Chats (Qwen)
 Qwen starts rate-limiting image generation once an account opens many new chats, and repeated creation can block the account for a day. `QwenAccount` therefore pins one image chat per **account + image model** in a `qwen-sticky` JsonStore (`sticky_image_chat` / `set_sticky_image_chat`). `collect_image` reuses that pinned chat for every prompt when the client sends no `session_id` (an explicit `session_id` is honoured and does not overwrite the pin), and reattaches it via `sessions.attach(..., chat_type="t2i")` if its local registry entry was lost. Image sessions are created with `chat_type="t2i"` so upstream keys them as image chats.
 
+### Web Search
+DeepSeek's web search is a per-turn flag, not a tool call: `search_enabled` in the completion request asks the provider to search, and the results are merged into the same answer. `api/openai.py` computes it as `(bool(req.search) or settings.search_always_on) and model_type in SEARCH_CAPABLE_MODEL_TYPES`, so `deepseek-v4-flash` and `deepseek-v4-pro` can search while `deepseek-v4-vision` cannot. `DANYAPI_SEARCH_ALWAYS_ON` keeps the flag on for every turn, the way the web client's search button stays pressed for the whole chat; the provider then searches only on turns whose prompt asks for it. The flag is carried through all four DeepSeek paths including continuations and tool-call repairs.
+
+The answer comes back as ordinary content, so nothing downstream changes — but the citation markers DeepSeek writes (`[citation:3]`) carry no URLs, and `MessageReconstructor` reads only `RESPONSE`/`THINK` fragments, so `search_triggered` and any search fragments are dropped. DanyAPI therefore cannot expose `url_citation` annotations; a client gets the search context, not the sources.
+
 ### Token Usage Accounting
 `usage.py` holds a process-wide `UsageTracker` (singleton via `init_tracker` / `get_tracker` / `reset_tracker`) that accumulates totals, per-model / per-provider / per-user breakdowns, and a bounded `recent` list. State persists through `JsonStore` under the `usage` key and is restored on startup.
 

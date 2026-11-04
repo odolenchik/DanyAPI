@@ -235,6 +235,16 @@ class Settings:
         # enabled, only replies the classifier judged json_malformed are retried.
         self.toolcall_retry = os.environ.get("DANYAPI_TOOLCALL_RETRY", "").strip().lower() in ("1", "true", "yes", "on")
 
+        # Keep DeepSeek's web-search toggle permanently on, the way the web
+        # client's search button stays pressed for the whole chat. The provider
+        # then decides per turn whether to search: a prompt that asks for it in
+        # words ("search the internet for ...") gets live results merged into
+        # the answer, an ordinary prompt is answered without a search. The
+        # request field ``search`` can still turn it on per request; this flag
+        # only removes the need to send it. Off by default so a client that
+        # never asked for search does not start burning search-triggered turns.
+        self.search_always_on = os.environ.get("DANYAPI_SEARCH_ALWAYS_ON", "").strip().lower() in ("1", "true", "yes", "on")
+
         # Ask for exactly one tool call per reply instead of letting the model
         # batch several. On by default: batching is where most mangled payloads
         # come from (sibling calls with no separator, a schema split across
