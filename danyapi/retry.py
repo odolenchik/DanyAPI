@@ -168,6 +168,26 @@ def blank_answer_finish_reason(rec) -> str:
     return "error"
 
 
+def stream_refusal_message(rec) -> str:
+    """The text to send as a delta when the content itself was refused."""
+    return blank_answer_reason(rec) or REFUSAL_MESSAGE
+
+
+def stream_refusal_finish_reason(rec) -> str:
+    """The finish_reason to put on a stream error chunk for an empty answer.
+
+    OpenAI clients decide retryability from this field alone: Kimi maps
+    ``content_filter`` to ``filtered`` (never retried) and anything it does not
+    recognise to ``other``, which it retries. DeepSeek's own reason
+    (``file_audit_reject``) is unknown to such a client, so a content refusal is
+    reported as ``content_filter``; the real reason stays in
+    ``error.finish_reason`` and in the message.
+    """
+    if is_content_refusal(rec):
+        return "content_filter"
+    return blank_answer_finish_reason(rec)
+
+
 def is_content_refusal(rec) -> bool:
     """True when the upstream refused the *content*, not the request rate.
 

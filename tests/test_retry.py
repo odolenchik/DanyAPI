@@ -955,3 +955,29 @@ async def test_non_stream_content_refusal_does_not_retry():
     with pytest.raises(openai_mod.HTTPException):
         await _collect_non_stream(**_args(acct))
     assert acct.client.completion.await_count == 1
+
+
+async def test_stream_content_refusal_reports_content_filter():
+    """A refusal in the stream must look permanent to an OpenAI client.
+
+    The OpenAI SDK raises on ANY ``error`` field in a chunk, before it reads
+    finish_reason, and the thrown APIError has no status — the client classifies
+    that as a transient provider error and resends the same refused request.
+    A refusal is therefore sent with no ``error`` field: the reason text rides in
+    the delta and ``content_filter`` (non-retryable) is the finish_reason.
+    """
+    acct = FakeAccount([FILE_AUDIT_REJECT_SSE])
+    lines = list(await _collect(_stream_openai(**_args(acct))))
+
+    payloads = [json.loads(line[len("data: ") :]) for line in lines if line.startswith("data: {")]
+    assert payloads, "a refusal must emit at least one chunk"
+    assert all("error" not in p for p in payloads), "an error field makes the SDK raise and retry"
+    final = payloads[0]
+    assert final["choices"][0]["finish_reason"] == "content_filter"
+    assert "Content violates terms" in final["choices"][0]["delta"]["content"]
+
+
+async def test_stream_content_refusal_does_not_retry():
+    acct = FakeAccount([FILE_AUDIT_REJECT_SSE] * (openai_mod.MAX_RETRIES + 1))
+    await _collect(_stream_openai(**_args(acct)))
+    assert acct.client.completion.await_count == 1

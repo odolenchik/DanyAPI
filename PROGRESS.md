@@ -1822,3 +1822,47 @@ media from tool result:" + image_url)]`.
   циклу отношения не имеет.
 - Правка не касается `extract_text`-режима (провайдер без `keep_parts`): там
   картинка и так заменяется текстом.
+
+## Отказ цензуры в стриме больше не крутит ретраи (2026-11-04)
+
+**Симптом.** Kimi + `ReadMediaFile` на картинке, которую DeepSeek отклоняет:
+Kimi повторял запрос 10 раз с растущими паузами (0.6 → 39 с), прогон висел до
+таймаута ~200 с и падал без внятного сообщения.
+
+**Причина (две части).**
+1. `danyapi/api/streaming.py` отдавал отказ как SSE-чанк с полем `error` и
+   `finish_reason: "file_audit_reject"`.
+2. OpenAI SDK (`core/streaming.js:49`), на котором работает Kimi, **бросает
+   исключение на любое поле `error` в чанке**, ещё до разбора `finish_reason`.
+   У брошенного `APIError` нет `status`, поэтому Kimi классифицирует его как
+   `ChatProviderError` без статуса, а `isRetryableGenerateError`
+   (`llm-adapter/contract/errors.ts:236`) для такого случая возвращает `true`.
+   Отсюда 10 ретраев.
+
+Промежуточная попытка (отдавать `finish_reason: content_filter` вместо
+`file_audit_reject`) не помогла: SDK падал раньше, чем читал это поле.
+
+**Правка.** Для отказа по содержимому (`is_content_refusal`) стрим теперь не
+кладёт поле `error` вообще: текст отказа уходит обычной дельтой, а
+`finish_reason` = `content_filter` — единственное значение, которое OpenAI-
+клиент трактует как неретраибельный `filtered`. Остальные хинты (занятость,
+троттлинг) по-прежнему отдают `error`, чтобы клиент их ретраил как раньше.
+`danyapi/retry.py`: `stream_refusal_finish_reason` и `stream_refusal_message`.
+
+**Тесты.** `tests/test_retry.py`: стрим-отказ не содержит `error`, отдаёт
+`content_filter`, текст в дельте; повторной отправки нет (1 вызов вместо
+`MAX_RETRIES + 1`). Итого 1692 passed.
+
+**Проверено.** `ruff check`, `ruff format --check`, `arch-check OK`,
+`pytest -q` → **1692 passed**. E2E через Kimi на 6660 с `1.png`:
+
+| | было | стало |
+|---|---|---|
+| попыток | 10 ретраев | **0** |
+| длительность | ~200 с (таймаут) | **17 с** |
+| сообщение | нет ответа | «Content violates terms. Message not sent.» + «Provider safety policy blocked the response» |
+
+**Не проверено / осталось.**
+- Правка касается только стрима. Non-stream уже отдавал 400 (коммит c22c113).
+- `INVALID_POW_RESPONSE` (40301) на загрузке иногда случается и не ретраится —
+  отдельная известная проблема, к цензуре отношения не имеет.

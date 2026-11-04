@@ -52,6 +52,8 @@ from .deepseek import (
     blank_answer_finish_reason,
     blank_answer_reason,
     is_content_refusal,
+    stream_refusal_finish_reason,
+    stream_refusal_message,
 )
 from .models import CONTEXT_LENGTH_STATUS, INPUT_EXCEEDS_LIMIT, MAX_CONTINUE_ROUNDS, _deepseek_usage, _finish_reason
 
@@ -1808,6 +1810,40 @@ async def _stream_openai(
                     model=model,
                     elapsed_ms=(time.monotonic() - started) * 1000,
                 )
+            # An OpenAI SDK raises on ANY ``error`` field in a chunk, before it
+            # reads finish_reason, and the thrown APIError has no status — so the
+            # client classifies a refusal as a transient provider error and
+            # retries the same refused request until its attempt budget runs out.
+            # A content refusal is therefore reported without that field: the
+            # text goes out as a normal delta and the permanent content_filter
+            # reason stops the retry loop. Other hints keep ``error`` so a busy
+            # or throttled turn still reads as retryable.
+            if is_content_refusal(rec):
+                yield _sse(
+                    {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": stream_refusal_message(rec)},
+                                "finish_reason": "content_filter",
+                            }
+                        ],
+                    }
+                )
+                yield _sse(
+                    {
+                        "id": chunk_id,
+                        "session_id": session_key,
+                        "object": "chat.completion.chunk",
+                        "choices": [],
+                    }
+                )
+                yield "data: [DONE]\n\n"
+                return
             yield _sse(
                 {
                     "id": chunk_id,
@@ -1822,7 +1858,7 @@ async def _stream_openai(
                         {
                             "index": 0,
                             "delta": {},
-                            "finish_reason": hint.get("finish_reason") or "error",
+                            "finish_reason": stream_refusal_finish_reason(rec),
                         }
                     ],
                 }
@@ -1855,12 +1891,14 @@ async def _stream_openai(
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": model,
-                    "error": {"message": blank_reason},
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {},
-                            "finish_reason": blank_answer_finish_reason(rec),
+                            # No ``error`` field here either: an OpenAI SDK turns
+                            # it into an APIError with no status, which the client
+                            # retries forever. The reason text rides in the delta.
+                            "delta": {"content": blank_reason},
+                            "finish_reason": stream_refusal_finish_reason(rec),
                         }
                     ],
                 }
