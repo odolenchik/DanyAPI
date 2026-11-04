@@ -289,6 +289,11 @@ def test_solve_challenge_all_fail():
         assert asyncio.run(solve_challenge("c", "s", 1, 10)) is None
 
 
+# Far in the future so a prefetched header is not treated as expired. The
+# expiry itself is exercised by the dedicated tests below.
+_FUTURE_EXPIRY_MS = 4102444800000
+
+
 def _valid_challenge():
     return {
         "challenge": "00" * 32,
@@ -296,7 +301,7 @@ def _valid_challenge():
         "algorithm": "alg",
         "signature": "sig",
         "target_path": "/api/v0/chat/completion",
-        "expire_at": 1700000000000,
+        "expire_at": _FUTURE_EXPIRY_MS,
         "difficulty": 5,
     }
 
@@ -304,3 +309,45 @@ def _valid_challenge():
 def _decode_header(header):
     raw = base64.b64decode(header["X-DS-PoW-Response"])
     return json.loads(raw)
+
+
+def test_expired_prefetch_is_not_reused():
+    """A prefetched header past its expire_at must be solved again."""
+    from danyapi.pow import PowManager
+
+    async def run():
+        pm = PowManager()
+        expired = _valid_challenge()
+        expired["expire_at"] = 1700000000000
+        fetch = AsyncMock(return_value=expired)
+
+        with patch("danyapi.pow.solve_challenge", new=AsyncMock(return_value=42)):
+            await pm.make_header(fetch)
+            if pm._refill is not None:
+                await pm._refill
+            assert pm._header is not None
+            # The cached header is stale, so the next call must fetch again
+            # instead of handing the server a dead challenge (40301).
+            await pm.make_header(fetch)
+            assert fetch.await_count == 3
+
+    asyncio.run(run())
+
+
+def test_fresh_skips_the_prefetched_header():
+    """``fresh=True`` is the recovery path after 40301: ignore the cache."""
+    from danyapi.pow import PowManager
+
+    async def run():
+        pm = PowManager()
+        fetch = AsyncMock(return_value=_valid_challenge())
+
+        with patch("danyapi.pow.solve_challenge", new=AsyncMock(return_value=42)):
+            await pm.make_header(fetch)
+            if pm._refill is not None:
+                await pm._refill
+            before = fetch.await_count
+            await pm.make_header(fetch, fresh=True)
+            assert fetch.await_count == before + 1
+
+    asyncio.run(run())

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 from dataclasses import dataclass
 
 from fastapi import HTTPException
@@ -8,6 +9,8 @@ from fastapi import HTTPException
 from ..deepseek.client import DeepSeekError
 from .deepseek import _deepseek_error_detail, _deepseek_status, _handle_account_error
 from .models import MODEL_NAME_BY_TYPE, ChatCompletionRequest
+
+log = logging.getLogger("danyapi.api")
 
 MAX_FILES_PER_REQUEST = 50
 MAX_FILE_SIZE = 100 * 1024 * 1024
@@ -91,20 +94,31 @@ def _validate_attachments(attachments: list[Attachment], model_type: str) -> Non
         raise HTTPException(400, f"{MODEL_NAME_BY_TYPE[model_type]} accepts images only")
 
 
-async def _fresh_pow_upload_headers(account) -> dict:
+# DeepSeek rejects a PoW header it considers invalid or expired with this biz
+# code. It is not an auth failure: the account is fine, the solved challenge is
+# not, so the upload is retried once with a freshly solved header.
+INVALID_POW_CODE = 40301
+UPLOAD_ATTEMPTS = 2
+
+
+async def _fresh_pow_upload_headers(account, *, fresh: bool = False) -> dict:
     try:
-        return await account.pow_upload.make_header(lambda: account.client.create_pow_challenge("/api/v0/file/upload_file"))
+        return await account.pow_upload.make_header(
+            lambda: account.client.create_pow_challenge("/api/v0/file/upload_file"),
+            fresh=fresh,
+        )
     except DeepSeekError as exc:
         _handle_account_error(account, exc, "upload pow challenge")
         raise HTTPException(_deepseek_status(exc), _deepseek_error_detail(exc)) from exc
 
 
-async def _upload_attachments(account, attachments: list[Attachment], model_type: str, thinking: bool) -> list[str]:
-    file_ids: list[str] = []
-    for att in attachments:
-        pow_headers = await _fresh_pow_upload_headers(account)
+async def _upload_one(account, att: Attachment, model_type: str, thinking: bool) -> dict:
+    for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+        # A rejected header is never reused: ask for a freshly solved challenge
+        # on the retry, which is the only thing that can fix this failure.
+        pow_headers = await _fresh_pow_upload_headers(account, fresh=attempt > 1)
         try:
-            info = await account.client.upload_file(
+            return await account.client.upload_file(
                 att.data,
                 att.name,
                 att.content_type,
@@ -113,8 +127,21 @@ async def _upload_attachments(account, attachments: list[Attachment], model_type
                 pow_headers=pow_headers,
             )
         except DeepSeekError as exc:
+            if exc.biz_code == INVALID_POW_CODE and attempt < UPLOAD_ATTEMPTS:
+                log.warning(
+                    "file upload got INVALID_POW_RESPONSE for %s, retrying with a fresh header",
+                    att.name,
+                )
+                continue
             _handle_account_error(account, exc, "file upload")
             raise HTTPException(_deepseek_status(exc), f"file upload failed: {exc}") from exc
+    raise HTTPException(502, f"file upload failed for {att.name}: no file id")
+
+
+async def _upload_attachments(account, attachments: list[Attachment], model_type: str, thinking: bool) -> list[str]:
+    file_ids: list[str] = []
+    for att in attachments:
+        info = await _upload_one(account, att, model_type, thinking)
         file_id = info.get("id")
         if not file_id:
             raise HTTPException(502, f"file upload failed for {att.name}: no file id")

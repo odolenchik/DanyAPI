@@ -1889,3 +1889,36 @@ def test_single_tool_call_cannot_be_opted_out_per_request(monkeypatch):
     req = ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}], parallel_tool_calls=True)
     monkeypatch.setattr(openai_mod.settings, "one_tool_call_per_turn", True)
     assert openai_mod._single_tool_call(req) is True
+
+
+async def test_upload_retries_invalid_pow_with_a_fresh_header():
+    """40301 INVALID_POW_RESPONSE is retried once with a newly solved header.
+
+    The server rejects a challenge that expired while it sat in the prefetch
+    cache. That is not an auth failure and not worth surfacing: the upload
+    succeeds on the retry, which asks for a fresh challenge instead of reusing
+    the rejected one.
+    """
+    acct = FakeAccount()
+    acct.pow_upload.make_header = AsyncMock(return_value={"X-DS-PoW-Response": "h"})
+    acct.client.upload_file = AsyncMock(side_effect=[DeepSeekError(40301, "INVALID_POW_RESPONSE"), {"id": "file-1"}])
+
+    ids = await openai_mod._upload_attachments(acct, [openai_mod.Attachment(b"a", "a.txt", "text/plain", False)], "default", False)
+
+    assert ids == ["file-1"]
+    assert acct.client.upload_file.await_count == 2
+    # The retry must not reuse the rejected header.
+    assert acct.pow_upload.make_header.await_count == 2
+    assert acct.pow_upload.make_header.await_args_list[1].kwargs["fresh"] is True
+
+
+async def test_upload_gives_up_after_one_invalid_pow_retry():
+    acct = FakeAccount()
+    acct.pow_upload.make_header = AsyncMock(return_value={"X-DS-PoW-Response": "h"})
+    acct.client.upload_file = AsyncMock(side_effect=DeepSeekError(40301, "INVALID_POW_RESPONSE"))
+
+    with pytest.raises(Exception) as excinfo:
+        await openai_mod._upload_attachments(acct, [openai_mod.Attachment(b"a", "a.txt", "text/plain", False)], "default", False)
+
+    assert excinfo.value.status_code == 502
+    assert acct.client.upload_file.await_count == 2

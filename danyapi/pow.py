@@ -6,6 +6,7 @@ import json
 import logging
 import struct
 import subprocess
+import time
 from pathlib import Path
 
 log = logging.getLogger("danyapi.pow")
@@ -52,6 +53,10 @@ _ROUNDS = 23
 _ROUND_CONSTANTS = _RC[1:24]
 
 _PYTHON_SOLVE_LIMIT = 2_000_000
+
+# A prefetched PoW header is only usable until its challenge expires. Keep a
+# margin so a header that is about to expire is never handed to a request.
+_POW_EXPIRY_MARGIN_MS = 5_000
 
 
 def _rol(x: int, n: int) -> int:
@@ -180,9 +185,22 @@ class PowManager:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._header: dict | None = None
+        self._expires_at_ms: int | None = None
         self._refill: asyncio.Task | None = None
 
-    async def _build(self, fetch) -> dict:
+    def _prefetched_is_stale(self) -> bool:
+        """True when the prefetched header's challenge has expired.
+
+        The challenge carries ``expire_at`` (epoch ms); the server rejects a
+        solved challenge past it with 40301 INVALID_POW_RESPONSE. The prefetch is
+        built right after the previous use, so a manager left idle for a long
+        time holds a header that is already dead.
+        """
+        if self._expires_at_ms is None:
+            return False
+        return time.time() * 1000 >= self._expires_at_ms - _POW_EXPIRY_MARGIN_MS
+
+    async def _build(self, fetch) -> tuple[dict, int]:
         challenge = await fetch()
         missing = [k for k in ("challenge", "salt", "algorithm", "signature", "target_path") if not challenge.get(k)]
         if missing:
@@ -210,13 +228,15 @@ class PowManager:
             "target_path": challenge["target_path"],
         }
         raw = json.dumps(payload, separators=(",", ":")).encode()
-        return {"X-DS-PoW-Response": base64.b64encode(raw).decode()}
+        return {"X-DS-PoW-Response": base64.b64encode(raw).decode()}, int(expire_at)
 
     async def _refill_if_empty(self, fetch) -> None:
         try:
             async with self._lock:
                 if self._header is None:
-                    self._header = await self._build(fetch)
+                    header, expires_at = await self._build(fetch)
+                    self._header = header
+                    self._expires_at_ms = expires_at
         except Exception as exc:
             log.warning("pow prefetch failed: %s", exc)
         finally:
@@ -226,16 +246,29 @@ class PowManager:
         if self._refill is None or self._refill.done():
             self._refill = asyncio.create_task(self._refill_if_empty(fetch))
 
-    async def make_header(self, fetch) -> dict:
+    async def make_header(self, fetch, fresh: bool = False) -> dict:
+        """Return a PoW header, reusing the prefetched one when it is still valid.
+
+        ``fresh`` skips the prefetched header and solves a new challenge; it is
+        the recovery path after the server rejected a header as invalid.
+        """
+        header = None
         async with self._lock:
             if self._header is not None:
-                header = self._header
-                self._header = None
-            else:
-                header = None
+                if fresh:
+                    self._header = None
+                    self._expires_at_ms = None
+                elif self._prefetched_is_stale():
+                    log.info("pow prefetched header expired; solving a new challenge")
+                    self._header = None
+                    self._expires_at_ms = None
+                else:
+                    header = self._header
+                    self._header = None
+                    self._expires_at_ms = None
         if header is not None:
             self._kick_refill(fetch)
             return header
-        header = await self._build(fetch)
+        header, _ = await self._build(fetch)
         self._kick_refill(fetch)
         return header
