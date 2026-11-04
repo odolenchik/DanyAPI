@@ -183,3 +183,75 @@ def test_build_compact_prompt_caps_older_tool_results():
     assert "first-result" not in body
     assert "User: q1" in body
     assert system == ""
+
+
+# ---------------------------------------------------------------------------
+# A client that relays tool media as a separate user message must not have its
+# delta prompt truncated to that message alone.
+# ---------------------------------------------------------------------------
+
+MEDIA_RELAY = "Attached media from tool result:"
+
+
+def _media_relay_messages(relay_content: str = MEDIA_RELAY):
+    return [
+        SimpleNamespace(role="user", content="опиши картинку"),
+        SimpleNamespace(
+            role="assistant",
+            content=None,
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "ReadMediaFile",
+                        "arguments": '{"path": "/tmp/a.png"}',
+                    },
+                }
+            ],
+        ),
+        SimpleNamespace(
+            role="tool",
+            tool_call_id="call_1",
+            content='<image path="/tmp/a.png"></image><system>Read image file.</system>',
+        ),
+        SimpleNamespace(role="user", content=relay_content),
+    ]
+
+
+def test_media_relay_does_not_truncate_the_delta_prompt():
+    """The media-relay user message is transport, not the user's turn.
+
+    Kimi pulls the image out of the tool result and sends it as a separate
+    role="user" message carrying only the label. Treating that as the last user
+    turn made the delta prompt 32 characters long — no question, no tool result —
+    so the model called the same tool again forever.
+    """
+    prompt, tools_present = build_prompt(_media_relay_messages(), has_session=True)
+
+    assert tools_present is True
+    assert "ReadMediaFile" in prompt
+    assert "Read image file." in prompt
+    assert prompt.strip() != MEDIA_RELAY
+
+
+def test_media_relay_is_not_the_extracted_user_turn():
+    from danyapi.tools.prompt import extract_last_user
+
+    assert extract_last_user(_media_relay_messages()) == "опиши картинку"
+
+
+def test_media_relay_match_is_case_and_space_insensitive():
+    prompt, _ = build_prompt(_media_relay_messages("  attached media from tool result:  "), has_session=True)
+
+    assert "Read image file." in prompt
+
+
+def test_a_real_user_message_after_a_tool_result_still_wins():
+    """The fix must not swallow a genuine user turn that follows a relay."""
+    messages = _media_relay_messages()
+    messages.append(SimpleNamespace(role="user", content="now count the files"))
+
+    from danyapi.tools.prompt import extract_last_user
+
+    assert extract_last_user(messages) == "now count the files"

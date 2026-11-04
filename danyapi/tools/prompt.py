@@ -246,6 +246,19 @@ def _is_ephemeral_system(content: str) -> bool:
     return content.strip().lower().startswith("<system")
 
 
+# A client that pulls media out of a tool result (Kimi's openai protocol does
+# this, see ``extractToolMedia``) leaves the tool message as plain text and
+# appends the image as a separate ``role="user"`` message carrying only this
+# label. That message is a transport detail, not a user turn: treating it as the
+# last user turn truncates the delta prompt to the label alone, so the model sees
+# no question and no tool result and calls the same tool again forever.
+MEDIA_RELAY_PROMPT = "attached media from tool result:"
+
+
+def _is_media_relay(content: str) -> bool:
+    return content.strip().lower() == MEDIA_RELAY_PROMPT
+
+
 def context_sequence(messages: list[Any], user: str | None = None) -> tuple[str, ...]:
     """Build a stable anchor fingerprint of the conversation for session dedup.
 
@@ -446,7 +459,8 @@ def extract_last_user(messages: list[Any]) -> str:
         # these as a separate role="user" message after the real question, so
         # treating one as the user's text sends a prompt with no question at all
         # and the model answers as if the user had said nothing.
-        if _is_ephemeral_system(_content_text(content)):
+        text_content = _content_text(content)
+        if _is_ephemeral_system(text_content) or _is_media_relay(text_content):
             continue
         if isinstance(content, str):
             return content
@@ -506,7 +520,8 @@ def _tail_after_last_user(messages: list[Any]) -> list[Any]:
         role = getattr(msg, "role", None)
         if role not in ("user", "system"):
             continue
-        if _is_ephemeral_system(_content_text(getattr(msg, "content", ""))):
+        text = _content_text(getattr(msg, "content", ""))
+        if _is_ephemeral_system(text) or _is_media_relay(text):
             continue
         index = i
     if index < 0:
