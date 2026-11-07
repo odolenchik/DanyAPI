@@ -4232,3 +4232,21 @@ def test_dsml_lost_close_does_not_turn_timeout_into_false():
     calls = parse_tool_calls(text)
     assert calls is not None
     assert json.loads(calls[0][0].arguments) == {"command": "echo hi", "timeout": 300}
+
+
+def test_dsml_opener_without_dsml_word_keeps_argument():
+    """tooltrace 882ec06b, 97329465, 4c462491, b5ce0b9f: the opener kept the pipes but
+    lost the DSML word, so no param regex saw the command and Bash went out with only
+    the timeout. A second opener written `parameter="X"` must survive alongside it."""
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f"<{S} tool_calls>\n"
+        f'<{S} invoke name="Bash">\n'
+        f'<\uff5c\uff5c parameter name="command" string="true">echo hi</{S} parameter>\n'
+        f'<{S} parameter="timeout">600</{S} parameter>\n'
+        f"</{S} invoke>\n"
+        f"</{S} tool_calls>"
+    )
+    calls = parse_tool_calls(text)
+    assert calls is not None
+    assert json.loads(calls[0][0].arguments) == {"command": "echo hi", "timeout": 600}

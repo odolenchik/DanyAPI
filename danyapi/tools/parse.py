@@ -1253,8 +1253,8 @@ def _repair_dsml_bare_arguments(text: str) -> str:
 # the same shape. Only the opener is rewritten: the canonical close regex already
 # accepts a bare </parameter>.
 _BARE_PARAM_OPENER_RE = re.compile(
-    r"<\s*parameter\s+name=(?P<q>['\"])(?P<pname>[^'\">]+)(?P=q)"
-    r"(?:\s+string=(?P<sq>['\"])(?P<sval>true|false)(?P=sq))?"
+    rf"<\s*(?:{_DSML_SEP}\s*)?parameter\s+name=(?P<q>['\"])(?P<pname>[^'\">]+)(?P=q)"
+    rf"(?:\s+string=(?P<sq>['\"])(?P<sval>true|false)(?P=sq))?"
     r"\s*>",
     re.IGNORECASE,
 )
@@ -1833,8 +1833,14 @@ def _parse_dsml(text: str, tool_schemas: dict[str, dict[str, Any]] | None = None
 
         # Bounded re-scan also when the first pass matched NOTHING but parameter
         # openers exist (a close tag carrying name= makes _DSML_PARAM_RE miss every
-        # param, leaving args empty even though the openers are there).
-        if shared_close or not matched_params:
+        # param, leaving args empty even though the openers are there). It also runs
+        # when an opener is still unaccounted for: the `parameter name=` and
+        # `parameter="X"` forms are scanned by different regexes, so a body mixing
+        # both leaves the second form unextracted once the first pass matches anything
+        # (tooltrace 882ec06b: timeout dropped after command started matching).
+        opener_names = {om.group("pname") for om in _DSML_PARAM_OPENER_RE.finditer(text, m.end(), body_end)}
+        opener_names |= {om.group("pname") for om in _DSML_PARAM_EQ_OPENER_RE.finditer(text, m.end(), body_end)}
+        if shared_close or not matched_params or (opener_names - matched_params):
             # Re-extract all params in this invoke body using bounded scanning:
             # each param's value ends at the next param opener or a close tag.
             _dsml_tag_any_re = re.compile(
