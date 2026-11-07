@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .format import format_tool_message, limit_tool_calls, tool_call_deltas
+from .leak import has_tool_markup, sanitize_tool_markup
 from .parse import (
     _balanced_json,
     _coerce_scalar,
@@ -97,6 +98,7 @@ __all__ = [
     "extract_last_user",
     "extract_system",
     "format_tool_message",
+    "has_tool_markup",
     "is_degenerate_repeat",
     "is_tool_round",
     "limit_tool_calls",
@@ -104,6 +106,7 @@ __all__ = [
     "render_json_mode",
     "render_message",
     "render_tool_schema",
+    "sanitize_tool_markup",
     "tool_call_deltas",
     "tool_schema_map",
 ]

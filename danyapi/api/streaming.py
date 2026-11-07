@@ -819,14 +819,16 @@ async def _compact_retry_stream(
                     )
                 finish = "tool_calls"
             else:
-                if content_buf:
+                # Unparsed reply forwarded as text: strip any markup around it.
+                visible = toolemu.sanitize_tool_markup(content_buf)
+                if visible:
                     yield _sse(
                         {
                             "id": chunk_id,
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": model,
-                            "choices": [{"index": 0, "delta": {"content": content_buf}, "finish_reason": None}],
+                            "choices": [{"index": 0, "delta": {"content": visible}, "finish_reason": None}],
                         }
                     )
                 finish = _finish_reason(rec.status)
@@ -1263,13 +1265,13 @@ async def _collect_non_stream(
                 finish = "tool_calls"
                 message = toolemu.format_tool_message(tool_calls, tool_text, reasoning)
             else:
-                message = {"role": "assistant", "content": content}
+                message = {"role": "assistant", "content": toolemu.sanitize_tool_markup(content)}
                 if reasoning:
                     message["reasoning_content"] = reasoning
                 finish = _finish_reason(rec.status)
         else:
             finish = _finish_reason(rec.status)
-            message = {"role": "assistant", "content": content}
+            message = {"role": "assistant", "content": toolemu.sanitize_tool_markup(content)}
             if reasoning:
                 message["reasoning_content"] = reasoning
         if tool_mode and trace is not None:
@@ -2116,7 +2118,20 @@ async def _stream_openai(
                     )
                 finish = "tool_calls"
             else:
-                if content_buf:
+                # The call did not parse and the reply is forwarded as text.
+                # Strip any markup that came with it — see tools/leak.py; prose
+                # is kept, and a reply that was nothing but a broken call is
+                # left empty rather than shown as raw tags.
+                visible = toolemu.sanitize_tool_markup(content_buf)
+                if visible and toolemu.has_tool_markup(content_buf):
+                    log.warning(
+                        "unparsed reply carried tool markup, sanitized (session=%s request=%s, %d -> %d chars)",
+                        session_key,
+                        request_id,
+                        len(content_buf),
+                        len(visible),
+                    )
+                if visible:
                     yield _sse(
                         {
                             "id": chunk_id,
@@ -2126,7 +2141,7 @@ async def _stream_openai(
                             "choices": [
                                 {
                                     "index": 0,
-                                    "delta": {"content": content_buf},
+                                    "delta": {"content": visible},
                                     "finish_reason": None,
                                 }
                             ],
