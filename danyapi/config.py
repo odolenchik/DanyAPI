@@ -235,6 +235,12 @@ class Settings:
         # enabled, only replies the classifier judged json_malformed are retried.
         self.toolcall_retry = os.environ.get("DANYAPI_TOOLCALL_RETRY", "").strip().lower() in ("1", "true", "yes", "on")
 
+        # When an upstream stream ends without FINISHED, ask the model to carry
+        # on from where it stopped instead of handing the client a truncated
+        # answer flagged as a clean stop. On by default: a cut stream is always
+        # a fault, and the extra request only happens when one occurs.
+        self.auto_continue = os.environ.get("DANYAPI_AUTO_CONTINUE", "1").strip().lower() not in ("0", "false", "no", "off")
+
         # Keep DeepSeek's web-search toggle permanently on, the way the web
         # client's search button stays pressed for the whole chat. The provider
         # then decides per turn whether to search: a prompt that asks for it in

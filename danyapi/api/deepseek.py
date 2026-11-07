@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import random
+import ssl
 
 import httpx
 from fastapi import HTTPException
@@ -34,7 +35,13 @@ from ..retry import (  # noqa: F401
     stream_refusal_message,
 )
 from ..tooltrace import ToolTraceLogger
-from .models import CONTEXT_LENGTH_STATUS, CONTINUE_PROMPT, INPUT_EXCEEDS_LIMIT
+from .models import (
+    CONTEXT_LENGTH_STATUS,
+    CONTINUE_PROMPT,
+    FINISHED_STATUS,
+    INPUT_EXCEEDS_LIMIT,
+    INTERRUPTED_STATUSES,
+)
 
 log = logging.getLogger("danyapi.api")
 
@@ -103,6 +110,33 @@ def _is_input_exceeds_limit(rec: MessageReconstructor) -> bool:
         return True
     hint = rec.hint_error
     return bool(hint and hint.get("finish_reason") == INPUT_EXCEEDS_LIMIT)
+
+
+def stream_was_interrupted(rec: MessageReconstructor) -> bool:
+    """Whether the turn ended without a clean completion from the upstream.
+
+    DeepSeek marks a completed turn with ``response/status = FINISHED``. A
+    stream that closes without that status was cut short: the connection
+    dropped, the upstream restarted, or the message was never committed. The
+    client would otherwise receive a truncated answer with ``finish_reason:
+    stop`` — indistinguishable from success, and never retried.
+
+    Outcomes that are a verdict in their own right are not interruptions:
+    context length and input-too-long have dedicated recovery paths, a content
+    filter refusal is final, and a hint or notice carries its own message that
+    the blank-answer path reports. Retrying any of those only repeats the
+    failure.
+    """
+    status = rec.status
+    if status == FINISHED_STATUS:
+        return False
+    if status in INTERRUPTED_STATUSES:
+        return True
+    if status in (CONTEXT_LENGTH_STATUS, INPUT_EXCEEDS_LIMIT):
+        return False
+    if rec.hint_error or rec.notice:
+        return False
+    return True
 
 
 def _input_exceeds_hint_from_http(exc: HTTPException) -> dict | None:
@@ -249,6 +283,7 @@ async def _collect_continuation(
         content_guard = _new_loop_guard()
         reasoning_guard = _new_loop_guard()
         loop_truncated = False
+        transport_error: Exception | None = None
         try:
             async for chunk in resp.aiter_bytes():
                 for event in incremental.feed(chunk):
@@ -271,8 +306,23 @@ async def _collect_continuation(
                     break
             for event in incremental.finish():
                 rec.handle(event)
+        except (httpx.TransportError, ssl.SSLError, ConnectionError) as exc:
+            # The continuation stream dropped. Keep whatever text arrived (the
+            # caller concatenates it with the main reply) and report the cut as
+            # a missing FINISHED rather than letting a transport error escape —
+            # this function's callers treat None/partial results as data, and
+            # an escaping exception would kill the client stream outright.
+            transport_error = exc
+            log.warning(
+                "continuation transport error (%s) after %d chars",
+                type(exc).__name__,
+                len(rec.content or ""),
+            )
         finally:
             await resp.aclose()
+        if transport_error is not None and not (rec.content or rec.reasoning):
+            # Nothing arrived: let the caller decide (it may retry or stop).
+            return None
         if loop_truncated:
             await _try_stop_stream(account.client, session.id, rec.id)
         if not (rec.content or rec.reasoning) and _is_retryable_hint(rec) and attempt < MAX_RETRIES:

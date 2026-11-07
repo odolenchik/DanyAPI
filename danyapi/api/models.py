@@ -54,6 +54,14 @@ INPUT_EXCEEDS_LIMIT = "input_exceeds_limit"
 CONTINUE_PROMPT = "Continue"
 MAX_CONTINUE_ROUNDS = 5
 
+# The upstream only reports a completed turn by setting response/status to
+# FINISHED. A stream that closes without it was cut short (dropped connection,
+# upstream restart, silent close) and the client would otherwise receive a
+# truncated answer reported as a clean stop.
+FINISHED_STATUS = "FINISHED"
+# Statuses that mean the turn was cut short rather than produced or refused.
+INTERRUPTED_STATUSES = frozenset({"INCOMPLETE", "TIMEOUT"})
+
 
 class ChatMessage(BaseModel):
     role: str = "user"

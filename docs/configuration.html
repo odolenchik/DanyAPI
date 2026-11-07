@@ -118,6 +118,7 @@
                             <tr><td><span class="env-var">DANYAPI_THINKING_MEDIUM_WEIGHT</span></td><td><code>2</code></td><td>Score for a medium signal: an ordinary question word (<code>why</code>, <code>explain</code>, <code>почему</code>) or a merely long prompt</td></tr>
                             <tr><td><span class="env-var">DANYAPI_THINKING_WEAK_WEIGHT</span></td><td><code>1</code></td><td>Score for a weak hint: a long history or an automatic (<code>tool_choice</code> unset/<code>auto</code>) tool round</td></tr>
                             <tr><td><span class="env-var">DANYAPI_THINKING_SCORE_THRESHOLD</span></td><td><code>3</code></td><td>Score needed to enable thinking; one strong signal clears it alone</td></tr>
+                            <tr><td><span class="env-var">DANYAPI_AUTO_CONTINUE</span></td><td><code>1</code></td><td data-i18n="cf_r18_desc">Resume a DeepSeek reply whose stream ended without <code>FINISHED</code> (dropped connection, upstream restart) instead of returning it truncated as a clean stop; <code>0</code> disables</td></tr>
                         </tbody>
                     </table>
                 </div>

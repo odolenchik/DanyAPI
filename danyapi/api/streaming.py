@@ -10,6 +10,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
+import httpx
 from fastapi import HTTPException
 
 from .. import repeat as repeat_guard
@@ -54,6 +55,7 @@ from .deepseek import (
     is_content_refusal,
     stream_refusal_finish_reason,
     stream_refusal_message,
+    stream_was_interrupted,
 )
 from .models import CONTEXT_LENGTH_STATUS, INPUT_EXCEEDS_LIMIT, MAX_CONTINUE_ROUNDS, _deepseek_usage, _finish_reason
 
@@ -1363,6 +1365,10 @@ async def _stream_openai(
         stop_message_id: str | None = None
         content_buf = ""
         loop_truncated = False
+        # Also reset per attempt below, but initialised here so the interrupted
+        # check after the loop is safe on paths that never entered an attempt.
+        degenerate_aborted = False
+        transport_interrupted = False
         started = time.monotonic()
         for attempt in range(MAX_RETRIES + 1):
             if attempt:
@@ -1523,7 +1529,12 @@ async def _stream_openai(
                                 break
                     if degenerate_aborted:
                         break
-            except (ssl.SSLError, ConnectionError) as exc:
+            except (ssl.SSLError, ConnectionError, httpx.TransportError) as exc:
+                # httpx reports a dropped upstream as TransportError
+                # (RemoteProtocolError, ReadError, ...), which inherits from
+                # neither ConnectionError nor OSError — catching only the
+                # builtins let a real disconnect escape the generator, so the
+                # client saw a few chunks and then a silent dead stream.
                 log.warning(
                     "stream transport error (%s), attempt %d/%d",
                     type(exc).__name__,
@@ -1531,6 +1542,13 @@ async def _stream_openai(
                     MAX_RETRIES,
                 )
                 if got_content:
+                    if settings.auto_continue:
+                        # The turn produced text before the drop. Leave the loop
+                        # with the partial reply in `rec` and let the interrupted
+                        # branch below resume it, instead of telling the client
+                        # the connection was lost.
+                        transport_interrupted = True
+                        break
                     yield _sse(
                         {
                             "id": chunk_id,
@@ -1595,6 +1613,84 @@ async def _stream_openai(
 
         assert rec is not None
         cont_exhausted = False
+        # A stream that closed without FINISHED was cut short. Resume it in the
+        # same session instead of returning a truncated answer as a clean stop:
+        # the client cannot tell the difference and never retries. Only the
+        # parent the upstream actually committed is used — guessing one ahead
+        # produces "invalid message id" cascades.
+        #
+        # Aborts we caused ourselves are excluded. The loop guard and the
+        # degenerate-repeat guard stop a stream on purpose and have already
+        # reported why; continuing would re-ask the model for the very output
+        # that was just rejected, and the turn would look like an upstream fault.
+        self_aborted = degenerate_aborted or loop_truncated
+        # A transport drop mid-stream is an interruption by definition: the
+        # upstream never had the chance to report a status, so the status check
+        # alone would already say so — naming the flag keeps the intent explicit
+        # and covers a partial reply whose last known status happened to be a
+        # terminal one.
+        interrupted = transport_interrupted or stream_was_interrupted(rec)
+        if settings.auto_continue and not self_aborted and interrupted and (rec.content or rec.reasoning):
+            cont_parent = rec.id or response_message_id
+            log.warning(
+                "stream interrupted (status=%s session=%s request=%s), continuing from parent=%s",
+                rec.status,
+                session_key,
+                request_id,
+                cont_parent,
+            )
+            for round_num in range(MAX_CONTINUE_ROUNDS):
+                cont_rec = await _collect_continuation(
+                    account,
+                    session,
+                    cont_parent,
+                    model_type,
+                    thinking,
+                    search,
+                    ref_file_ids,
+                    request_id=request_id,
+                    trace=trace,
+                    model=model,
+                )
+                if cont_rec is None or not (cont_rec.content or cont_rec.reasoning):
+                    log.warning("interrupted continuation round %d: no content", round_num + 1)
+                    break
+                rec.extend_with(cont_rec)
+                cont_parent = cont_rec.id or cont_parent
+                if cont_rec.content:
+                    if tool_mode:
+                        content_buf += cont_rec.content
+                    else:
+                        yield _sse(
+                            {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"content": cont_rec.content}, "finish_reason": None}],
+                            }
+                        )
+                if cont_rec.reasoning:
+                    yield _sse(
+                        {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"reasoning_content": cont_rec.reasoning},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    )
+                if not stream_was_interrupted(cont_rec):
+                    break
+            else:
+                cont_exhausted = True
+                log.warning("interrupted continuation exhausted after %d rounds", MAX_CONTINUE_ROUNDS)
         if _is_context_limit(rec) and not (rec.content or rec.reasoning):
             compact_gen = await _compact_retry_stream(
                 account,
