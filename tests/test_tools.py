@@ -4214,3 +4214,21 @@ def test_dsml_bare_close_without_name_keeps_every_argument():
     calls = parse_tool_calls(text)
     assert calls is not None
     assert json.loads(calls[0][0].arguments) == {"path": "/a/b.rs", "old_string": "old", "new_string": "new"}
+
+
+def test_dsml_lost_close_does_not_turn_timeout_into_false():
+    """tooltrace af2a57f0, 2d3bf5b8: with the close broken, the string-value regex
+    matched the opener prefix, ``string="false"`` was coerced to False, and the client
+    rejected the call as ``Bash.timeout=False expected integer``."""
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f"<{S} tool_calls>\n"
+        f'<{S} invoke name="Bash">\n'
+        f'<{S} parameter name="command" string="true">echo hi</{S} parameter>\n'
+        f'<{S} parameter name="timeout" string="false">300{S} parameter>\n'
+        f"</{S} invoke>\n"
+        f"</{S} tool_calls>"
+    )
+    calls = parse_tool_calls(text)
+    assert calls is not None
+    assert json.loads(calls[0][0].arguments) == {"command": "echo hi", "timeout": 300}

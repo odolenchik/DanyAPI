@@ -983,7 +983,11 @@ _DSML_PARAM_RE = re.compile(
 # Handles both self-closing (string="/path"/>) and missing-quote closing (string="value"</...>)
 _DSML_PARAM_STRING_VALUE_RE = re.compile(
     rf"<{_DSML_SEP}DSML{_DSML_SEP}\s*parameter\s+name=(?P<q>['\"])(?P<pname>[^'\">]+)(?P=q)"
-    rf"\s+string=(?P<sq>['\"])(?P<sval>(?!true|false$)[^'\"]*?)?(?:(?=\")(?P=sq)|(?=<))\s*(?:/>)?"
+    rf"\s+string=(?P<sq>['\"])(?P<sval>(?!true|false$)[^'\"]*?)?(?:(?=\")(?P=sq)|(?=<))"
+    # A terminator is mandatory: without it the regex matched an opener truncated at
+    # the DSML separator, the value group stayed empty, and _coerce_dsml("") produced
+    # False (tooltrace af2a57f0, 2d3bf5b8 -> "Bash.timeout=False expected integer").
+    rf"\s*(?:/>|>|(?=</\s*{_DSML_SEP}DSML{_DSML_SEP}\s*parameter\s*>))"
     rf"(?:\s*</{_DSML_SEP}DSML{_DSML_SEP}\s*parameter\s*>)?",
     re.IGNORECASE,
 )
