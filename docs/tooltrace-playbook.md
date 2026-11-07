@@ -205,6 +205,30 @@ PY
      уходит с пустыми аргументами. Нормализует `_repair_dsml_bare_param_opener`
      (`_BARE_PARAM_OPENER_RE`); срабатывает только при наличии DSML-префиксного
      `<invoke>`, чтобы не украсть чистый XML у XML-ветки (tooltrace `42585858`).
+     Тот же opener может сохранить палочный разделитель, но потерять слово `DSML`
+     (tooltrace `882ec06b`, `97329465`, `4c462491`, `b5ce0b9f`): тег выглядит
+     каноническим, но ни один param-регекс такого маркера не принимает, вызов уходит
+     как `Bash {}` (64 отказа `missing_required Bash.command`). Покрывает
+     опциональный pipe-префикс в `_BARE_PARAM_OPENER_RE`. Важно: после этой правки
+     первый проход начинает матчить `command`, `matched_params` становится непустым
+     и bounded re-scan (`_parse_dsml`) больше не запускается — а он единственный
+     разбирает форму `parameter="X"`, поэтому `timeout` молча терялся. Условие
+     rescan'а расширено: он срабатывает и когда остались opener'ы, чьих имён нет в
+     `matched_params`.
+   - **Close-тег потерял `<`, `/` и `name=`**: остаётся голый маркер + слово
+     `parameter>`. `_DSML_PARAM_RE` требует `</`, а `_DSML_BRACKETLESS_CLOSE_RE`
+     требовал `parameter name=`, поэтому тег невидим обоим, и ленивое значение
+     предыдущего параметра съедает все следующие аргументы — `Edit` теряет
+     `old_string`, repair крутит ту же форму. 667 request'ов несут эту форму, это
+     70% отказов `Edit.old_string`. `name=` в `_DSML_BRACKETLESS_CLOSE_RE` стал
+     опциональным: close без имени восстанавливается как обычный терминатор, с
+     именем — вместе с opener'ом (tooltrace `aa405112`, `1139becd`, `d4ccafca`).
+   - **`timeout`/`n_lines` превращаются в `false`**: `_DSML_PARAM_STRING_VALUE_RE`
+     не требовал терминатора, поэтому матчил opener, обрезанный на разделителе;
+     группа значения оставалась пустой, `_coerce_dsml("")` давал `False` →
+     `Bash.timeout=False expected integer` (150), `Read.n_lines=False` (17),
+     `WaitFor.timeout=False` (13). Терминатор (`/>`, `>` или закрывающий
+     param-тег) теперь обязателен (tooltrace `af2a57f0`, `2d3bf5b8`).
    - **`=` превращён в `:=""`, разделитель — в `,=""`**: DeepSeek пишет
      `name="timeout" :="" 600}` и `task_id" :="" "bash-x",="" "timeout":600}`.
      Ни один opener-регекс такую форму не матчит, вызов уходит с пустыми

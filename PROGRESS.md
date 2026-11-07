@@ -1909,3 +1909,58 @@ INVALID_POW_RESPONSE`, клиент получал 502, и весь запрос
 - Заодно замечено: Qwen-токен в `DanyAPI3/.env` отозван
   (`Token is revoked, please login again`), провайдер при старте отключается.
   К этой правке отношения не имеет.
+
+## Три формы DSML, терявшие аргументы (2026-11-07)
+
+**Симптом.** `tooltrace.ndjson` (4 279 request'ов, 11-02 → 11-07): 252
+`unparsed`, но основной урон — `ok:missing_required` (675) и `ok:wrong_type`
+(160). Парсер отдавал вызов с потерянными или испорченными аргументами, клиент
+браковал его как missing required, repair-цикл повторял промпт, модель
+повторяла ту же форму.
+
+**Причины — три независимые формы DeepSeek.**
+
+1. **Close-тег потерял `<`, `/` и `name=`** (`aa405112`, `1139becd`,
+   `d4ccafca`). Оставалось `<SEP>DSML<SEP>parameter>`. `_DSML_PARAM_RE`
+   требует `</`, `_DSML_BRACKETLESS_CLOSE_RE` требовал `parameter name=`,
+   поэтому тег был невидим обоим, а ленивое значение предыдущего параметра
+   съедало все следующие аргументы. 667 request'ов несут эту форму, среди них
+   70% отказов `Edit.old_string`.
+2. **`_DSML_PARAM_STRING_VALUE_RE` без обязательного терминатора**
+   (`af2a57f0`, `2d3bf5b8`). Регекс матчил opener, обрезанный на разделителе,
+   группа значения оставалась пустой, `_coerce_dsml("")` возвращал `False` →
+   `Bash.timeout=False expected integer` (150), `Read.n_lines=False` (17),
+   `WaitFor.timeout=False` (13).
+3. **Opener потерял слово `DSML`** (`882ec06b`, `97329465`, `4c462491`,
+   `b5ce0b9f`). Палочный разделитель на месте, слово пропало —
+   `_BARE_PARAM_OPENER_RE` требовал литеральное `<parameter`. Вызов уходил как
+   `Bash {}`; 64 отказа `missing_required Bash.command`.
+
+**Правка** (`danyapi/tools/parse.py`).
+- `_DSML_BRACKETLESS_CLOSE_RE`: `name=` стал опциональным; close без имени
+  восстанавливается как обычный терминатор, с именем — вместе с opener'ом.
+- `_DSML_PARAM_STRING_VALUE_RE`: обязательный терминатор (`/>`, `>` или
+  закрывающий param-тег).
+- `_BARE_PARAM_OPENER_RE`: опциональный pipe-префикс.
+- `_parse_dsml`: bounded re-scan теперь срабатывает и когда остались opener'ы,
+  чьих имён нет в `matched_params`. Без этого после третьей правки `command`
+  начинал матчиться первым проходом, rescan не запускался, и `timeout` —
+  единственный аргумент в форме `parameter="X"` — молча терялся.
+
+**Тесты** (`tests/test_tools.py`, +4): голый close без имени, сохранение всех
+аргументов Edit, `timeout=300` вместо `false`, opener без слова `DSML` вместе
+с `parameter="X"`-соседом.
+
+**Проверено.** `pytest tests/test_tools.py` → 309 passed; `pytest -q` →
+**1700 passed**; `ruff check`, `ruff format --check`, `arch-check OK`.
+Прогон реальных записей через парсер: `882ec06b`, `97329465`, `4c462491`,
+`b5ce0b9f`, `af2a57f0`, `aa405112` восстановлены полностью (включая `timeout`).
+Из 675 request'ов с `missing_required` непустые аргументы теперь получают 641.
+
+**Коммиты.** `14e0a80` (close без скобок и имени), `73780d0` (терминатор в
+string-value), `d0856a6` (opener без слова `DSML` + rescan).
+
+**Не проверено.** E2E через живой прокси с Kimi не прогонялся — проверка шла
+на записях `tooltrace.ndjson` и тестами. Записи с `unparsed:no_tool_call`, где
+в `issue` попадает обычный текст ответа (18 случаев), не чинились: похоже на
+баг логгера, а не парсера.
