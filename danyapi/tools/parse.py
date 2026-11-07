@@ -1143,9 +1143,10 @@ def _repair_dsml_fused_close_open(text: str) -> str:
 # would otherwise never see it (it requires ``</``).
 _DSML_BRACKETLESS_CLOSE_RE = re.compile(
     rf"(?<![</])(?P<sep>{_DSML_SEP})\s*DSML\s*{_DSML_SEP}\s*"
-    rf"parameter\s+name=(?P<q>['\"])(?P<pname>[^'\">]+)(?P=q)"
+    rf"parameter"
+    rf"(?:\s+name=(?P<q>['\"])(?P<pname>[^'\">]+)(?P=q)"
     rf"(?:\s+string=(?P<sq>['\"])(?P<sval>true|false)(?P=sq))?"
-    r"\s*>",
+    r")?\s*>",
     re.IGNORECASE,
 )
 
@@ -1153,17 +1154,23 @@ _DSML_BRACKETLESS_CLOSE_RE = re.compile(
 def _repair_dsml_bracketless_close(text: str) -> str:
     """Restore a close tag that lost both its ``<`` and its ``/``.
 
-    The separator is taken from the matched tag, so an ASCII pair stays ASCII and a
-    fullwidth pair stays fullwidth instead of being silently converted.
+    Two shapes reach here: a close that still carries ``name="X"`` (it doubles as the
+    next opener) and a bare close that lost the attribute too. Only the first needs an
+    opener restored; the second is a plain terminator. The separator is taken from the
+    matched tag, so an ASCII pair stays ASCII and a fullwidth pair stays fullwidth
+    instead of being silently converted.
     """
     if "DSML" not in text:
         return text
 
     def _repl(m: re.Match[str]) -> str:
         sep = m.group("sep")
-        string = f' string="{m.group("sval")}"' if m.group("sval") else ""
         close = f"</{sep}DSML{sep} parameter>"
-        opener = f'<{sep}DSML{sep} parameter name="{m.group("pname")}"{string}>'
+        pname = m.group("pname")
+        if not pname:
+            return close
+        string = f' string="{m.group("sval")}"' if m.group("sval") else ""
+        opener = f'<{sep}DSML{sep} parameter name="{pname}"{string}>'
         return close + opener
 
     return _DSML_BRACKETLESS_CLOSE_RE.sub(_repl, text)

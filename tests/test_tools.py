@@ -4188,3 +4188,29 @@ def test_dsml_bracketless_close_restores_close_and_opener():
     S = "\uff5c\uff5cDSML\uff5c\uff5c"
     broken = f'value{S} parameter name="x" string="false">'
     assert _repair_dsml_bracketless_close(broken) == (f'value</{S} parameter><{S} parameter name="x" string="false">')
+
+
+def test_dsml_bracketless_close_bare_restores_plain_close():
+    """tooltrace aa405112: the close lost ``<``, ``/`` AND the ``name=`` attribute.
+    Only a plain close comes back — restoring an opener here would invent a parameter."""
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    assert _repair_dsml_bracketless_close(f"value{S} parameter>") == f"value</{S} parameter>"
+
+
+def test_dsml_bare_close_without_name_keeps_every_argument():
+    """tooltrace aa405112, 1139becd, d4ccafca: a nameless bare close read as garbage
+    glued to the previous value, so Edit lost old_string and the repair loop repeated
+    the same shape."""
+    S = "\uff5c\uff5cDSML\uff5c\uff5c"
+    text = (
+        f"<{S} tool_calls>\n"
+        f'<{S} invoke name="Edit">\n'
+        f'<{S} parameter name="path" string="true">/a/b.rs{S} parameter>\n'
+        f'<{S} parameter name="old_string" string="true">old{S} parameter>\n'
+        f'<{S} parameter name="new_string" string="true">new{S} parameter>\n'
+        f"</{S} invoke>\n"
+        f"</{S} tool_calls>"
+    )
+    calls = parse_tool_calls(text)
+    assert calls is not None
+    assert json.loads(calls[0][0].arguments) == {"path": "/a/b.rs", "old_string": "old", "new_string": "new"}
