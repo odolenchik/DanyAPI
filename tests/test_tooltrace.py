@@ -154,3 +154,52 @@ def test_tool_names_extraction(tmp_path):
     logger.client("req-1", tools=mixed_tools)
     lines = _read_lines(path)
     assert lines[0]["tool_names"] == ["a", "b", "c"]
+
+
+def test_upstream_records_hint_and_notice(tmp_path):
+    """A blank reply must carry the upstream's own explanation into the trace.
+
+    Without these fields an empty answer in the trace cannot be told apart from
+    a throttle, a refusal or a dropped stream, which is what decides whether a
+    retry is safe.
+    """
+    path = tmp_path / "trace.ndjson"
+    logger = ToolTraceLogger(path)
+
+    logger.upstream(
+        "req-hint",
+        content="",
+        session_id="sess-1",
+        model="deepseek-v4-pro",
+        hint={"message": "Server is busy", "finish_reason": "server_busy"},
+        notice={"message": "Message not sent.", "finish_reason": None},
+    )
+
+    upstream = _read_lines(path)[0]
+    # _truncate serialises nested values to JSON text, like every other field.
+    hint = json.loads(upstream["hint"])
+    notice = json.loads(upstream["notice"])
+    assert hint["message"] == "Server is busy"
+    assert hint["finish_reason"] == "server_busy"
+    assert notice["message"] == "Message not sent."
+
+
+def test_upstream_omits_hint_and_notice_when_absent(tmp_path):
+    path = tmp_path / "trace.ndjson"
+    logger = ToolTraceLogger(path)
+
+    logger.upstream("req-plain", content="ok")
+
+    upstream = _read_lines(path)[0]
+    assert upstream["hint"] is None
+    assert upstream["notice"] is None
+
+
+def test_upstream_truncates_long_hint(tmp_path):
+    path = tmp_path / "trace.ndjson"
+    logger = ToolTraceLogger(path)
+
+    logger.upstream("req-long", content="", hint={"message": "x" * 2000})
+
+    upstream = _read_lines(path)[0]
+    assert len(upstream["hint"]) <= 500

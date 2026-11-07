@@ -516,7 +516,15 @@ async def _compact_retry(
 
     # Build the response in the same shape as normal completion.
     if tool_mode and trace is not None:
-        trace.upstream(request_id, content=rec.content, reasoning=rec.reasoning or None, session_id=new_sid, model=None)
+        trace.upstream(
+            request_id,
+            content=rec.content,
+            reasoning=rec.reasoning or None,
+            session_id=new_sid,
+            model=None,
+            hint=rec.hint_error,
+            notice=rec.notice,
+        )
     if tool_mode:
         parsed = toolemu.parse_tool_calls(rec.content, tool_schemas)
         if parsed is None:
@@ -763,7 +771,15 @@ async def _compact_retry_stream(
         log.info("compact retry (stream) OK: new_session=%s content_len=%d", new_sid, len(rec.content or ""))
 
         if tool_mode and trace is not None:
-            trace.upstream(request_id, content=content_buf, reasoning=None, session_id=new_sid, model=model)
+            trace.upstream(
+                request_id,
+                content=content_buf,
+                reasoning=None,
+                session_id=new_sid,
+                model=model,
+                hint=rec.hint_error,
+                notice=rec.notice,
+            )
         if tool_mode:
             parsed = toolemu.parse_tool_calls(content_buf, tool_schemas)
             if parsed is None:
@@ -1182,7 +1198,15 @@ async def _collect_non_stream(
         content = rec.content
         reasoning = rec.reasoning
         if tool_mode and trace is not None:
-            trace.upstream(request_id, content=content, reasoning=rec.reasoning or None, session_id=session_key, model=model)
+            trace.upstream(
+                request_id,
+                content=content,
+                reasoning=rec.reasoning or None,
+                session_id=session_key,
+                model=model,
+                hint=rec.hint_error,
+                notice=rec.notice,
+            )
         if tool_mode:
             parsed = toolemu.parse_tool_calls(content, tool_schemas)
             if parsed is None:
@@ -2019,7 +2043,15 @@ async def _stream_openai(
         log.info("deepseek completion OK (%.0fms)", (time.monotonic() - started) * 1000)
 
         if tool_mode and trace is not None:
-            trace.upstream(request_id, content=content_buf, reasoning=None, session_id=session_key, model=model)
+            trace.upstream(
+                request_id,
+                content=content_buf,
+                reasoning=None,
+                session_id=session_key,
+                model=model,
+                hint=rec.hint_error,
+                notice=rec.notice,
+            )
         if tool_mode:
             parsed = toolemu.parse_tool_calls(content_buf, tool_schemas)
             if parsed is None:

@@ -127,8 +127,24 @@ class ToolTraceLogger:
         """Final prompt Dany actually sent to the upstream model."""
         self._event(request_id, "dany", session_id, model, prompt=_truncate(prompt, 4000))
 
-    def upstream(self, request_id: str | None = None, *, content: Any = "", reasoning: Any = None, session_id: Any = None, model: Any = None) -> None:
-        """Raw provider response (content + reasoning), before tool-call parsing."""
+    def upstream(
+        self,
+        request_id: str | None = None,
+        *,
+        content: Any = "",
+        reasoning: Any = None,
+        session_id: Any = None,
+        model: Any = None,
+        hint: Any = None,
+        notice: Any = None,
+    ) -> None:
+        """Raw provider response (content + reasoning), before tool-call parsing.
+
+        ``hint`` and ``notice`` carry the upstream's own explanation when the
+        reply came back empty or refused. Without them a blank answer in the
+        trace cannot be told apart from a throttle, a refusal or a dropped
+        stream — which is exactly what decides whether retrying is safe.
+        """
         self._event(
             request_id,
             "upstream",
@@ -136,6 +152,8 @@ class ToolTraceLogger:
             model,
             content=_truncate(content, 5000),
             reasoning=_truncate(reasoning, 500) if reasoning else None,
+            hint=_truncate(hint, 500) if hint else None,
+            notice=_truncate(notice, 500) if notice else None,
         )
 
     def parse(self, request_id: str | None = None, *, result: Any = None, issue: Any = None, session_id: Any = None, model: Any = None) -> None:
