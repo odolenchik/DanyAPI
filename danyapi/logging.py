@@ -1,15 +1,50 @@
 from __future__ import annotations
 
 import logging
+import uuid
+from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-DEFAULT_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+# Per-request correlation id. Set by RequestIDMiddleware and read by the log
+# filter below, so every line written while a request is in flight carries the
+# same id the response header reports. A ContextVar is safe here: the whole
+# request runs in one task, and each task gets its own copy.
+request_id_var: ContextVar[str] = ContextVar("danyapi_request_id", default="-")
+
+DEFAULT_FORMAT = "%(asctime)s %(levelname)s [%(request_id)s] %(name)s: %(message)s"
 CONSOLE_HANDLER_NAME = "danyapi-console"
 FILE_HANDLER_NAME = "danyapi-file"
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_MAX_BYTES = 10 * 1024 * 1024
 DEFAULT_BACKUP_COUNT = 3
+
+
+class RequestIdFilter(logging.Filter):
+    """Attach the current request id to every record.
+
+    The format string references ``%(request_id)s``; without this filter any
+    handler using it would raise. Records written outside a request get "-".
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_var.get()
+        return True
+
+
+_request_id_filter = RequestIdFilter()
+
+
+def new_request_id() -> str:
+    """Return the id for this request, generating one when middleware did not.
+
+    Tests and internal callers invoke the endpoint functions directly, without
+    going through the ASGI stack, so the ContextVar can still be at its default.
+    """
+    current = request_id_var.get()
+    if current and current != "-":
+        return current
+    return uuid.uuid4().hex
 
 
 def _known_level_names() -> dict[str, int]:
@@ -50,6 +85,7 @@ def _make_file_handler(log_file: str, max_bytes: int, backup_count: int) -> Rota
         encoding="utf-8",
     )
     handler.setFormatter(logging.Formatter(DEFAULT_FORMAT))
+    handler.addFilter(_request_id_filter)
     return handler
 
 
@@ -71,6 +107,7 @@ def configure() -> None:
         console = logging.StreamHandler()
         console.name = CONSOLE_HANDLER_NAME
         console.setLevel(level)
+        console.addFilter(_request_id_filter)
         console.setFormatter(logging.Formatter(DEFAULT_FORMAT))
         root.addHandler(console)
 

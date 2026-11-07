@@ -6,7 +6,6 @@ import logging
 import math
 import re
 import time
-import uuid
 from contextlib import asynccontextmanager, suppress
 from typing import Annotated, Any
 
@@ -18,6 +17,8 @@ from .. import tools as toolemu
 from ..accounts import AccountPool, AccountPoolBusy, DeepSeekAccount
 from ..config import settings
 from ..deepseek.client import AuthCheck, DeepSeekClient
+from ..logging import new_request_id
+from ..middleware import ExceptionBarrierMiddleware, RequestIdMiddleware
 from ..qwen import api as qwen_api
 from ..qwen.accounts import QwenAccount, load_effective_token, persist_rotated_token
 from ..qwen.client import QwenClient, QwenError
@@ -580,6 +581,11 @@ async def _image_generations(req: ImageGenerationRequest, pool: AccountPool) -> 
 
 app = FastAPI(title="DanyAPI", lifespan=lifespan)
 
+# Order: registered last runs first. ExceptionBarrier must wrap RequestId so an
+# exception below still carries the correlation id in its log line and body.
+app.add_middleware(RequestIdMiddleware)
+app.add_middleware(ExceptionBarrierMiddleware)
+
 
 def _pool_stats(pool) -> dict | None:
     if pool is None:
@@ -901,7 +907,7 @@ async def _chat_completions_deepseek(req: ChatCompletionRequest) -> Any:
     if pool is None:
         raise HTTPException(503, "deepseek provider is not configured")
 
-    request_id = uuid.uuid4().hex
+    request_id = new_request_id()
     trace = _trace_client_event(req, request_id)
 
     model_type = _resolve_model(req.model)
@@ -1016,7 +1022,7 @@ async def _chat_completions_qwen(req: ChatCompletionRequest) -> Any:
     if pool is None:
         raise HTTPException(503, "qwen provider is not configured" + _qwen_disabled_suffix())
 
-    request_id = uuid.uuid4().hex
+    request_id = new_request_id()
     trace = _trace_client_event(req, request_id)
 
     thinking = _resolve_thinking(req, default=True)
@@ -1090,7 +1096,7 @@ async def _chat_completions_zai(req: ChatCompletionRequest) -> Any:
     if browser is None:
         raise HTTPException(503, "zai provider is not configured")
 
-    request_id = uuid.uuid4().hex
+    request_id = new_request_id()
     trace = _trace_client_event(req, request_id)
     try:
         prompt, tool_mode = toolemu.build_prompt(
