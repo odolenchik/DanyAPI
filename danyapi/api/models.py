@@ -103,6 +103,11 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: str | None = None  # Kimi sends "low"|"medium"|"high"; maps to thinking=True
     search: bool | None = None
     session_id: str | None = None
+    # Kimi Code CLI sends a per-session key here (``session_<uuid>``) instead of
+    # ``session_id``. It is the only stable per-conversation identifier in its
+    # requests, so it doubles as the session id: without it two sessions that
+    # open with the same first message share one upstream chat.
+    prompt_cache_key: str | None = None
     user: str | None = None
     files: list[FileSpec] | None = None
     tools: list[Any] | None = None

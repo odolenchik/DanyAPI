@@ -575,14 +575,9 @@ class AccountPool:
         if session_id:
             acct = self.account_for_session(session_id)
             if acct is not None:
-                # Existing mapping found — use that account and keep the session ID.
                 if acct.sem.locked() and max_wait is not None:
                     return await self._wait_free(acct, max_wait, session_id)
                 return acct, session_id
-            # No existing mapping for this client key yet (first request in this
-            # conversation). Round-robin to any available account but keep the
-            # client-provided session ID so it can be registered once a new chat
-            # is created upstream.
         n = len(healthy)
         start = self._rr % n
         for i in range(n):

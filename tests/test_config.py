@@ -230,6 +230,17 @@ def test_thinking_heuristic_enabled_variants(settings_for, value):
     assert settings_for({"DANYAPI_THINKING_HEURISTIC": value}).thinking_heuristic is True
 
 
+def test_thinking_heuristic_override_off_by_default(settings_for):
+    assert settings_for({}).thinking_heuristic_override is False
+    assert settings_for({"DANYAPI_THINKING_HEURISTIC_OVERRIDE": ""}).thinking_heuristic_override is False
+    assert settings_for({"DANYAPI_THINKING_HEURISTIC_OVERRIDE": "0"}).thinking_heuristic_override is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", "TRUE", "On"])
+def test_thinking_heuristic_override_enabled_variants(settings_for, value):
+    assert settings_for({"DANYAPI_THINKING_HEURISTIC_OVERRIDE": value}).thinking_heuristic_override is True
+
+
 def test_thinking_thresholds_have_defaults(settings_for):
     s = settings_for({})
     assert s.thinking_min_prompt_chars == 2000

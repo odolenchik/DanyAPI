@@ -152,6 +152,20 @@ def test_session_reuses_explicit():
     assert k2 == k1
 
 
+def test_client_key_binds_first_chat_to_itself():
+    """A client key (e.g. Kimi's prompt_cache_key) given on the very first turn
+    must be remembered: the next turn with the same key continues the chat
+    instead of creating a new one."""
+    client = FakeSessionClient()
+    reg = SessionRegistry(client)
+    s1, k1 = asyncio.run(reg.obtain("session_abc"))
+    assert k1 == "session_abc"
+    s2, k2 = asyncio.run(reg.obtain("session_abc"))
+    assert s2 is s1
+    assert k2 == "session_abc"
+    assert client.counter == 1
+
+
 def test_session_evicts_oldest():
     reg = SessionRegistry(FakeSessionClient(), maxsize=2)
     asyncio.run(reg.obtain(None))
@@ -185,8 +199,12 @@ def test_session_forget_removes():
     assert reg.get(k) is not None
     reg.forget(k)
     assert reg.get(k) is None
+    # A forgotten key is no longer bound to anything, so a new chat is created
+    # and stored under that same key again (this is what makes a client key
+    # survive an eviction).
     _, k2 = asyncio.run(reg.obtain(k))
-    assert k2 != k
+    assert k2 == k
+    assert reg.get(k) is not None
 
 
 def test_session_ttl_expires():
@@ -803,6 +821,75 @@ def test_openai_reattaches_before_build_prompt():
         assert captured["existing_sid"] == "chat-x"
     finally:
         openai_mod._collect_non_stream = orig
+
+
+def _sid_req(**kwargs):
+    base = {
+        "model": "deepseek-v4-flash",
+        "stream": False,
+        "thinking": False,
+        "search": False,
+        "session_id": None,
+        "prompt_cache_key": None,
+        "files": None,
+        "tools": None,
+        "tool_choice": None,
+        "response_format": None,
+        "messages": [openai_mod.ChatMessage(role="user", content="hello")],
+    }
+    base.update(kwargs)
+    return SimpleNamespace(**base)
+
+
+def test_client_session_id_prefers_session_id():
+    req = _sid_req(session_id="chat-1", prompt_cache_key="session_abc")
+    assert openai_mod._client_session_id(req) == "chat-1"
+
+
+def test_client_session_id_falls_back_to_prompt_cache_key():
+    # Kimi Code CLI sends only prompt_cache_key; without this fallback two
+    # sessions opening with the same first message share one upstream chat.
+    req = _sid_req(prompt_cache_key="session_77d8e7f8")
+    assert openai_mod._client_session_id(req) == "session_77d8e7f8"
+
+
+def test_client_session_id_none_when_both_missing_or_blank():
+    assert openai_mod._client_session_id(_sid_req()) is None
+    assert openai_mod._client_session_id(_sid_req(session_id="  ", prompt_cache_key=" ")) is None
+
+
+def test_openai_uses_prompt_cache_key_as_session(monkeypatch):
+    captured = {}
+
+    async def fake_collect(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(openai_mod, "_collect_non_stream", fake_collect)
+    pool = MagicMock()
+    pool.acquire = AsyncMock(return_value=(MagicMock(index=0, sem=MagicMock()), "session_abc"))
+    monkeypatch.setattr(openai_mod.app.state, "pool", pool)
+    asyncio.run(openai_mod._chat_completions_deepseek(_sid_req(prompt_cache_key="session_abc")))
+    pool.acquire.assert_awaited_once_with("session_abc", openai_mod.settings.acquire_timeout)
+
+
+def test_two_kimi_sessions_with_same_opening_do_not_collide(monkeypatch):
+    """Same first message, different prompt_cache_key → different sessions."""
+    seen = []
+
+    async def fake_collect(**kwargs):
+        return {"ok": True}
+
+    monkeypatch.setattr(openai_mod, "_collect_non_stream", fake_collect)
+    pool = MagicMock()
+    pool.acquire = AsyncMock(side_effect=lambda sid, _t: seen.append(sid) or (MagicMock(index=0, sem=MagicMock()), sid))
+    monkeypatch.setattr(openai_mod.app.state, "pool", pool)
+
+    asyncio.run(openai_mod._chat_completions_deepseek(_sid_req(prompt_cache_key="session_aaa")))
+    asyncio.run(openai_mod._chat_completions_deepseek(_sid_req(prompt_cache_key="session_bbb")))
+
+    assert seen == ["session_aaa", "session_bbb"]
+    pool.resolve_context.assert_not_called()
 
 
 def test_openai_falls_back_when_reattach_fails():

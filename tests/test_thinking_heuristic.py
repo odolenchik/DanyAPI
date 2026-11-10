@@ -21,6 +21,7 @@ from danyapi.api.openai import _looks_hard, _resolve_thinking, settings
 @pytest.fixture
 def heuristic_on(monkeypatch):
     monkeypatch.setattr(settings, "thinking_heuristic", True)
+    monkeypatch.setattr(settings, "thinking_heuristic_override", False)
     monkeypatch.setattr(settings, "thinking_min_prompt_chars", 2000)
     monkeypatch.setattr(settings, "thinking_long_prompt_chars", 4000)
     monkeypatch.setattr(settings, "thinking_min_messages", 8)
@@ -77,6 +78,112 @@ def test_blank_reasoning_effort_counts_as_unset(heuristic_on, effort):
     force thinking on and must fall through to the heuristic."""
     assert _resolve_thinking(_req("hi", reasoning_effort=effort), default=False) is False
     assert _resolve_thinking(_req("x" * 4000, reasoning_effort=effort), default=False) is True
+
+
+# ---------------------------------------------------------------------------
+# heuristic override: the heuristic outranks an enabling reasoning_effort
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def override_on(heuristic_on, monkeypatch):
+    monkeypatch.setattr(settings, "thinking_heuristic_override", True)
+
+
+def test_override_hard_turn_with_high_effort_turns_thinking_on(override_on):
+    stack = "why does this fail\nTraceback (most recent call last):"
+    assert _resolve_thinking(_req(stack, reasoning_effort="high"), default=False) is True
+
+
+def test_override_plain_turn_with_high_effort_turns_thinking_off(override_on):
+    """The Kimi case: it sends reasoning_effort=high on every turn; the turn's
+    own content must still decide."""
+    assert _resolve_thinking(_req("hi", reasoning_effort="high"), default=True) is False
+
+
+def test_override_long_prompt_still_counts(override_on):
+    assert _resolve_thinking(_req("x" * 4000, reasoning_effort="high"), default=False) is True
+
+
+@pytest.mark.parametrize("effort", ["off", "none", "disabled", " OFF "])
+def test_override_honours_an_explicit_off_effort(override_on, effort):
+    stack = "Traceback (most recent call last):\n  File x.py"
+    assert _resolve_thinking(_req(stack, reasoning_effort=effort), default=True) is False
+
+
+def test_override_explicit_thinking_field_still_wins(override_on):
+    assert _resolve_thinking(_req("hi", thinking=True), default=False) is True
+    stack = "Traceback (most recent call last):\n  File x.py"
+    assert _resolve_thinking(_req(stack, thinking=False), default=True) is False
+
+
+def test_override_inert_when_heuristic_is_off(monkeypatch):
+    monkeypatch.setattr(settings, "thinking_heuristic", False)
+    monkeypatch.setattr(settings, "thinking_heuristic_override", True)
+    assert _resolve_thinking(_req("hi", reasoning_effort="high"), default=False) is True
+
+
+async def test_route_override_kimi_like_request(override_on, monkeypatch):
+    captured = await _run_deepseek_route(monkeypatch, "hi", extra={"reasoning_effort": "high"})
+    assert captured["thinking"] is False
+    captured = await _run_deepseek_route(
+        monkeypatch,
+        "why does this fail\nTraceback (most recent call last):",
+        extra={"reasoning_effort": "high"},
+    )
+    assert captured["thinking"] is True
+
+
+# ---------------------------------------------------------------------------
+# trailing client boilerplate is not part of the user's turn
+# ---------------------------------------------------------------------------
+
+# Kimi Code CLI appends its permission/date notices as extra role="user"
+# messages after the real question. The auto-mode reminder literally contains
+# the word "exception" ("Plan mode is the exception"), which matched the error
+# signal and turned thinking on for every single turn.
+KIMI_REMINDER = (
+    "<system-reminder>\nAuto permission mode is active. Tool approvals will be handled "
+    "automatically while this mode remains enabled.\n"
+    "  - Plan mode is the exception: ExitPlanMode still waits for the user to review the plan.\n"
+    "</system-reminder>"
+)
+
+
+def _kimi_req(question, *, effort="high"):
+    return ChatCompletionRequest(
+        model="deepseek-v4-flash",
+        messages=[
+            {"role": "user", "content": question},
+            {"role": "user", "content": KIMI_REMINDER},
+        ],
+        reasoning_effort=effort,
+        tools=[{"type": "function", "function": {"name": "Bash"}}],
+    )
+
+
+def test_kimi_reminder_does_not_make_a_plain_turn_hard(override_on):
+    assert _looks_hard(_kimi_req("Say only: ok")) is False
+    assert _resolve_thinking(_kimi_req("Say only: ok"), default=True) is False
+
+
+def test_kimi_reminder_does_not_hide_a_real_hard_turn(override_on):
+    q = "Why does this fail?\nTraceback (most recent call last):\n  File x.py"
+    assert _looks_hard(_kimi_req(q)) is True
+    assert _resolve_thinking(_kimi_req(q), default=False) is True
+
+
+def test_thinking_text_skips_trailing_reminders():
+    req = _kimi_req("real question here")
+    assert openai_mod._thinking_text(req) == "real question here"
+
+
+def test_thinking_text_empty_when_only_reminders():
+    req = ChatCompletionRequest(
+        model="deepseek-v4-flash",
+        messages=[{"role": "user", "content": KIMI_REMINDER}],
+    )
+    assert openai_mod._thinking_text(req) == ""
 
 
 # ---------------------------------------------------------------------------

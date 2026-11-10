@@ -159,23 +159,27 @@ class SessionRegistry:
             return session
 
     async def obtain(self, session_id: str | None, **kwargs) -> tuple[Any, str]:
+        """Return a session and the key it is stored under.
+
+        When the caller supplies a key (``session_id`` or a client key such as
+        ``prompt_cache_key``) and no live session exists for it, the freshly
+        created chat is stored under that key. Otherwise the key would be lost
+        after the first turn and every later request would start a new chat.
+        The only exception is a registry entry that cannot serve the request
+        (``_reuse`` returns False, e.g. the model changed): that chat is
+        replaced under its own upstream id and the caller's key is not reused.
+        """
+        replaced = False
         if session_id:
             existing = self.get(session_id)
-            if existing is not None and self._reuse(existing, session_id, **kwargs):
-                return existing, session_id
+            if existing is not None:
+                if self._reuse(existing, session_id, **kwargs):
+                    return existing, session_id
+                replaced = True
         session = await self._create(**kwargs)
-        new_id = session.id
-        now = self._now()
-        with self._lock:
-            self._sessions[new_id] = (session, now)
-            self._sessions.move_to_end(new_id)
-            while len(self._sessions) > self._maxsize:
-                evicted, _ = self._sessions.popitem(last=False)
-                if self._store is not None:
-                    self._store.discard(self._session_key(evicted))
-            if self._store is not None:
-                self._store.set(self._session_key(new_id), self._serialize(session))
-        return session, new_id
+        key = session.id if replaced or not session_id else session_id
+        self._store_session(key, session)
+        return session, key
 
     def touch_last_message(self, session_id: str, message_id: str | None) -> None:
         session = self.get(session_id)

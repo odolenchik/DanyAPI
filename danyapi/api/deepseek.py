@@ -352,15 +352,14 @@ async def _prepare_session(
         raise HTTPException(_deepseek_status(exc), _deepseek_error_detail(exc)) from exc
     if session_key != existing_sid:
         pool.register(account.index, session_key)
-        # When the caller provided an explicit client key (e.g. prompt_cache_key)
-        # but no mapping existed yet, a new DeepSeek chat was created with its own
-        # internal ID. Register the client's key pointing to this new chat so that
-        # subsequent requests with the same key continue in this conversation.
-        if existing_sid is not None:
-            pool.register(account.index, existing_sid)
-            log.debug(
-                "registered client key %s -> deepseek chat %s", existing_sid, session_key
-            )
+    # Keep the caller's key (session_id or a client key such as
+    # prompt_cache_key) mapped to the account that now holds its chat, so the
+    # next turn with the same key lands on the same account.
+    if existing_sid is not None:
+        pool.register(account.index, existing_sid)
+    # Note: context_seq is indexed AFTER successful send (see streaming.py),
+    # so that non-retryable errors don't leave a stale fingerprint pointing at
+    # a session that never received the message.
     return session, session_key, session.last_message_id
 
 

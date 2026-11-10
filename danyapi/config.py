@@ -305,6 +305,14 @@ class Settings:
         # provider default. Off by default so existing clients keep their exact
         # behavior; opt in with DANYAPI_THINKING_HEURISTIC=1.
         self.thinking_heuristic = os.environ.get("DANYAPI_THINKING_HEURISTIC", "").strip().lower() in ("1", "true", "yes", "on")
+        # Some clients (Kimi Code CLI with a thinking-capable model) send a
+        # `reasoning_effort` on every turn, which would otherwise pin thinking
+        # on and leave the heuristic above unreachable. With this flag the
+        # heuristic decides even when the client did send one; an explicit
+        # `thinking` field still wins. Off by default; an explicit
+        # `reasoning_effort` that says "off" is still honoured so a client can
+        # opt out of a turn.
+        self.thinking_heuristic_override = os.environ.get("DANYAPI_THINKING_HEURISTIC_OVERRIDE", "").strip().lower() in ("1", "true", "yes", "on")
         # A user turn at or above this many characters counts as medium-hard.
         try:
             self.thinking_min_prompt_chars = max(1, int(os.environ.get("DANYAPI_THINKING_MIN_PROMPT_CHARS", "2000")))

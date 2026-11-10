@@ -351,17 +351,19 @@ async def test_existing_session_reused():
     pool = MagicMock()
     _, key, _ = await openai_mod._prepare_session(acct, pool, "s1")
     assert key == "s1"
-    pool.register.assert_not_called()
+    # The caller's key is always (re)bound to this account, even on a cache
+    # hit, so the next turn with the same key stays here.
+    pool.register.assert_called_once_with(acct.index, "s1")
 
 
-async def test_swapped_session_forgets_old():
+async def test_swapped_session_rebinds_old_key():
     acct = FakeAccount()
     pool = MagicMock()
     acct.sessions.obtain = AsyncMock(return_value=(FakeSession(sid="new1"), "new1"))
     await openai_mod._prepare_session(acct, pool, "old1", ("u1",))
-    # When a new chat is created for an existing key (e.g. due to eviction or error),
-    # the old mapping should be replaced with one pointing at the new chat, not forgotten.
-    assert pool.register.call_args_list == [call(0, "new1"), call(0, "old1")]
+    # A new upstream chat was created under its own id, and the caller's key is
+    # rebound to it instead of being dropped.
+    assert pool.register.call_args_list == [call(acct.index, "new1"), call(acct.index, "old1")]
 
 
 async def test_auth_error_401():

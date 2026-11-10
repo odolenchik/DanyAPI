@@ -23,6 +23,7 @@ from ..qwen import api as qwen_api
 from ..qwen.accounts import QwenAccount, load_effective_token, persist_rotated_token
 from ..qwen.client import QwenClient, QwenError
 from ..store import JsonStore
+from ..tools.prompt import _is_ephemeral_system, _is_media_relay
 from ..tooltrace import ToolTraceLogger
 from ..usage import init_tracker
 from ..zai import api as zai_api
@@ -533,7 +534,7 @@ async def _image_generations(req: ImageGenerationRequest, pool: AccountPool) -> 
     revised_prompt = ""
     for attempt in range(max_attempts):
         try:
-            account, existing_sid = await _acquire_account(pool, req.session_id)
+            account, existing_sid = await _acquire_account(pool, _client_session_id(req))
         except AccountPoolBusy:
             raise HTTPException(429, "all accounts are busy, try again later") from None
         data: list[dict] = []
@@ -704,21 +705,28 @@ _THINKING_DIFFICULTY_RE = re.compile(
 
 
 def _thinking_text(req: ChatCompletionRequest) -> str:
-    """Flatten the last user turn into searchable text.
+    """Flatten the last real user turn into searchable text.
 
     Content may be a plain string or a multimodal list of parts; anything else
-    contributes nothing.
+    contributes nothing. Client-injected ``<system-reminder>`` blocks and media
+    relay labels are skipped: Kimi appends them as trailing ``role="user"``
+    messages, and their boilerplate ("Plan mode is the exception") would
+    otherwise read as an error signal on every single turn.
     """
     for msg in reversed(req.messages or []):
         if getattr(msg, "role", "") != "user":
             continue
         content = getattr(msg, "content", "")
         if isinstance(content, str):
-            return content
-        if isinstance(content, list):
+            text = content
+        elif isinstance(content, list):
             parts = [p["text"] for p in content if isinstance(p, dict) and isinstance(p.get("text"), str)]
-            return "\n".join(parts)
-        return ""
+            text = "\n".join(parts)
+        else:
+            return ""
+        if _is_ephemeral_system(text) or _is_media_relay(text):
+            continue
+        return text
     return ""
 
 
@@ -797,14 +805,22 @@ def _resolve_thinking(req: ChatCompletionRequest, *, default: bool) -> bool:
     per-turn difficulty heuristic (opt-in) > provider default.
     ``reasoning_effort`` is compared case-insensitively after stripping; a
     blank value counts as unset so it cannot silently force thinking on.
+
+    With ``DANYAPI_THINKING_HEURISTIC_OVERRIDE`` the heuristic outranks an
+    enabling ``reasoning_effort``: clients such as Kimi Code CLI send one on
+    every turn whenever the model is declared thinking-capable, which would
+    otherwise pin thinking on and make the heuristic unreachable. An explicit
+    "off" effort is still honoured, so a client can opt out of a turn.
     """
     if req.thinking is not None:
         return req.thinking
     effort = _normalized_effort(getattr(req, "reasoning_effort", None))
-    if effort:
-        return effort not in _THINKING_OFF_EFFORTS
-    if settings.thinking_heuristic:
+    if effort and effort in _THINKING_OFF_EFFORTS:
+        return False
+    if settings.thinking_heuristic and (settings.thinking_heuristic_override or not effort) and getattr(req, "messages", None):
         return _looks_hard(req)
+    if effort:
+        return True
     return default
 
 
@@ -880,6 +896,22 @@ async def image_variations(
     return await _image_generations(req, pool)
 
 
+def _client_session_id(req: ChatCompletionRequest) -> str | None:
+    """Return the client's conversation id, or None when it sent none.
+
+    ``session_id`` is the documented field; Kimi Code CLI instead sends a
+    per-session ``prompt_cache_key`` (``session_<uuid>``) and no ``session_id``
+    at all. Without this fallback two Kimi sessions that open with the same
+    first message produce the same context fingerprint and share one upstream
+    chat, so their histories get mixed.
+    """
+    session_id = (req.session_id or "").strip()
+    if session_id:
+        return session_id
+    cache_key = (getattr(req, "prompt_cache_key", None) or "").strip()
+    return cache_key or None
+
+
 async def _acquire_account(pool: AccountPool, session_id: str | None):
     try:
         return await pool.acquire(session_id, settings.acquire_timeout)
@@ -915,8 +947,9 @@ async def _chat_completions_deepseek(req: ChatCompletionRequest) -> Any:
     search = (bool(req.search) or settings.search_always_on) and model_type in SEARCH_CAPABLE_MODEL_TYPES
 
     context_seq = toolemu.context_sequence(req.messages, user=getattr(req, "user", None))
-    if req.session_id:
-        account, existing_sid = await _acquire_account(pool, req.session_id)
+    client_sid = _client_session_id(req)
+    if client_sid:
+        account, existing_sid = await _acquire_account(pool, client_sid)
     else:
         cached_sid = pool.resolve_context(context_seq) if context_seq else None
         account, existing_sid = await _acquire_account(pool, cached_sid)
@@ -1029,8 +1062,9 @@ async def _chat_completions_qwen(req: ChatCompletionRequest) -> Any:
     search = bool(req.search)
 
     context_seq = toolemu.context_sequence(req.messages, user=getattr(req, "user", None))
-    if req.session_id:
-        account, existing_sid = await _acquire_account(pool, req.session_id)
+    client_sid = _client_session_id(req)
+    if client_sid:
+        account, existing_sid = await _acquire_account(pool, client_sid)
     else:
         cached_sid = pool.resolve_context(context_seq) if context_seq else None
         account, existing_sid = await _acquire_account(pool, cached_sid)
