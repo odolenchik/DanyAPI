@@ -2,7 +2,7 @@ import asyncio
 import base64 as b64
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
 import pytest
@@ -359,9 +359,9 @@ async def test_swapped_session_forgets_old():
     pool = MagicMock()
     acct.sessions.obtain = AsyncMock(return_value=(FakeSession(sid="new1"), "new1"))
     await openai_mod._prepare_session(acct, pool, "old1", ("u1",))
-    pool.forget.assert_called_once_with("old1")
-    pool.forget_context.assert_called_once_with("old1")
-    acct.sessions.forget.assert_called_once_with("old1")
+    # When a new chat is created for an existing key (e.g. due to eviction or error),
+    # the old mapping should be replaced with one pointing at the new chat, not forgotten.
+    assert pool.register.call_args_list == [call(0, "new1"), call(0, "old1")]
 
 
 async def test_auth_error_401():

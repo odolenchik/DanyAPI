@@ -31,8 +31,11 @@ async def test_session_affinity():
     acct, sid = await pool.acquire("sess-abc")
     assert acct is a1
     assert sid == "sess-abc"
+    # New session ID with no existing mapping: returns an available account but
+    # preserves the client-provided key so it can be registered once upstream
+    # creates a chat.
     acct, sid = await pool.acquire("sess-zzz")
-    assert sid is None
+    assert sid == "sess-zzz"
 
 
 async def test_broken_account_releases_session():
@@ -42,7 +45,9 @@ async def test_broken_account_releases_session():
     pool.register(0, "sess-broken")
     acct, sid = await pool.acquire("sess-broken")
     assert acct is a1
-    assert sid is None
+    # Original account was broken; the session ID is returned so downstream can
+    # register it with the new account once upstream creates a chat.
+    assert sid == "sess-broken"
     assert "sess-broken" not in pool._by_session
 
 
